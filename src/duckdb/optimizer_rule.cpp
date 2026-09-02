@@ -216,8 +216,8 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "'force' (fire whenever the plan shape matches; benchmarking only)",
 	                          LogicalType::VARCHAR, Value("off"));
 	config.AddExtensionOption("factorize_debug_print_plan",
-	                          "Print the post-optimizer logical plan seen by the factorize rule",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                          "Print the post-optimizer logical plan seen by the factorize rule", LogicalType::BOOLEAN,
+	                          Value::BOOLEAN(false));
 }
 
 } // namespace duckdb

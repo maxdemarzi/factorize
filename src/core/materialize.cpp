@@ -9,8 +9,7 @@ namespace factorize {
 
 TreeTopology TreeTopology::Of(const FTree &tree) {
 	TreeTopology topology;
-	std::function<void(const FNode &, int32_t, int32_t)> visit = [&](const FNode &node, int32_t parent,
-	                                                                int32_t slot) {
+	std::function<void(const FNode &, int32_t, int32_t)> visit = [&](const FNode &node, int32_t parent, int32_t slot) {
 		const auto self = static_cast<int32_t>(topology.parent.size());
 		topology.parent.push_back(parent);
 		topology.slot_in_parent.push_back(slot);
@@ -23,8 +22,7 @@ TreeTopology TreeTopology::Of(const FTree &tree) {
 }
 
 MaterializePlan MaterializePlan::Build(const FTree &input_tree, const Layout &input_layout, const FTree &output_tree,
-                                       const Layout &output_layout,
-                                       const std::vector<std::vector<uint32_t>> &sources,
+                                       const Layout &output_layout, const std::vector<std::vector<uint32_t>> &sources,
                                        const std::vector<bool> &owned, uint32_t root_output_level) {
 	const auto input_topology = TreeTopology::Of(input_tree);
 	const auto output_topology = TreeTopology::Of(output_tree);
@@ -84,8 +82,8 @@ MaterializePlan MaterializePlan::Build(const FTree &input_tree, const Layout &in
 					}
 					if (entry->second == level.output_level) {
 						// Sibling dependency: the parent must already be placed.
-						ready = std::find(ordered.begin(), ordered.end(), static_cast<uint32_t>(parent)) !=
-						        ordered.end();
+						ready =
+						    std::find(ordered.begin(), ordered.end(), static_cast<uint32_t>(parent)) != ordered.end();
 					}
 				}
 				if (ready) {
@@ -164,8 +162,7 @@ MaterializePlan MaterializePlan::Build(const FTree &input_tree, const Layout &in
 				}
 			}
 			if (!found) {
-				throw std::runtime_error("materialize: no input holds output attribute " +
-				                         std::to_string(attribute));
+				throw std::runtime_error("materialize: no input holds output attribute " + std::to_string(attribute));
 			}
 		}
 	}

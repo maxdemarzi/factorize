@@ -308,8 +308,7 @@ FNode &FTree::CreateRootToLeafPath(const std::vector<AttributeId> &keys, PathStr
 //===--------------------------------------------------------------------===//
 // Joins (paper section 4.2.3)
 //===--------------------------------------------------------------------===//
-FTree MergeTrees(const FTree &build, const FTree &probe, const JoinKeys &keys, JoinMode mode,
-                 PathStrategy strategy) {
+FTree MergeTrees(const FTree &build, const FTree &probe, const JoinKeys &keys, JoinMode mode, PathStrategy strategy) {
 	// Top-insert puts the probe tree on top; bottom-insert puts the build tree
 	// on top. Nothing else differs between the two -- which is exactly the
 	// symmetry behind  L (top-insert) R  ==  R (bottom-insert) L.

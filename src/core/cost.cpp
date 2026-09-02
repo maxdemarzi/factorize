@@ -67,8 +67,7 @@ EngineCost FitEngineCost(const std::vector<CostSample> &samples, double quantile
 	for (double startup : {0.0, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0}) {
 		for (int i = -16; i <= 0; i++) {
 			for (int j = -17; j <= 0; j++) {
-				EngineCost candidate {startup, std::pow(10.0, i / 2.0),
-				                      j < -16 ? 0.0 : std::pow(10.0, j / 2.0)};
+				EngineCost candidate {startup, std::pow(10.0, i / 2.0), j < -16 ? 0.0 : std::pow(10.0, j / 2.0)};
 				const double value = loss(candidate);
 				if (value < best) {
 					best = value;
@@ -228,8 +227,7 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	estimate.duckdb_ms = thresholds.duckdb.Estimate(input_rows, estimate.flat_tuples);
 
 	estimate.bytes = estimate.factorized_records *
-	                 (thresholds.bytes_per_record +
-	                  thresholds.bytes_per_relation * static_cast<double>(steps.size()));
+	                 (thresholds.bytes_per_record + thresholds.bytes_per_relation * static_cast<double>(steps.size()));
 
 	if (thresholds.require_acyclic && !acyclic) {
 		estimate.reason = "cyclic join graph";
@@ -244,15 +242,13 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	}
 	if (estimate.duckdb_ms < thresholds.margin * estimate.ours_ms) {
 		estimate.reason = "predicted " + Millis(estimate.ours_ms) + "ms against DuckDB's " +
-		                  Millis(estimate.duckdb_ms) + "ms, under the " + Round(thresholds.margin) +
-		                  "x margin";
+		                  Millis(estimate.duckdb_ms) + "ms, under the " + Round(thresholds.margin) + "x margin";
 		return estimate;
 	}
 
 	estimate.fire = true;
-	estimate.reason = "predicted " + Millis(estimate.ours_ms) + "ms against DuckDB's " +
-	                  Millis(estimate.duckdb_ms) + "ms, from " + Format(estimate.flat_tuples) +
-	                  " tuples compressed " + Round(estimate.ratio) + "x";
+	estimate.reason = "predicted " + Millis(estimate.ours_ms) + "ms against DuckDB's " + Millis(estimate.duckdb_ms) +
+	                  "ms, from " + Format(estimate.flat_tuples) + " tuples compressed " + Round(estimate.ratio) + "x";
 	return estimate;
 }
 

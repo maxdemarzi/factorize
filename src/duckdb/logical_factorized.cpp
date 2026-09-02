@@ -6,8 +6,7 @@
 
 namespace duckdb {
 
-LogicalFactorized::LogicalFactorized(idx_t table_index_p)
-    : LogicalExtensionOperator(), table_index(table_index_p) {
+LogicalFactorized::LogicalFactorized(idx_t table_index_p) : LogicalExtensionOperator(), table_index(table_index_p) {
 }
 
 void LogicalFactorized::ResolveTypes() {

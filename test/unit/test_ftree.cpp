@@ -98,7 +98,8 @@ static void TestFigure6() {
 	const FNode *top_attached = top.Find(A);
 	const FNode *bottom_attached = bottom.Find(S);
 	ExpectTrue(top_attached != nullptr && !top_attached->RequiresLock(), "top-insert needs no lock");
-	ExpectTrue(bottom_attached != nullptr && bottom_attached->RequiresLock(), "bottom-insert marks its insertion point");
+	ExpectTrue(bottom_attached != nullptr && bottom_attached->RequiresLock(),
+	           "bottom-insert marks its insertion point");
 
 	// The paper's equivalence: L (top-insert) R == R (bottom-insert) L.
 	JoinKeys swapped;

@@ -99,8 +99,8 @@ struct JoinStats {
 //! the affected levels are partially flattened (section 4.6) rather than
 //! rejected.
 FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const FactorizedRelation &probe,
-                                  const JoinKeys &keys, JoinMode mode,
-                                  PathStrategy strategy = PathStrategy::LEVELWISE, JoinStats *stats = nullptr);
+                                  const JoinKeys &keys, JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE,
+                                  JoinStats *stats = nullptr);
 
 //! Performs a join and returns the cardinality of its result *without ever
 //! building it*.
@@ -119,8 +119,7 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 //! The count is a property of the relation, so both insert modes yield the same
 //! answer; `mode` still selects which side is indexed and which is scanned.
 int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRelation &probe, const JoinKeys &keys,
-                            JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE,
-                            JoinStats *stats = nullptr);
+                            JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE, JoinStats *stats = nullptr);
 
 //! Memory cap applied to every f-representation the core creates; 0 = none.
 //! Set once per query by the caller. The DuckDB operator will drive this from

@@ -109,7 +109,8 @@ static void EnumerateSlots(const FRepresentation &rep, Record record, size_t slo
 	bool any = false;
 	rep.ForEachChild(record, slot_index, [&](Record child) {
 		any = true;
-		EnumerateRecord(rep, child, assignment, [&]() { EnumerateSlots(rep, record, slot_index + 1, assignment, emit); });
+		EnumerateRecord(rep, child, assignment,
+		                [&]() { EnumerateSlots(rep, record, slot_index + 1, assignment, emit); });
 	});
 	// An empty slot means this record encodes no tuples at all -- the case
 	// bottom-inserts create and a flattening iterator has to skip.
@@ -209,16 +210,15 @@ static bool RunCase(std::mt19937 &rng, int relations, int columns, int rows, int
 
 	for (int i = 1; i < relations; i++) {
 		const AttributeId right_key = static_cast<AttributeId>(i * columns);
-		const AttributeId left_key =
-		    star ? static_cast<AttributeId>(0) : static_cast<AttributeId>((i - 1) * columns);
+		const AttributeId left_key = star ? static_cast<AttributeId>(0) : static_cast<AttributeId>((i - 1) * columns);
 
 		JoinKeys join_keys;
 		// The accumulated relation is the probe side; the new one is the build.
 		join_keys.build = {right_key};
 		join_keys.probe = {left_key};
 
-		auto next_factorized = FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(i)], types), factorized,
-		                                      join_keys, mode, strategy);
+		auto next_factorized =
+		    FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(i)], types), factorized, join_keys, mode, strategy);
 		flat = FlatJoin(flat, inputs[static_cast<size_t>(i)].flat, {left_key}, {right_key});
 		factorized = std::move(next_factorized);
 	}
@@ -242,8 +242,8 @@ static bool RunCase(std::mt19937 &rng, int relations, int columns, int rows, int
 
 	if (expected != actual || counted != static_cast<int64_t>(expected.size())) {
 		detail = "relations=" + std::to_string(relations) + " columns=" + std::to_string(columns) +
-		         " rows=" + std::to_string(rows) + " domain=" + std::to_string(domain) +
-		         (star ? " star" : " chain") + (mode == JoinMode::TOP_INSERT ? " top" : " bottom") +
+		         " rows=" + std::to_string(rows) + " domain=" + std::to_string(domain) + (star ? " star" : " chain") +
+		         (mode == JoinMode::TOP_INSERT ? " top" : " bottom") +
 		         (strategy == PathStrategy::NAIVE ? " naive" : " levelwise") +
 		         " expected=" + std::to_string(expected.size()) + " enumerated=" + std::to_string(actual.size()) +
 		         " counted=" + std::to_string(counted);
@@ -283,8 +283,8 @@ static void TestLongChains() {
 					JoinKeys keys;
 					keys.build = {right_key};
 					keys.probe = {left_key};
-					factorized = FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(i)], types), factorized,
-					                            keys, mode);
+					factorized =
+					    FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(i)], types), factorized, keys, mode);
 					flat = FlatJoin(flat, inputs[static_cast<size_t>(i)].flat, {left_key}, {right_key});
 				}
 				std::vector<AttributeId> order = flat.attributes;
@@ -351,9 +351,8 @@ static void TestStarThenDeepJoin() {
 			JoinKeys keys;
 			keys.build = {static_cast<AttributeId>(i * 2)};
 			keys.probe = {0};
-			factorized =
-			    FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(i)], types), factorized, keys,
-			                   JoinMode::TOP_INSERT);
+			factorized = FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(i)], types), factorized, keys,
+			                            JoinMode::TOP_INSERT);
 			flat = FlatJoin(flat, inputs[static_cast<size_t>(i)].flat, {0}, {static_cast<AttributeId>(i * 2)});
 		}
 
@@ -366,8 +365,7 @@ static void TestStarThenDeepJoin() {
 		keys.probe = {deep_key};
 		factorized = FactorizedJoin(ToFactorized(inputs[static_cast<size_t>(last)], types), factorized, keys,
 		                            JoinMode::TOP_INSERT);
-		flat = FlatJoin(flat, inputs[static_cast<size_t>(last)].flat, {deep_key},
-		                {static_cast<AttributeId>(last * 2)});
+		flat = FlatJoin(flat, inputs[static_cast<size_t>(last)].flat, {deep_key}, {static_cast<AttributeId>(last * 2)});
 
 		std::vector<AttributeId> order = flat.attributes;
 		std::sort(order.begin(), order.end());
@@ -462,8 +460,7 @@ static void TestModeEquivalence() {
 	Expect(top.Count() == bottom.Count(), "both modes count the same");
 
 	std::vector<AttributeId> order = {0, 1, 10, 11};
-	Expect(Sorted(Enumerate(top, order)) == Sorted(Enumerate(bottom, order)),
-	       "both modes encode the same tuples");
+	Expect(Sorted(Enumerate(top, order)) == Sorted(Enumerate(bottom, order)), "both modes encode the same tuples");
 	Report("insert modes agree on shape, count and contents");
 }
 
@@ -490,15 +487,15 @@ static void TestPartialFlattening() {
 	JoinKeys k1;
 	k1.build = {2};
 	k1.probe = {0};
-	auto left = FactorizedJoin(ToFactorized(inputs[1], types), ToFactorized(inputs[0], types), k1,
-	                           JoinMode::TOP_INSERT);
+	auto left =
+	    FactorizedJoin(ToFactorized(inputs[1], types), ToFactorized(inputs[0], types), k1, JoinMode::TOP_INSERT);
 	auto flat_left = FlatJoin(inputs[0].flat, inputs[1].flat, {0}, {2});
 
 	JoinKeys k2;
 	k2.build = {6};
 	k2.probe = {4};
-	auto right = FactorizedJoin(ToFactorized(inputs[3], types), ToFactorized(inputs[2], types), k2,
-	                            JoinMode::TOP_INSERT);
+	auto right =
+	    FactorizedJoin(ToFactorized(inputs[3], types), ToFactorized(inputs[2], types), k2, JoinMode::TOP_INSERT);
 	auto flat_right = FlatJoin(inputs[2].flat, inputs[3].flat, {4}, {6});
 
 	// Join the two intermediates on one attribute from each side; the required
@@ -524,8 +521,8 @@ static void TestPartialFlattening() {
 	Expect(joined.Count() == static_cast<int64_t>(flat_rows.size()), "bushy join counts correctly");
 	Report("bushy plan over four relations, " + std::to_string(flat_rows.size()) + " tuples");
 	std::printf("       f-tree: %s\n", joined.Tree().ToString(DefaultAttributeName).c_str());
-	std::printf("       %zu records for %lld tuples%s\n", stats.output_records,
-	            static_cast<long long>(joined.Count()), stats.merged_nodes ? ", nodes were merged" : "");
+	std::printf("       %zu records for %lld tuples%s\n", stats.output_records, static_cast<long long>(joined.Count()),
+	            stats.merged_nodes ? ", nodes were merged" : "");
 }
 
 //===--------------------------------------------------------------------===//
@@ -599,8 +596,8 @@ static void TestDiamondMerge() {
 		       label + ": partially flattened result matches the flat oracle");
 		Expect(joined.Count() == static_cast<int64_t>(flat_rows.size()), label + ": count matches");
 		std::printf("       %-9s -> %s  (%lld tuples, %zu records)\n", label.c_str(),
-		            joined.Tree().ToString(DefaultAttributeName).c_str(),
-		            static_cast<long long>(joined.Count()), stats.output_records);
+		            joined.Tree().ToString(DefaultAttributeName).c_str(), static_cast<long long>(joined.Count()),
+		            stats.output_records);
 	}
 	Report("cycle-closing join exercises partial flattening under both strategies");
 }
@@ -658,8 +655,7 @@ static void TestFusedCount() {
 						failures++;
 						if (detail.empty()) {
 							detail = "relations=" + std::to_string(relations) + " domain=" + std::to_string(domain) +
-							         (star ? " star" : " chain") +
-							         (mode == JoinMode::TOP_INSERT ? " top" : " bottom") +
+							         (star ? " star" : " chain") + (mode == JoinMode::TOP_INSERT ? " top" : " bottom") +
 							         " fused=" + std::to_string(fused) +
 							         " materialized=" + std::to_string(materialized);
 						}

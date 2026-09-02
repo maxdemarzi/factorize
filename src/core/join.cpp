@@ -130,9 +130,9 @@ KeyReader MakeKeyReader(const MaterializePlan &plan, const Layout &input_layout,
 						throw std::runtime_error("join: key attributes did not converge on one level");
 					}
 					reader.plan_index = static_cast<uint32_t>(plan_index);
-					reader.columns.push_back(
-					    KeyReader::Column {static_cast<uint32_t>(source_index), static_cast<uint32_t>(payload),
-					                       in_layout.payload[payload].type});
+					reader.columns.push_back(KeyReader::Column {static_cast<uint32_t>(source_index),
+					                                            static_cast<uint32_t>(payload),
+					                                            in_layout.payload[payload].type});
 					bits += in_layout.payload[payload].type == ValueType::INT32 ? 32 : 64;
 					found = true;
 					break;
@@ -241,10 +241,9 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 
 	AttributeTypes out_types = build.Types();
 	for (const auto &entry : probe.Types()) {
-		if (std::find_if(out_types.begin(), out_types.end(),
-		                 [&](const std::pair<AttributeId, ValueType> &existing) {
-			                 return existing.first == entry.first;
-		                 }) == out_types.end()) {
+		if (std::find_if(out_types.begin(), out_types.end(), [&](const std::pair<AttributeId, ValueType> &existing) {
+			    return existing.first == entry.first;
+		    }) == out_types.end()) {
 			out_types.push_back(entry);
 		}
 	}
@@ -495,8 +494,8 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 
 	int64_t total = 0;
 	size_t matches = 0;
-	OutputCounter counter {upper_plan,           upper.Rep(), upper_ctx, static_cast<int32_t>(merge.insertion_level),
-	                       upper_key,            table,       &matches};
+	OutputCounter counter {upper_plan, upper.Rep(), upper_ctx, static_cast<int32_t>(merge.insertion_level),
+	                       upper_key,  table,       &matches};
 	IterateLevel(upper_plan, 0, upper.Rep(), upper_ctx, 0, [&]() {
 		if (stats) {
 			stats->probe_rows++;

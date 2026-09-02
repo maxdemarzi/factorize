@@ -70,10 +70,9 @@ static void ExactGroup(const std::vector<std::map<int64_t, double>> &columns, do
 static ColumnStats ToStats(const std::map<int64_t, double> &column, size_t k) {
 	ColumnStats stats;
 	std::vector<std::pair<int64_t, double>> all(column.begin(), column.end());
-	std::sort(all.begin(), all.end(),
-	          [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
-		          return a.second > b.second;
-	          });
+	std::sort(all.begin(), all.end(), [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
+		return a.second > b.second;
+	});
 	for (const auto &entry : all) {
 		stats.rows += entry.second;
 	}
@@ -242,8 +241,8 @@ static void TestCalibration() {
 	};
 	const auto pessimistic = FitEngineCost(samples, 0.75);
 	const auto optimistic = FitEngineCost(samples, 0.25);
-	std::printf("  sits above the data: optimistic %d%%, median %d%%, pessimistic %d%% of 300\n",
-	            above(optimistic) / 3, above(median) / 3, above(pessimistic) / 3);
+	std::printf("  sits above the data: optimistic %d%%, median %d%%, pessimistic %d%% of 300\n", above(optimistic) / 3,
+	            above(median) / 3, above(pessimistic) / 3);
 	Check(above(pessimistic) > above(median), "a higher quantile must sit above more of the data");
 	Check(above(median) > above(optimistic), "a lower quantile must sit below more of the data");
 }
@@ -324,8 +323,8 @@ static void TestMemoryBudget() {
 	CostThresholds tight = generous;
 	tight.memory_budget_bytes = unlimited.bytes / 2;
 	const auto refused = EstimateCost(steps, true, tight);
-	std::printf("  %.4g bytes predicted, budget %.4g -> %s (%s)\n", refused.bytes,
-	            tight.memory_budget_bytes, refused.fire ? "FIRE" : "decline", refused.reason.c_str());
+	std::printf("  %.4g bytes predicted, budget %.4g -> %s (%s)\n", refused.bytes, tight.memory_budget_bytes,
+	            refused.fire ? "FIRE" : "decline", refused.reason.c_str());
 	Check(!refused.fire, "over budget must decline");
 	Check(refused.reason.find("budget") != std::string::npos, "the reason must name the budget");
 

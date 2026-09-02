@@ -93,9 +93,8 @@ static std::vector<Query> ParseQueryFile(const std::string &path) {
 		while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
 			value.erase(value.begin());
 		}
-		while (!value.empty() &&
-		       (value.back() == ' ' || value.back() == '\t' || value.back() == '\r' || value.back() == '\n' ||
-		        value.back() == ';')) {
+		while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r' ||
+		                          value.back() == '\n' || value.back() == ';')) {
 			value.pop_back();
 		}
 		return value;
@@ -173,8 +172,8 @@ static std::vector<Query> ParseQueryFile(const std::string &path) {
 		size_t position = 0;
 		while (position < conditions.size()) {
 			auto next = conditions.find(" and ", position);
-			std::string clause = conditions.substr(position, next == std::string::npos ? std::string::npos
-			                                                                           : next - position);
+			std::string clause =
+			    conditions.substr(position, next == std::string::npos ? std::string::npos : next - position);
 			position = next == std::string::npos ? conditions.size() : next + 5;
 
 			const auto equals = clause.find('=');
@@ -309,9 +308,9 @@ public:
 				i = j;
 			}
 			std::sort(heap.begin(), heap.end(),
-						  [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
-							  return a.second > b.second;
-						  });
+			          [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
+				          return a.second > b.second;
+			          });
 			table.distinct[column] = std::max<int64_t>(1, distinct);
 			table.mcv[column] = std::move(heap);
 		}
@@ -577,8 +576,7 @@ static std::vector<CostStep> BuildCostSteps(const Query &query, const Plan &plan
 		const auto &attach_table = cache.Get(query.tables[attach_relation]);
 		CostStep entry;
 		entry.key = StatsFor(table, new_column);
-		entry.key_group =
-		    static_cast<int>(classes.Find(AttributeOf(step.relation, static_cast<int>(new_column))));
+		entry.key_group = static_cast<int>(classes.Find(AttributeOf(step.relation, static_cast<int>(new_column))));
 		entry.parent_key = StatsFor(attach_table, attach_column);
 		entry.parent_step = static_cast<int>(step_of[attach_relation]);
 		steps.push_back(entry);
@@ -658,21 +656,19 @@ static RunResult RunFactorized(const Query &query, const Plan &plan, TableCache 
 				keys.build = new_keys;
 				keys.probe = accumulated_keys;
 				if (last_join) {
-					fused_count = FactorizedCountJoin(make(step.relation), accumulated, keys, mode, strategy,
-					                                  &join_stats);
+					fused_count =
+					    FactorizedCountJoin(make(step.relation), accumulated, keys, mode, strategy, &join_stats);
 				} else {
-					accumulated =
-					    FactorizedJoin(make(step.relation), accumulated, keys, mode, strategy, &join_stats);
+					accumulated = FactorizedJoin(make(step.relation), accumulated, keys, mode, strategy, &join_stats);
 				}
 			} else {
 				keys.build = accumulated_keys;
 				keys.probe = new_keys;
 				if (last_join) {
-					fused_count = FactorizedCountJoin(accumulated, make(step.relation), keys, mode, strategy,
-					                                  &join_stats);
+					fused_count =
+					    FactorizedCountJoin(accumulated, make(step.relation), keys, mode, strategy, &join_stats);
 				} else {
-					accumulated =
-					    FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy, &join_stats);
+					accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy, &join_stats);
 				}
 			}
 			if (g_verbose) {
@@ -680,8 +676,7 @@ static RunResult RunFactorized(const Query &query, const Plan &plan, TableCache 
 				             "    join %zu: +%s  build_keys=%zu probe_rows=%zu matches=%zu "
 				             "records=%zu bytes=%.1fMB count=%lld tree=%s\n",
 				             i, query.tables[step.relation].c_str(), join_stats.build_keys, join_stats.probe_rows,
-				             join_stats.matches, join_stats.output_records,
-				             join_stats.output_bytes / (1024.0 * 1024.0),
+				             join_stats.matches, join_stats.output_records, join_stats.output_bytes / (1024.0 * 1024.0),
 				             static_cast<long long>(accumulated.Count()),
 				             accumulated.Tree().ToString(DefaultAttributeName).c_str());
 			}
@@ -752,12 +747,10 @@ static RunResult RunFlat(const Query &query, const Plan &plan, TableCache &cache
 			std::vector<int> probe_keys;
 			for (const auto &edge : step.edges) {
 				const bool left_is_new = edge.left_relation == step.relation;
-				const auto build_attribute =
-				    AttributeOf(left_is_new ? edge.left_relation : edge.right_relation,
-				                left_is_new ? edge.left_column : edge.right_column);
-				const auto probe_attribute =
-				    AttributeOf(left_is_new ? edge.right_relation : edge.left_relation,
-				                left_is_new ? edge.right_column : edge.left_column);
+				const auto build_attribute = AttributeOf(left_is_new ? edge.left_relation : edge.right_relation,
+				                                         left_is_new ? edge.left_column : edge.right_column);
+				const auto probe_attribute = AttributeOf(left_is_new ? edge.right_relation : edge.left_relation,
+				                                         left_is_new ? edge.right_column : edge.left_column);
 				build_keys.push_back(build.Index(build_attribute));
 				probe_keys.push_back(accumulated.Index(probe_attribute));
 			}
@@ -839,7 +832,9 @@ int main(int argc, char **argv) {
 
 	for (int i = 1; i < argc; i++) {
 		const std::string arg = argv[i];
-		auto next = [&]() { return std::string(argv[++i]); };
+		auto next = [&]() {
+			return std::string(argv[++i]);
+		};
 		if (arg == "--data") {
 			data_dir = next();
 		} else if (arg == "--query") {
@@ -870,11 +865,10 @@ int main(int argc, char **argv) {
 		}
 	}
 	if (data_dir.empty() || query_files.empty()) {
-		std::fprintf(stderr,
-		             "usage: standalone --data <ce csv dir> --query <file.sql> [--query ...]\n"
-		             "                  [--limit N] [--repeats N] [--no-flat] [--only NAME]\n"
-		             "                  [--calibrate obs.csv] [--gate-only]\n"
-		             "                  [--max-flat-rows N]\n");
+		std::fprintf(stderr, "usage: standalone --data <ce csv dir> --query <file.sql> [--query ...]\n"
+		                     "                  [--limit N] [--repeats N] [--no-flat] [--only NAME]\n"
+		                     "                  [--calibrate obs.csv] [--gate-only]\n"
+		                     "                  [--max-flat-rows N]\n");
 		return 2;
 	}
 
@@ -892,8 +886,7 @@ int main(int argc, char **argv) {
 		std::string line;
 		while (std::getline(input, line)) {
 			CostSample sample;
-			if (std::sscanf(line.c_str(), "%lf,%lf,%lf", &sample.input_rows, &sample.output,
-			                &sample.millis) == 3 &&
+			if (std::sscanf(line.c_str(), "%lf,%lf,%lf", &sample.input_rows, &sample.output, &sample.millis) == 3 &&
 			    sample.millis > 0) {
 				samples.push_back(sample);
 			}
@@ -905,8 +898,7 @@ int main(int argc, char **argv) {
 		std::printf("quantile,startup_ms,per_input_row_ms,per_output_ms\n");
 		for (double quantile : {0.25, 0.5, 0.75, 0.9}) {
 			const auto fit = FitEngineCost(samples, quantile);
-			std::printf("%.2f,%.6g,%.6g,%.6g\n", quantile, fit.startup_ms, fit.per_input_row_ms,
-			            fit.per_output_ms);
+			std::printf("%.2f,%.6g,%.6g,%.6g\n", quantile, fit.startup_ms, fit.per_input_row_ms, fit.per_output_ms);
 		}
 		std::fprintf(stderr, "fitted on %zu samples\n", samples.size());
 		return 0;
@@ -917,7 +909,8 @@ int main(int argc, char **argv) {
 	SetGlobalMemoryLimit(g_max_frep_bytes);
 
 	TableCache cache(data_dir);
-	std::printf("query,shape,expected,factorized,flat,fact_top_ms,fact_bottom_ms,flat_ms,records,bytes,predicted_ratio,predicted_flat,gate_fires,status\n");
+	std::printf("query,shape,expected,factorized,flat,fact_top_ms,fact_bottom_ms,flat_ms,records,bytes,predicted_ratio,"
+	            "predicted_flat,gate_fires,status\n");
 
 	size_t executed = 0;
 	size_t correct = 0;
@@ -998,20 +991,17 @@ int main(int argc, char **argv) {
 				}
 				executed++;
 				std::printf("%s,%s,%lld,,,,,,,%.0f,%.4f,%.0f,%d,%s\n", query.name.c_str(),
-				            query.cyclic ? "cyclic" : "acyclic", static_cast<long long>(query.expected),
-				            decision.bytes, decision.ratio, decision.flat_tuples, decision.fire ? 1 : 0,
-				            decision.reason.c_str());
+				            query.cyclic ? "cyclic" : "acyclic", static_cast<long long>(query.expected), decision.bytes,
+				            decision.ratio, decision.flat_tuples, decision.fire ? 1 : 0, decision.reason.c_str());
 				std::fflush(stdout);
 				continue;
 			}
 
 			RunResult top, bottom, flat;
-			top = measure([&]() {
-				return RunFactorized(query, plan, cache, JoinMode::TOP_INSERT, PathStrategy::LEVELWISE);
-			});
-			bottom = measure([&]() {
-				return RunFactorized(query, plan, cache, JoinMode::BOTTOM_INSERT, PathStrategy::LEVELWISE);
-			});
+			top = measure(
+			    [&]() { return RunFactorized(query, plan, cache, JoinMode::TOP_INSERT, PathStrategy::LEVELWISE); });
+			bottom = measure(
+			    [&]() { return RunFactorized(query, plan, cache, JoinMode::BOTTOM_INSERT, PathStrategy::LEVELWISE); });
 			if (run_flat) {
 				flat = measure([&]() { return RunFlat(query, plan, cache, max_flat_rows); });
 			}
@@ -1040,16 +1030,18 @@ int main(int argc, char **argv) {
 			CostEstimate gate;
 			try {
 				const auto cost_steps = BuildCostSteps(query, plan, cache);
-			if (g_verbose) {
-				std::fprintf(stderr, "  cost steps:\n");
-				for (size_t c = 0; c < cost_steps.size(); c++) {
-					const auto &cs = cost_steps[c];
-					std::fprintf(stderr, "    [%zu] group=%d parent=%d rows=%.0f distinct=%.0f mcv=%zu parent_distinct=%.0f\n",
-					             c, cs.key_group, cs.parent_step, cs.key.rows, cs.key.distinct,
-					             cs.key.mcv.size(), cs.parent_key.distinct);
+				if (g_verbose) {
+					std::fprintf(stderr, "  cost steps:\n");
+					for (size_t c = 0; c < cost_steps.size(); c++) {
+						const auto &cs = cost_steps[c];
+						std::fprintf(
+						    stderr,
+						    "    [%zu] group=%d parent=%d rows=%.0f distinct=%.0f mcv=%zu parent_distinct=%.0f\n", c,
+						    cs.key_group, cs.parent_step, cs.key.rows, cs.key.distinct, cs.key.mcv.size(),
+						    cs.parent_key.distinct);
+					}
 				}
-			}
-			CostThresholds limits;
+				CostThresholds limits;
 				limits.memory_budget_bytes = static_cast<double>(g_max_frep_bytes);
 				gate = EstimateCost(cost_steps, !query.cyclic, limits);
 			} catch (const std::exception &) {
@@ -1060,8 +1052,8 @@ int main(int argc, char **argv) {
 			            query.cyclic ? "cyclic" : "acyclic", static_cast<long long>(reference),
 			            static_cast<long long>(top.count),
 			            static_cast<long long>(run_flat && flat.ok ? flat.count : -1), top.millis, bottom.millis,
-			            run_flat && flat.ok ? flat.millis : -1.0, top.records, top.bytes, gate.ratio,
-			            gate.flat_tuples, gate.fire ? 1 : 0, status.c_str());
+			            run_flat && flat.ok ? flat.millis : -1.0, top.records, top.bytes, gate.ratio, gate.flat_tuples,
+			            gate.fire ? 1 : 0, status.c_str());
 			std::fflush(stdout);
 		}
 	}

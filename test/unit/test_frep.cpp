@@ -246,8 +246,7 @@ static void TestCount() {
 	}
 	ExpectEq<int64_t>(big.Count(), 20000000, "20,000,000 flat tuples counted without flattening");
 	ExpectTrue(big.RecordCount() == 20 + 20 * 2000, "held in 40,020 records");
-	std::printf("       %zu records, %zu bytes for 20,000,000 flat tuples\n", big.RecordCount(),
-	            big.BytesAllocated());
+	std::printf("       %zu records, %zu bytes for 20,000,000 flat tuples\n", big.RecordCount(), big.BytesAllocated());
 }
 
 int main() {

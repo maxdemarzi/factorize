@@ -6,7 +6,6 @@
 
 namespace factorize {
 
-
 double ColumnStats::TailRows() const {
 	double covered = 0;
 	for (const auto &entry : mcv) {
