@@ -1,0 +1,78 @@
+# name: test/sql/factorize_phase0.test
+# description: Phase 0 -- the OptimizerExtension / LogicalExtensionOperator / PhysicalOperator chain composes
+# group: [sql]
+
+require factorize
+
+statement ok
+CREATE TABLE a AS SELECT i % 10 AS x FROM range(100) t(i);
+
+statement ok
+CREATE TABLE b AS SELECT i % 10 AS x FROM range(100) t(i);
+
+# Default is 'off': the rule must not touch the plan.
+query I
+SELECT count(*) FROM a, b WHERE a.x = b.x;
+----
+1000
+
+query I
+SELECT current_setting('factorize_mode');
+----
+off
+
+# 'force' takes the plan over. The Phase 0 operator is a stub that ignores its
+# children and emits a constant, so 42 here means the whole chain fired.
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM a, b WHERE a.x = b.x;
+----
+42
+
+# ... and EXPLAIN shows the operator.
+query II
+EXPLAIN SELECT count(*) FROM a, b WHERE a.x = b.x;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Shapes outside the allowlist must be declined even under 'force'.
+
+# GROUP BY is a v2 item.
+query II
+SELECT a.x, count(*) FROM a, b WHERE a.x = b.x GROUP BY a.x ORDER BY a.x LIMIT 1;
+----
+0	100
+
+# Non-equality predicates.
+query I
+SELECT count(*) FROM a, b WHERE a.x > b.x;
+----
+4500
+
+# A single relation has nothing to factorize.
+query I
+SELECT count(*) FROM a;
+----
+100
+
+# An aggregate other than COUNT(*).
+query I
+SELECT sum(a.x) FROM a, b WHERE a.x = b.x;
+----
+4500
+
+# LEFT JOIN is not INNER.
+query I
+SELECT count(*) FROM a LEFT JOIN b ON a.x = b.x;
+----
+1000
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM a, b WHERE a.x = b.x;
+----
+1000
