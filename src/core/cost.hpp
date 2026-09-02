@@ -97,6 +97,8 @@ struct CostEstimate {
 	//! Estimated milliseconds for each engine.
 	double ours_ms = 0;
 	double duckdb_ms = 0;
+	//! Estimated bytes the f-representation will occupy.
+	double bytes = 0;
 	//! Whether the join graph is acyclic. The paper reports cyclic queries as
 	//! 32% slower, so they are refused outright.
 	bool acyclic = true;
@@ -134,6 +136,25 @@ struct CostThresholds {
 	EngineCost duckdb {34.33, 5.674e-6, 3.946e-5};
 	//! Fire only when we are predicted to beat DuckDB by this factor.
 	double margin = 1.5;
+	//! Bytes an f-representation record occupies: a fixed header plus a slot
+	//! per relation. Measured across 857 CE queries -- median 47 bytes overall,
+	//! rising from 37 at three relations to 64 at twelve.
+	double bytes_per_record = 28.0;
+	double bytes_per_relation = 3.0;
+	//! Decline when the f-representation is predicted not to fit. Zero means no
+	//! limit.
+	//!
+	//! This is the difference between declining a query and being killed by it.
+	//! F17: 47% of the excluded-regime queries exceed a 6 GB budget, and result
+	//! size does not predict which -- a 1.013e12-tuple query fits in 497K
+	//! records while a 1.093e11-tuple one does not.
+	//!
+	//! Measured on the CE corpus at a 4 GB budget it catches 47 of 75 overruns
+	//! and refuses 87 of 840 queries that would have fit. The refusals are free
+	//! there: the gate fires on *none* of them. AUC is 0.87, and predicting
+	//! bytes is no better than predicting records alone (0.875 vs 0.874) -- the
+	//! width term buys nothing but a number in the units budgets are set in.
+	double memory_budget_bytes = 0;
 	//! Refuse cyclic join graphs.
 	bool require_acyclic = true;
 };

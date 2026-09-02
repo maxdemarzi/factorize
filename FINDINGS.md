@@ -749,3 +749,43 @@ estimation with the statistics currently available. Closing them needs either a
 statistic that captures *joint* presence across columns (a sketch, not an MCV
 list), or a runtime bail-out that abandons factorization when it exceeds its
 predicted cost.
+
+## F20 — The 47% decline rate is 90% predictable before execution
+
+F17's open problem: in the excluded regime 162 of 344 hetio queries exceed a
+6 GB f-representation budget, and result size does not predict which -- a
+1.013e12-tuple query fits in 497K records while a 1.093e11-tuple one does not.
+Until now that was discovered at the memory cap, after the work was spent.
+
+The gate's record estimate answers it. Adding `CostThresholds::
+memory_budget_bytes` and a `--gate-only` harness mode (decide without running,
+which is what an optimizer does):
+
+**344 gate decisions in 0.85 seconds**, against roughly five hours to execute
+the same queries.
+
+| | predicted bytes p10 | median | p90 |
+|---|---|---|---|
+| fit in 6 GB (n=182) | 1.73e7 | **7.22e7** | 6.47e9 |
+| exceeded it (n=162) | 6.73e9 | **5.77e12** | 8.96e14 |
+
+Five orders of magnitude between the medians. **AUC 0.969.**
+
+| budget | catches of 162 overruns | wrongly refuses of 182 that fit |
+|---|---|---|
+| 1e9 | 157 (97%) | 35 (19%) |
+| 4e9 | 147 (91%) | 25 (14%) |
+| **6e9** (matching the cap) | **146 (90%)** | **19 (10%)** |
+| 2e10 | 134 (83%) | 9 (5%) |
+
+**It works far better here than on the CE corpus**, where the same guard scores
+AUC 0.87 and catches 63%. That is the expected direction: in the excluded
+regime f-representation sizes span fourteen orders of magnitude, so the
+estimator's ~7x error cannot blur the decision, whereas on the live corpus
+everything is bunched near the budget.
+
+Two things worth keeping straight. The byte conversion is cosmetic -- predicting
+records alone discriminates identically (AUC 0.874 vs 0.875 on CE); bytes exist
+so the budget can be set in the units budgets are set in. And on the CE corpus
+the false refusals cost nothing measurable, because the cost gate fires on
+*none* of the 87 queries the guard wrongly refuses there.

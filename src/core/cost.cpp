@@ -227,8 +227,19 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	estimate.ours_ms = thresholds.ours.Estimate(input_rows, estimate.factorized_records);
 	estimate.duckdb_ms = thresholds.duckdb.Estimate(input_rows, estimate.flat_tuples);
 
+	estimate.bytes = estimate.factorized_records *
+	                 (thresholds.bytes_per_record +
+	                  thresholds.bytes_per_relation * static_cast<double>(steps.size()));
+
 	if (thresholds.require_acyclic && !acyclic) {
 		estimate.reason = "cyclic join graph";
+		return estimate;
+	}
+	// Checked before the margin, because "will not fit" is a different answer
+	// from "will not pay" and deserves to say so.
+	if (thresholds.memory_budget_bytes > 0 && estimate.bytes > thresholds.memory_budget_bytes) {
+		estimate.reason = "predicted " + Format(estimate.bytes) + "B of f-representation, over the " +
+		                  Format(thresholds.memory_budget_bytes) + "B budget";
 		return estimate;
 	}
 	if (estimate.duckdb_ms < thresholds.margin * estimate.ours_ms) {

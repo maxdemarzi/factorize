@@ -300,6 +300,40 @@ static void TestGateDecision() {
 	}
 }
 
+//! A query that would win on time but cannot fit must be declined for the
+//! right reason, and the reason has to say so -- "will not fit" is a different
+//! answer from "will not pay", and confusing them makes the decline
+//! undiagnosable.
+static void TestMemoryBudget() {
+	std::printf("memory budget: refuse what will not fit, and say why\n");
+	std::vector<CostStep> steps;
+	for (int i = 0; i < 5; i++) {
+		CostStep step;
+		step.key = ToStats(Skewed(6000, 5, 40, 1), 8);
+		step.key_group = 0;
+		step.parent_step = i == 0 ? -1 : 0;
+		step.parent_key = step.key;
+		steps.push_back(step);
+	}
+
+	CostThresholds generous;
+	const auto unlimited = EstimateCost(steps, true, generous);
+	Check(unlimited.fire, "with no budget this query should fire");
+	Check(unlimited.bytes > 0, "bytes must be estimated");
+
+	CostThresholds tight = generous;
+	tight.memory_budget_bytes = unlimited.bytes / 2;
+	const auto refused = EstimateCost(steps, true, tight);
+	std::printf("  %.4g bytes predicted, budget %.4g -> %s (%s)\n", refused.bytes,
+	            tight.memory_budget_bytes, refused.fire ? "FIRE" : "decline", refused.reason.c_str());
+	Check(!refused.fire, "over budget must decline");
+	Check(refused.reason.find("budget") != std::string::npos, "the reason must name the budget");
+
+	CostThresholds ample = generous;
+	ample.memory_budget_bytes = unlimited.bytes * 2;
+	Check(EstimateCost(steps, true, ample).fire, "under budget must still fire");
+}
+
 static void TestEmptyMcvDegradesToTextbook() {
 	std::printf("no MCV list: must degrade to the textbook estimator, not to garbage\n");
 	std::vector<ColumnStats> stats;
@@ -322,6 +356,7 @@ int main() {
 	TestMismatchedCardinalities();
 	TestCalibration();
 	TestGateDecision();
+	TestMemoryBudget();
 	TestEmptyMcvDegradesToTextbook();
 	std::printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

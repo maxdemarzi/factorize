@@ -834,6 +834,7 @@ int main(int argc, char **argv) {
 	int repeats = 1;
 	bool run_flat = true;
 	std::string calibrate;
+	bool gate_only = false;
 	std::string only;
 
 	for (int i = 1; i < argc; i++) {
@@ -849,6 +850,8 @@ int main(int argc, char **argv) {
 			max_flat_rows = std::strtoul(next().c_str(), nullptr, 10);
 		} else if (arg == "--repeats") {
 			repeats = std::atoi(next().c_str());
+		} else if (arg == "--gate-only") {
+			gate_only = true;
 		} else if (arg == "--calibrate") {
 			calibrate = next();
 		} else if (arg == "--no-flat") {
@@ -870,7 +873,7 @@ int main(int argc, char **argv) {
 		std::fprintf(stderr,
 		             "usage: standalone --data <ce csv dir> --query <file.sql> [--query ...]\n"
 		             "                  [--limit N] [--repeats N] [--no-flat] [--only NAME]\n"
-		             "                  [--calibrate obs.csv]\n"
+		             "                  [--calibrate obs.csv] [--gate-only]\n"
 		             "                  [--max-flat-rows N]\n");
 		return 2;
 	}
@@ -981,6 +984,27 @@ int main(int argc, char **argv) {
 				return result;
 			};
 
+			if (gate_only) {
+				// What an optimizer actually does: decide without running. Costs a
+				// scan for statistics and nothing else, so this stays cheap on
+				// queries the engine could not finish at all.
+				CostEstimate decision;
+				try {
+					CostThresholds limits;
+					limits.memory_budget_bytes = static_cast<double>(g_max_frep_bytes);
+					decision = EstimateCost(BuildCostSteps(query, plan, cache), !query.cyclic, limits);
+				} catch (const std::exception &error) {
+					decision.reason = std::string("estimate failed: ") + error.what();
+				}
+				executed++;
+				std::printf("%s,%s,%lld,,,,,,,%.0f,%.4f,%.0f,%d,%s\n", query.name.c_str(),
+				            query.cyclic ? "cyclic" : "acyclic", static_cast<long long>(query.expected),
+				            decision.bytes, decision.ratio, decision.flat_tuples, decision.fire ? 1 : 0,
+				            decision.reason.c_str());
+				std::fflush(stdout);
+				continue;
+			}
+
 			RunResult top, bottom, flat;
 			top = measure([&]() {
 				return RunFactorized(query, plan, cache, JoinMode::TOP_INSERT, PathStrategy::LEVELWISE);
@@ -1025,7 +1049,9 @@ int main(int argc, char **argv) {
 					             cs.key.mcv.size(), cs.parent_key.distinct);
 				}
 			}
-			gate = EstimateCost(cost_steps, !query.cyclic);
+			CostThresholds limits;
+				limits.memory_budget_bytes = static_cast<double>(g_max_frep_bytes);
+				gate = EstimateCost(cost_steps, !query.cyclic, limits);
 			} catch (const std::exception &) {
 				gate.reason = "estimate failed";
 			}
