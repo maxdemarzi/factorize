@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "../core/cost.hpp"
+#include "../core/plan.hpp"
 #include "../core/join.hpp"
 
 #include <algorithm>
@@ -52,13 +53,6 @@ static double MillisSince(Clock::time_point start) {
 //===--------------------------------------------------------------------===//
 // CE corpus
 //===--------------------------------------------------------------------===//
-struct Predicate {
-	size_t left_relation;
-	int left_column; // 0 == s, 1 == d
-	size_t right_relation;
-	int right_column;
-};
-
 struct Query {
 	std::string name;
 	int64_t expected = -1;
@@ -73,6 +67,16 @@ struct Query {
 	std::vector<std::string> aliases;
 	std::vector<Predicate> predicates;
 	bool cyclic = false;
+
+	//! The shape, without the names. Every relation here is a two-column CE
+	//! table; the alias mapping stays on this side of the boundary.
+	QueryGraph Graph() const {
+		QueryGraph graph;
+		graph.column_counts.assign(tables.size(), 2);
+		graph.predicates = predicates;
+		graph.cyclic = cyclic;
+		return graph;
+	}
 };
 
 //! Parses one CE query file. Each file holds many queries, each introduced by
@@ -343,249 +347,37 @@ private:
 // dangling predicate between two already-joined relations, which would need a
 // selection operator the core does not have.
 //===--------------------------------------------------------------------===//
-struct PlanStep {
-	size_t relation;
-	//! Predicates connecting the new relation to everything joined so far.
-	std::vector<Predicate> edges;
-};
-
-struct Plan {
-	std::vector<PlanStep> steps;
-	bool complete = false;
-	std::string reason;
-};
-
-static Plan BuildPlan(const Query &query) {
-	Plan plan;
-	std::set<size_t> joined;
-	std::vector<bool> used(query.predicates.size(), false);
-
-	// Seed with the relation carrying the first predicate.
-	size_t seed = query.predicates.empty() ? 0 : query.predicates[0].left_relation;
-	joined.insert(seed);
-	plan.steps.push_back(PlanStep {seed, {}});
-
-	while (joined.size() < query.tables.size()) {
-		std::map<size_t, std::vector<Predicate>> candidates;
-		for (size_t i = 0; i < query.predicates.size(); i++) {
-			if (used[i]) {
-				continue;
-			}
-			const auto &predicate = query.predicates[i];
-			const bool left_in = joined.count(predicate.left_relation) > 0;
-			const bool right_in = joined.count(predicate.right_relation) > 0;
-			if (left_in == right_in) {
-				continue; // both or neither joined
-			}
-			candidates[left_in ? predicate.right_relation : predicate.left_relation].push_back(predicate);
-		}
-		if (candidates.empty()) {
-			plan.reason = "join graph is disconnected";
-			return plan;
-		}
-		auto best = candidates.begin();
-		for (auto it = candidates.begin(); it != candidates.end(); ++it) {
-			if (it->second.size() > best->second.size()) {
-				best = it;
-			}
-		}
-		plan.steps.push_back(PlanStep {best->first, best->second});
-		joined.insert(best->first);
-		for (size_t i = 0; i < query.predicates.size(); i++) {
-			const auto &predicate = query.predicates[i];
-			if (used[i]) {
-				continue;
-			}
-			const bool covers = (predicate.left_relation == best->first && joined.count(predicate.right_relation)) ||
-			                    (predicate.right_relation == best->first && joined.count(predicate.left_relation));
-			if (covers) {
-				used[i] = true;
-			}
-		}
-	}
-
-	for (size_t i = 0; i < query.predicates.size(); i++) {
-		if (!used[i]) {
-			// A predicate between two already-joined relations is a selection on
-			// the f-representation, which v1 does not implement.
-			plan.reason = "residual predicate needs a selection operator";
-			return plan;
-		}
-	}
-	plan.complete = true;
-	return plan;
-}
-
-//===--------------------------------------------------------------------===//
-// Factorized execution
-//===--------------------------------------------------------------------===//
-static AttributeId AttributeOf(size_t relation, int column) {
-	return static_cast<AttributeId>(relation * 2 + static_cast<size_t>(column));
-}
-
-//===--------------------------------------------------------------------===//
-// Equality propagation
-//
-// `a.s = b.s and b.s = c.s` puts all three attributes in one equivalence class,
-// so the second join may be keyed on *a.s* just as correctly as on b.s. Which
-// one is chosen decides the f-tree's shape: keying on the most recently added
-// relation nests every relation under the last one, producing a chain in which
-// nothing is independent and factorization saves nothing. Keying on the
-// shallowest available member makes the new subtree a *sibling* of the existing
-// ones -- independent, hence a Cartesian product -- which is the shape of the
-// paper's running example in Figure 3.
-//
-// This is ordinary optimizer behaviour, not a trick: DuckDB propagates equality
-// the same way.
-//===--------------------------------------------------------------------===//
-class EquivalenceClasses {
+//! Adapts the CSV table cache to the planner's data interface. The DuckDB
+//! table function supplies the same interface over base-table scans, so both
+//! callers share the join ordering, equality propagation and execution loop
+//! rather than keeping two copies that can drift.
+class CacheSource : public RelationSource {
 public:
-	explicit EquivalenceClasses(const Query &query) {
-		parent.resize(query.tables.size() * 2);
-		for (size_t i = 0; i < parent.size(); i++) {
-			parent[i] = i;
-		}
-		for (const auto &predicate : query.predicates) {
-			Merge(AttributeOf(predicate.left_relation, predicate.left_column),
-			      AttributeOf(predicate.right_relation, predicate.right_column));
-		}
+	CacheSource(const Query &query, TableCache &cache) : query(query), cache(cache) {
 	}
 
-	size_t Find(size_t x) {
-		while (parent[x] != x) {
-			parent[x] = parent[parent[x]];
-			x = parent[x];
-		}
-		return x;
+	const std::vector<std::vector<int64_t>> &Columns(size_t relation) override {
+		const auto &table = cache.Get(query.tables[relation]);
+		held.assign(2, {});
+		held[0].assign(table.s.begin(), table.s.end());
+		held[1].assign(table.d.begin(), table.d.end());
+		return held;
 	}
-	bool SameClass(AttributeId a, AttributeId b) {
-		return Find(a) == Find(b);
-	}
-	size_t Size() const {
-		return parent.size();
+
+	ColumnStats Stats(size_t relation, size_t column) override {
+		const auto &table = cache.Get(query.tables[relation]);
+		ColumnStats stats;
+		stats.rows = static_cast<double>(table.s.size());
+		stats.distinct = static_cast<double>(table.distinct[column]);
+		stats.mcv = table.mcv[column];
+		return stats;
 	}
 
 private:
-	void Merge(size_t a, size_t b) {
-		a = Find(a);
-		b = Find(b);
-		if (a != b) {
-			parent[a] = b;
-		}
-	}
-	std::vector<size_t> parent;
+	const Query &query;
+	TableCache &cache;
+	std::vector<std::vector<int64_t>> held;
 };
-
-//! Rewrites a probe-side key onto the shallowest equivalent attribute already
-//! present in the accumulated f-tree.
-static AttributeId ShallowestEquivalent(EquivalenceClasses &classes, const FTree &tree, AttributeId key) {
-	AttributeId best = key;
-	int best_depth = tree.DepthOfAttribute(key);
-	for (size_t candidate = 0; candidate < classes.Size(); candidate++) {
-		const auto attribute = static_cast<AttributeId>(candidate);
-		if (attribute == key || !classes.SameClass(attribute, key)) {
-			continue;
-		}
-		const int depth = tree.DepthOfAttribute(attribute);
-		if (depth < 0) {
-			continue; // not joined yet
-		}
-		if (best_depth < 0 || depth < best_depth) {
-			best = attribute;
-			best_depth = depth;
-		}
-	}
-	return best;
-}
-
-//! Builds the gate's view of the plan: for each relation, its size, the
-//! distinct counts on both sides of the join that attaches it, and whether it
-//! attaches as a sibling. Uses exactly the plan the engine will run, so the
-//! prediction describes the query that is actually executed.
-static ColumnStats StatsFor(const Table &table, size_t column) {
-	ColumnStats stats;
-	stats.rows = static_cast<double>(table.s.size());
-	stats.distinct = static_cast<double>(table.distinct[column]);
-	stats.mcv = table.mcv[column];
-	return stats;
-}
-
-//! Describes the plan to the gate: one step per relation, carrying its join
-//! column's statistics and the equivalence class that column belongs to.
-static std::vector<CostStep> BuildCostSteps(const Query &query, const Plan &plan, TableCache &cache) {
-	EquivalenceClasses classes(query);
-
-	// Which column each relation joins on. For every relation but the first this
-	// is the column its own attaching edge names; the first relation has no
-	// attaching edge, so it takes the first edge that mentions it.
-	std::map<size_t, size_t> join_column;
-	for (size_t i = 1; i < plan.steps.size(); i++) {
-		for (const auto &edge : plan.steps[i].edges) {
-			join_column.emplace(edge.left_relation, static_cast<size_t>(edge.left_column));
-			join_column.emplace(edge.right_relation, static_cast<size_t>(edge.right_column));
-		}
-	}
-
-	std::vector<CostStep> steps;
-	// Mirrors the engine exactly, including equality propagation: a relation
-	// attaches beneath the *shallowest* already-joined attribute of its
-	// equivalence class, not beneath whichever relation the predicate happens to
-	// name. That choice is what turns a chain into a star, and a star is the
-	// only shape that compresses -- so an estimator that ignores it predicts a
-	// ratio of about 1 for every query, including the ones that compress 3000x.
-	std::map<size_t, int> depth_of;   // relation -> depth in the f-tree
-	std::map<size_t, size_t> step_of; // relation -> index in `steps`
-
-	const size_t seed_relation = plan.steps[0].relation;
-	const auto &seed = cache.Get(query.tables[seed_relation]);
-	const size_t seed_column = join_column.count(seed_relation) ? join_column[seed_relation] : 0;
-	CostStep first;
-	first.key = StatsFor(seed, seed_column);
-	first.key_group = static_cast<int>(classes.Find(AttributeOf(seed_relation, static_cast<int>(seed_column))));
-	steps.push_back(first);
-	depth_of[seed_relation] = 0;
-	step_of[seed_relation] = 0;
-
-	for (size_t i = 1; i < plan.steps.size(); i++) {
-		const auto &step = plan.steps[i];
-		const auto &table = cache.Get(query.tables[step.relation]);
-		const auto &edge = step.edges.front();
-		const bool left_is_new = edge.left_relation == step.relation;
-		const auto new_column = static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column);
-		const auto named_relation = left_is_new ? edge.right_relation : edge.left_relation;
-		const auto named_column = static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column);
-		const auto named_attribute = AttributeOf(named_relation, static_cast<int>(named_column));
-
-		// Find the shallowest joined attribute equivalent to the predicate's.
-		size_t attach_relation = named_relation;
-		size_t attach_column = named_column;
-		int attach_depth = depth_of.count(named_relation) ? depth_of[named_relation] : 0;
-		for (size_t candidate = 0; candidate < classes.Size(); candidate++) {
-			const auto attribute = static_cast<AttributeId>(candidate);
-			const size_t owner = candidate / 2;
-			if (!depth_of.count(owner) || !classes.SameClass(attribute, named_attribute)) {
-				continue;
-			}
-			if (depth_of[owner] < attach_depth) {
-				attach_depth = depth_of[owner];
-				attach_relation = owner;
-				attach_column = candidate % 2;
-			}
-		}
-
-		const auto &attach_table = cache.Get(query.tables[attach_relation]);
-		CostStep entry;
-		entry.key = StatsFor(table, new_column);
-		entry.key_group = static_cast<int>(classes.Find(AttributeOf(step.relation, static_cast<int>(new_column))));
-		entry.parent_key = StatsFor(attach_table, attach_column);
-		entry.parent_step = static_cast<int>(step_of[attach_relation]);
-		steps.push_back(entry);
-
-		depth_of[step.relation] = attach_depth + 1;
-		step_of[step.relation] = steps.size() - 1;
-	}
-	return steps;
-}
 
 struct RunResult {
 	bool ok = false;
@@ -604,103 +396,23 @@ static RunResult RunFactorized(const Query &query, const Plan &plan, TableCache 
                                PathStrategy strategy) {
 	RunResult result;
 	const auto start = Clock::now();
-	try {
-		AttributeTypes types;
-		for (size_t r = 0; r < query.tables.size(); r++) {
-			types.emplace_back(AttributeOf(r, 0), ValueType::INT32);
-			types.emplace_back(AttributeOf(r, 1), ValueType::INT32);
-		}
-
-		auto make = [&](size_t relation) {
-			const auto &table = cache.Get(query.tables[relation]);
-			std::vector<std::vector<int64_t>> columns(2);
-			columns[0].assign(table.s.begin(), table.s.end());
-			columns[1].assign(table.d.begin(), table.d.end());
-			return MakeScan({AttributeOf(relation, 0), AttributeOf(relation, 1)}, types, columns);
-		};
-
-		EquivalenceClasses classes(query);
-		//! Set by the final join, which counts without materializing.
-		int64_t fused_count = -1;
-		auto accumulated = make(plan.steps[0].relation);
-		for (size_t i = 1; i < plan.steps.size(); i++) {
-			const auto &step = plan.steps[i];
-			// The accumulated tree must stay on top either way, otherwise the
-			// new relation becomes the root and every previous one nests
-			// beneath it -- a chain, in which nothing is independent.
-			//
-			// Top-insert puts the *probe* on top, bottom-insert the *build*, so
-			// the two modes take their arguments swapped. That is exactly the
-			// paper's  L (top-insert) R == R (bottom-insert) L : the shape is
-			// the same, and what differs is which side gets the hash table
-			// built on it. Decoupling those two choices is the whole point of
-			// having both modes.
-			JoinKeys keys;
-			std::vector<AttributeId> new_keys;
-			std::vector<AttributeId> accumulated_keys;
-			for (const auto &edge : step.edges) {
-				const bool left_is_new = edge.left_relation == step.relation;
-				new_keys.push_back(AttributeOf(left_is_new ? edge.left_relation : edge.right_relation,
-				                               left_is_new ? edge.left_column : edge.right_column));
-				const auto raw = AttributeOf(left_is_new ? edge.right_relation : edge.left_relation,
-				                             left_is_new ? edge.right_column : edge.left_column);
-				accumulated_keys.push_back(ShallowestEquivalent(classes, accumulated.Tree(), raw));
-			}
-			JoinStats join_stats;
-			// The aggregate is the topmost operator, so the final join's output
-			// exists only to be counted (sections 4.2.2 and 4.5). Building it
-			// would be the single most expensive step of the query -- it is
-			// where stock DuckDB spends 96% of its time on these shapes.
-			const bool last_join = (i + 1 == plan.steps.size());
-			if (mode == JoinMode::TOP_INSERT) {
-				keys.build = new_keys;
-				keys.probe = accumulated_keys;
-				if (last_join) {
-					fused_count =
-					    FactorizedCountJoin(make(step.relation), accumulated, keys, mode, strategy, &join_stats);
-				} else {
-					accumulated = FactorizedJoin(make(step.relation), accumulated, keys, mode, strategy, &join_stats);
-				}
-			} else {
-				keys.build = accumulated_keys;
-				keys.probe = new_keys;
-				if (last_join) {
-					fused_count =
-					    FactorizedCountJoin(accumulated, make(step.relation), keys, mode, strategy, &join_stats);
-				} else {
-					accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy, &join_stats);
-				}
-			}
-			if (g_verbose) {
-				std::fprintf(stderr,
-				             "    join %zu: +%s  build_keys=%zu probe_rows=%zu matches=%zu "
-				             "records=%zu bytes=%.1fMB count=%lld tree=%s\n",
-				             i, query.tables[step.relation].c_str(), join_stats.build_keys, join_stats.probe_rows,
-				             join_stats.matches, join_stats.output_records, join_stats.output_bytes / (1024.0 * 1024.0),
-				             static_cast<long long>(accumulated.Count()),
-				             accumulated.Tree().ToString(DefaultAttributeName).c_str());
-			}
-		}
-		// A single-relation query never reaches a join, so it still counts the
-		// scan's own representation.
-		result.count = fused_count >= 0 ? fused_count : accumulated.Count();
-		result.records = accumulated.Rep().RecordCount();
-		result.bytes = accumulated.Rep().BytesAllocated();
-		result.ok = true;
-	} catch (const std::exception &error) {
-		result.error = error.what();
-	}
+	CacheSource source(query, cache);
+	const auto executed = ExecuteCount(query.Graph(), plan, source, mode, strategy);
+	result.ok = executed.ok;
+	result.count = executed.count;
+	result.error = executed.error;
+	result.records = executed.records;
+	result.bytes = executed.bytes;
 	result.millis = MillisSince(start);
 	return result;
 }
 
-//===--------------------------------------------------------------------===//
-// Flat baseline
-//
-// Same arena, same chaining hash table, same plan. Intermediates are
-// materialized -- that is precisely the cost factorization avoids -- while the
-// final join only counts, as any real engine would for count(*).
-//===--------------------------------------------------------------------===//
+//! The flat baseline predates the shared planner and indexes attributes
+//! directly; CE relations are always two columns wide.
+static AttributeId AttributeOf(size_t relation, int column) {
+	return static_cast<AttributeId>(relation * 2 + static_cast<size_t>(column));
+}
+
 struct FlatRelation {
 	std::vector<AttributeId> attributes;
 	std::vector<int32_t> values; // row-major
@@ -941,7 +653,7 @@ int main(int argc, char **argv) {
 			if (cache.Bytes() > g_max_table_cache_bytes) {
 				cache.Clear();
 			}
-			const auto plan = BuildPlan(query);
+			const auto plan = BuildPlan(query.Graph());
 			if (g_verbose && plan.complete) {
 				std::fprintf(stderr, "  plan: ");
 				for (size_t s = 0; s < plan.steps.size(); s++) {
@@ -985,7 +697,8 @@ int main(int argc, char **argv) {
 				try {
 					CostThresholds limits;
 					limits.memory_budget_bytes = static_cast<double>(g_max_frep_bytes);
-					decision = EstimateCost(BuildCostSteps(query, plan, cache), !query.cyclic, limits);
+					CacheSource source(query, cache);
+					decision = EstimateCost(BuildCostSteps(query.Graph(), plan, source), !query.cyclic, limits);
 				} catch (const std::exception &error) {
 					decision.reason = std::string("estimate failed: ") + error.what();
 				}
@@ -1029,7 +742,8 @@ int main(int argc, char **argv) {
 			// prediction describes the query that was actually measured.
 			CostEstimate gate;
 			try {
-				const auto cost_steps = BuildCostSteps(query, plan, cache);
+				CacheSource source(query, cache);
+				const auto cost_steps = BuildCostSteps(query.Graph(), plan, source);
 				if (g_verbose) {
 					std::fprintf(stderr, "  cost steps:\n");
 					for (size_t c = 0; c < cost_steps.size(); c++) {

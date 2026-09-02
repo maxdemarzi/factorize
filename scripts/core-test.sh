@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 OUT="${TMPDIR:-/tmp}/factorize-core-test"
 mkdir -p "$OUT"
 
-CORE="src/core/ftree.cpp src/core/layout.cpp src/core/frep.cpp src/core/materialize.cpp src/core/join.cpp src/core/cost.cpp src/core/stats.cpp"
+CORE="src/core/ftree.cpp src/core/layout.cpp src/core/frep.cpp src/core/materialize.cpp src/core/join.cpp src/core/cost.cpp src/core/stats.cpp src/core/plan.cpp"
 FLAGS="-std=c++17 -g -Wall -Wextra -Wno-unused-parameter"
 # Correctness runs use the sanitizers; the stability test is large, so it gets
 # an optimized build too.

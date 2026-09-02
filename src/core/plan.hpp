@@ -1,0 +1,139 @@
+//===----------------------------------------------------------------------===//
+//                         factorize
+//
+// core/plan.hpp
+//
+// Everything between a join graph and a count: join ordering, equality
+// propagation, and the execution loop that drives join.hpp.
+//
+// This lived in the benchmark harness while there was only one caller. Phase 2
+// adds a second -- a DuckDB table function over real catalog tables -- and the
+// planning is the part that must not diverge between them. Equality propagation
+// in particular is not an optimization but a correctness-of-shape requirement:
+// attaching a relation beneath whichever relation its predicate happens to name,
+// rather than beneath the shallowest equivalent attribute, turns a star into a
+// chain and nothing in a chain is independent (FINDINGS F6). A second
+// implementation of that rule is a second chance to get it wrong.
+//
+// Callers differ only in where the data comes from, which is what
+// RelationSource abstracts. No DuckDB headers (plan section 4).
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "cost.hpp"
+#include "ftree.hpp"
+#include "join.hpp"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace factorize {
+
+//! An equality between two relations' columns.
+struct Predicate {
+	size_t left_relation = 0;
+	int left_column = 0;
+	size_t right_relation = 0;
+	int right_column = 0;
+};
+
+//! A join graph: relations, and the equalities connecting them.
+//!
+//! Relations are positions, not names. Several may refer to the same physical
+//! table -- a self-join is two relations over one table -- so the caller owns
+//! the mapping and this layer never resolves names.
+struct QueryGraph {
+	//! Columns each relation exposes. Join columns are indices into this.
+	std::vector<size_t> column_counts;
+	std::vector<Predicate> predicates;
+	//! Set when the graph has a cycle. Cyclic queries are refused by the gate;
+	//! the paper reports them 32% slower.
+	bool cyclic = false;
+
+	size_t RelationCount() const {
+		return column_counts.size();
+	}
+};
+
+//! The attribute id for one relation's column. Attribute ids are global across
+//! the query, so a relation's columns are contiguous from its base.
+AttributeId AttributeOf(const QueryGraph &graph, size_t relation, size_t column);
+
+//! Union-find over attributes, closing equality under transitivity.
+class EquivalenceClasses {
+public:
+	explicit EquivalenceClasses(const QueryGraph &graph);
+
+	size_t Find(size_t attribute);
+	bool SameClass(AttributeId a, AttributeId b);
+	size_t Size() const {
+		return parent.size();
+	}
+
+private:
+	std::vector<size_t> parent;
+};
+
+//! Rewrites a probe-side key onto the shallowest equivalent attribute already
+//! present in the accumulated f-tree.
+AttributeId ShallowestEquivalent(EquivalenceClasses &classes, const FTree &tree, AttributeId key);
+
+struct PlanStep {
+	size_t relation = 0;
+	//! Predicates connecting the new relation to everything joined so far.
+	std::vector<Predicate> edges;
+};
+
+//! A left-deep join order, plus why one could not be found.
+struct Plan {
+	std::vector<PlanStep> steps;
+	bool complete = false;
+	std::string reason;
+};
+
+//! Orders the joins greedily, taking the relation with the most edges into the
+//! already-joined set at each step. A relation that cannot be connected means a
+//! disconnected graph, which this refuses rather than turning into a product.
+Plan BuildPlan(const QueryGraph &graph);
+
+//! Supplies relation data on demand.
+//!
+//! Materializing every relation up front would defeat the point on the queries
+//! this engine is for, where the inputs are small and only the *result* is
+//! enormous -- but it also lets a caller stream from wherever it likes. The
+//! harness reads CSVs; the DuckDB operator scans base tables.
+class RelationSource {
+public:
+	virtual ~RelationSource() = default;
+	//! Columns of `relation`, in declaration order. The reference must stay
+	//! valid until the next call for a different relation.
+	virtual const std::vector<std::vector<int64_t>> &Columns(size_t relation) = 0;
+	//! Statistics for one column, for the gate.
+	virtual ColumnStats Stats(size_t relation, size_t column) = 0;
+};
+
+//! Describes `plan` to the gate.
+std::vector<CostStep> BuildCostSteps(const QueryGraph &graph, const Plan &plan, RelationSource &source);
+
+struct ExecuteResult {
+	bool ok = false;
+	int64_t count = -1;
+	std::string error;
+	//! Records and bytes in the last materialized f-representation. Zero when
+	//! the plan was a single fused count join, which never materializes.
+	size_t records = 0;
+	size_t bytes = 0;
+};
+
+//! Runs `plan`, returning the count without materializing the final join.
+//!
+//! The last join is fused (section 4.2.2, 4.5): its output exists only to be
+//! counted, and building it is where stock DuckDB spends 96% of its time on
+//! these shapes.
+ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                           PathStrategy strategy = PathStrategy::LEVELWISE);
+
+} // namespace factorize
