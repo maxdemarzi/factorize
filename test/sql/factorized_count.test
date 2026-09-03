@@ -147,3 +147,41 @@ statement error
 SELECT * FROM factorized_count(['a', 'nosuchtable'], ['a.s = nosuchtable.s']);
 ----
 nosuchtable
+
+# An f-representation that outgrows memory must fail the query, not the process.
+# On the CE corpus an unbounded build was OOM-killed and took the whole DuckDB
+# session with it; the engine is now capped by DuckDB's own memory_limit.
+#
+# This needs a shape where the *representation* is large, not merely the answer.
+# A star over `a` will not do it -- that is the case factorization handles, and
+# it stays at a few hundred records however big the count gets. A chain is the
+# opposite: each level multiplies, so 5,000 rows over 50 key values materialise
+# roughly half a million records.
+statement ok
+CREATE TABLE chainable AS SELECT i % 50 AS s, i % 50 AS d FROM range(5000) t(i);
+
+statement ok
+SET memory_limit = '10MB';
+
+statement error
+SELECT * FROM factorized_count(['chainable p', 'chainable q', 'chainable r'],
+                               ['p.d = q.s', 'q.d = r.s']);
+----
+memory limit
+
+statement ok
+RESET memory_limit;
+
+# ... and with room it answers: 5000 rows, each key value matching 100 rows at
+# each of two further levels.
+query I
+SELECT count(*) FROM chainable p, chainable q, chainable r
+ WHERE p.d = q.s AND q.d = r.s;
+----
+50000000
+
+query I
+SELECT * FROM factorized_count(['chainable p', 'chainable q', 'chainable r'],
+                               ['p.d = q.s', 'q.d = r.s']);
+----
+50000000

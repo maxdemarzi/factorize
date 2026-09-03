@@ -3,6 +3,7 @@
 #include "../core/plan.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -353,6 +354,21 @@ void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output
 	state.emitted = true;
 
 	auto &bind_data = data.bind_data->Cast<FactorizedCountBindData>();
+
+	// Bound to DuckDB's own memory_limit. Without this the engine allocates
+	// until the kernel kills the process -- which is exactly what happened on
+	// the CE corpus, taking the whole DuckDB session with it. An f-representation
+	// that silently OOMs is worse than one that is slow, so the core's allocator
+	// is capped and a query that would exceed the cap fails cleanly instead.
+	//
+	// Half the limit, not all of it: the base-table columns being scanned are
+	// held outside the arena and are not counted by it.
+	const auto &config = DBConfig::GetConfig(context);
+	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
+	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
+	                            : config.options.maximum_memory;
+	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+
 	const auto plan = factorize::BuildPlan(bind_data.graph);
 	if (!plan.complete) {
 		throw InvalidInputException("factorized_count: %s", plan.reason);
