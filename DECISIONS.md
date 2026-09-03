@@ -206,3 +206,54 @@ What this costs, stated plainly:
 Reversible: nothing is deleted, and the CE numbers stand on their own if the
 decision is revisited. Open items O11 (portable coefficients) and O12 (flat
 estimation on uniform data) apply to either direction.
+
+## D16 — Phase 2 complete: factorized_count() over DuckDB storage
+
+The plan's Phase 2 exit is "for 200+ CE queries, `factorized_count(...)` matches
+both the `-- Result size:` comment and stock DuckDB's `count(*)`. Zero
+mismatches." Both clauses are met.
+
+| check | result |
+|---|---|
+| CE queries run through the extension | **238** |
+| matching the published result size | **212** |
+| **mismatches** | **0** |
+| declined (memory cap) | 26, all watdiv |
+| three-way cross-check vs stock DuckDB | **25 / 25** |
+| sqllogictest assertions | 33 |
+| core unit checks | 77 |
+
+The cross-check reconstructs the equivalent plain SQL from the same lists the
+function takes, so both engines answer an identical question; it is limited to
+results under 2e6 tuples because the published sizes reach 1e17 and the point is
+agreement, not timing DuckDB.
+
+**Three things this phase established that were not in the plan.**
+
+**The extension must build at C++14.** C++17 makes DuckDB's `static constexpr`
+members implicitly inline, so a translation unit including its headers emits its
+own `duckdb::LogicalType::BIGINT` and collides at link time with the one
+DuckDB's C++11 build emits. C++11 lacks `make_unique` and generic lambdas, which
+`src/core/` needs. `std::byte` was the core's only C++17 dependency and is now
+`factorize::Byte`. `core-test.sh` and `run-ce.sh` build at C++14 as well, so the
+constraint is enforced rather than commented -- it immediately caught a missing
+`<algorithm>` that C++17 headers had been supplying transitively.
+
+**`CORE_SOURCES` was empty.** The engine had never been compiled into the
+extension; every green CI run before this built the glue and a stub operator.
+Any earlier statement that "CI builds the extension" was true but weaker than it
+sounded.
+
+**Memory accounting is not optional, and it was missing.** The first CE run
+OOM-killed the DuckDB process -- the kernel, not a query error. The engine now
+takes half of DuckDB's `memory_limit` (half because scanned base-table columns
+live outside the arena) and a query that would exceed it fails cleanly. Testing
+this needed a *chain*, the shape the engine handles worst: a four-way self-join
+star did not trip a 50 MB cap at all, because holding a few hundred records
+whatever the count is exactly what factorization does.
+
+Not established, deliberately: **no performance claim.** The local build is
+debug + ASAN, so nothing measured here is a timing. Statistics are computed
+exactly from the data just scanned rather than sampled from the catalog --
+DuckDB carries approximate distinct counts and no MCV list, which is Phase 3's
+problem (D13).
