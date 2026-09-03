@@ -7,7 +7,13 @@ OUT="${TMPDIR:-/tmp}/factorize-core-test"
 mkdir -p "$OUT"
 
 CORE="src/core/ftree.cpp src/core/layout.cpp src/core/frep.cpp src/core/materialize.cpp src/core/join.cpp src/core/cost.cpp src/core/stats.cpp src/core/plan.cpp"
-FLAGS="-std=c++17 -g -Wall -Wextra -Wno-unused-parameter"
+# C++14, not 17, and the tests enforce it rather than a comment asking nicely.
+# The extension has to compile at C++14 (see CMakeLists.txt): C++17 makes
+# DuckDB's static constexpr members implicitly inline and they collide at
+# link time, while C++11 lacks make_unique and generic lambdas. Building the
+# core standalone at 17 would let a C++17 feature in that only fails much
+# later, inside a 13-minute DuckDB build.
+FLAGS="-std=c++14 -g -Wall -Wextra -Wno-unused-parameter"
 # Correctness runs use the sanitizers; the stability test is large, so it gets
 # an optimized build too.
 MODE="${1:-both}"

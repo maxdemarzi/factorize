@@ -3,6 +3,7 @@
 #include "factorize_extension.hpp"
 
 #include "factorize/optimizer_rule.hpp"
+#include "factorize/table_function.hpp"
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
@@ -11,6 +12,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	FactorizeOptimizerExtension::Register(config);
+	RegisterFactorizedCount(loader);
 }
 
 void FactorizeExtension::Load(ExtensionLoader &loader) {

@@ -37,7 +37,7 @@ namespace factorize {
 class Record {
 public:
 	Record() = default;
-	Record(LevelId level, std::byte *data) : data(data), level(level) {
+	Record(LevelId level, Byte *data) : data(data), level(level) {
 	}
 
 	bool IsValid() const {
@@ -46,7 +46,7 @@ public:
 	LevelId Level() const {
 		return level;
 	}
-	std::byte *Data() const {
+	Byte *Data() const {
 		return data;
 	}
 
@@ -55,7 +55,7 @@ public:
 	}
 
 private:
-	std::byte *data = nullptr;
+	Byte *data = nullptr;
 	LevelId level = 0;
 };
 
@@ -143,7 +143,7 @@ public:
 		}
 		const auto child_size = layout->Level(slot.child_level).record_size;
 		for (auto *segment = static_cast<OverflowSegment *>(header->overflow_head); segment; segment = segment->next) {
-			auto *base = reinterpret_cast<std::byte *>(segment) + SegmentHeaderSize();
+			auto *base = reinterpret_cast<Byte *>(segment) + SegmentHeaderSize();
 			for (uint32_t i = 0; i < segment->count; i++) {
 				Record child(slot.child_level, base + static_cast<size_t>(i) * child_size);
 				if (!IsPruned(child)) {
@@ -161,7 +161,7 @@ public:
 		}
 		const auto record_size = layout->Level(0).record_size;
 		for (auto *segment = root_head; segment; segment = segment->next) {
-			auto *base = reinterpret_cast<std::byte *>(segment) + SegmentHeaderSize();
+			auto *base = reinterpret_cast<Byte *>(segment) + SegmentHeaderSize();
 			for (uint32_t i = 0; i < segment->count; i++) {
 				Record root(0, base + static_cast<size_t>(i) * record_size);
 				if (!IsPruned(root)) {

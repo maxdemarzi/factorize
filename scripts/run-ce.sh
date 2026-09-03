@@ -41,7 +41,7 @@ done
 # run is executing it truncates the file under the running process.
 BIN="$(mktemp "${TMPDIR:-/tmp}/factorize-standalone.XXXXXX")"
 trap 'rm -f "$BIN"' EXIT
-g++ -std=c++17 -O2 -g -o "$BIN" src/bench/standalone.cpp \
+g++ -std=c++14 -O2 -g -o "$BIN" src/bench/standalone.cpp \
     src/core/ftree.cpp src/core/layout.cpp src/core/frep.cpp \
     src/core/materialize.cpp src/core/join.cpp src/core/cost.cpp src/core/stats.cpp
 

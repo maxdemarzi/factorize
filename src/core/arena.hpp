@@ -31,6 +31,15 @@
 
 namespace factorize {
 
+//! Raw storage. This is `unsigned char` rather than `Byte` for one
+//! reason: DuckDB compiles at C++11, and a translation unit that includes
+//! DuckDB headers at C++17 turns their `static constexpr` members into inline
+//! definitions, which then collide at link time with the out-of-line ones
+//! DuckDB's own C++11 build emits (`multiple definition of
+//! duckdb::LogicalType::BIGINT`). `Byte` was the core's only C++17
+//! dependency, so dropping it lets the whole extension build at one standard.
+using Byte = unsigned char;
+
 class Arena {
 public:
 	explicit Arena(size_t first_chunk_bytes = 64 * 1024)
@@ -44,12 +53,12 @@ public:
 
 	//! Allocates `bytes`, zeroed, aligned for any scalar type. The returned
 	//! address stays valid for the lifetime of the arena.
-	std::byte *Allocate(size_t bytes) {
+	Byte *Allocate(size_t bytes) {
 		const size_t aligned = (bytes + kAlign - 1) & ~(kAlign - 1);
 		if (used + aligned > capacity) {
 			Grow(aligned);
 		}
-		std::byte *result = chunks.back().get() + used;
+		Byte *result = chunks.back().get() + used;
 		used += aligned;
 		allocated += aligned;
 		return result;
@@ -81,7 +90,7 @@ private:
 		while (bytes < at_least) {
 			bytes *= 2;
 		}
-		auto chunk = std::unique_ptr<std::byte[]>(new std::byte[bytes]);
+		auto chunk = std::unique_ptr<Byte[]>(new Byte[bytes]);
 		std::memset(chunk.get(), 0, bytes);
 		chunks.push_back(std::move(chunk));
 		used = 0;
@@ -94,7 +103,7 @@ private:
 		}
 	}
 
-	std::vector<std::unique_ptr<std::byte[]>> chunks;
+	std::vector<std::unique_ptr<Byte[]>> chunks;
 	size_t used = 0;
 	size_t capacity = 0;
 	size_t allocated = 0;

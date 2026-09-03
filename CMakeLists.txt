@@ -15,12 +15,21 @@ include_directories(src/include)
 
 # src/core/ is deliberately free of DuckDB headers (plan §4): it is compiled and
 # benchmarked standalone in Phase 1 so the go/no-go measurement stays honest.
-set(CORE_SOURCES)
+set(CORE_SOURCES
+    src/core/ftree.cpp
+    src/core/layout.cpp
+    src/core/frep.cpp
+    src/core/materialize.cpp
+    src/core/join.cpp
+    src/core/cost.cpp
+    src/core/stats.cpp
+    src/core/plan.cpp)
 
 set(DUCKDB_GLUE_SOURCES
     src/duckdb/logical_factorized.cpp
     src/duckdb/physical_factorized.cpp
-    src/duckdb/optimizer_rule.cpp)
+    src/duckdb/optimizer_rule.cpp
+    src/duckdb/table_function.cpp)
 
 set(EXTENSION_SOURCES
     src/factorize_extension.cpp
@@ -29,6 +38,23 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+# The extension builds at C++14, which is the only standard that works here.
+#
+# DuckDB compiles at C++11, and C++17 is not an option: it makes `static
+# constexpr` members implicitly inline, so a translation unit including DuckDB
+# headers emits its own definitions of things like duckdb::LogicalType::BIGINT
+# and they collide at link time with the out-of-line ones DuckDB's own build
+# emits. C++11 is not an option either: src/core/ needs std::make_unique and
+# generic lambdas, both C++14. C++14 has neither problem.
+#
+# src/core/ is kept free of C++17 (see the Byte alias in core/arena.hpp, which
+# exists in place of std::byte for exactly this reason).
+foreach(factorize_target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
+    set_target_properties(${factorize_target} PROPERTIES
+        CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+endforeach()
+
 
 install(
   TARGETS ${EXTENSION_NAME}

@@ -14,6 +14,7 @@
 #include "../../src/core/cost.hpp"
 #include "../../src/core/stats.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

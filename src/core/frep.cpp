@@ -42,7 +42,7 @@ Record FRepresentation::AppendRoot() {
 			next_root_capacity *= 2;
 		}
 	}
-	auto *base = reinterpret_cast<std::byte *>(root_tail) + SegmentHeaderSize();
+	auto *base = reinterpret_cast<Byte *>(root_tail) + SegmentHeaderSize();
 	auto *data = base + static_cast<size_t>(root_tail->count) * record_size;
 	root_tail->count++;
 	roots++;
@@ -83,7 +83,7 @@ Record FRepresentation::InsertChild(Record parent, size_t slot_index) {
 		header->overflow_tail = segment;
 		tail = segment;
 	}
-	auto *base = reinterpret_cast<std::byte *>(tail) + SegmentHeaderSize();
+	auto *base = reinterpret_cast<Byte *>(tail) + SegmentHeaderSize();
 	auto *data = base + static_cast<size_t>(tail->count) * child_size;
 	tail->count++;
 	header->count++;
