@@ -32,6 +32,8 @@ struct BoundRelation {
 	vector<idx_t> columns;
 	//! Column name for each entry of `columns`, for error messages.
 	vector<string> column_names;
+	//! Storage width for each entry of `columns`, parallel to it.
+	vector<factorize::ValueType> column_types;
 
 	int LocalIndex(idx_t physical) const {
 		for (idx_t i = 0; i < columns.size(); i++) {
@@ -83,17 +85,25 @@ string Trim(const string &text) {
 //! An f-representation packs keys into fixed-width slots, so a join key has to
 //! be an integer of known width. Rejecting here, by name, beats failing later
 //! inside the core with no idea which column was at fault.
-void RequireIntegerKey(const LogicalType &type, const string &alias, const string &column) {
+//!
+//! Returns the storage width the core must use for this column. This is not
+//! simply "32-bit types get INT32, 64-bit types get INT64": factorize::INT32
+//! is a *signed* 32-bit slot, and UINTEGER's range (0..4294967295) does not
+//! fit in one -- a value above INT32_MAX would be silently truncated exactly
+//! like the bug this function's caller exists to prevent. UINTEGER needs
+//! INT64 storage despite being nominally 32 bits.
+factorize::ValueType RequireIntegerKey(const LogicalType &type, const string &alias, const string &column) {
 	switch (type.id()) {
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:
 	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::UTINYINT:
 	case LogicalTypeId::USMALLINT:
+		return factorize::ValueType::INT32;
 	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::UBIGINT:
-		return;
+		return factorize::ValueType::INT64;
 	default:
 		throw BinderException("factorized_count: join key %s.%s is %s; only integer keys are supported", alias, column,
 		                      type.ToString());
@@ -172,13 +182,14 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 				throw BinderException("factorized_count: %s has no column '%s'", alias, column);
 			}
 			auto &definition = table_entry.GetColumn(column);
-			RequireIntegerKey(definition.Type(), alias, column);
+			const auto value_type = RequireIntegerKey(definition.Type(), alias, column);
 			const auto physical = static_cast<idx_t>(definition.Physical().index);
 
 			auto &bound = result->relations[relation];
 			if (bound.LocalIndex(physical) < 0) {
 				bound.columns.push_back(physical);
 				bound.column_names.push_back(column);
+				bound.column_types.push_back(value_type);
 			}
 			(side == 0 ? edge.left_relation : edge.right_relation) = relation;
 			(side == 0 ? edge.left_column : edge.right_column) = physical;
@@ -191,6 +202,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			throw BinderException("factorized_count: relation '%s' has no join predicate", result->relations[i].alias);
 		}
 		result->graph.column_counts.push_back(result->relations[i].columns.size());
+		result->graph.column_types.push_back(result->relations[i].column_types);
 	}
 	for (auto &edge : edges) {
 		Predicate predicate;
@@ -289,20 +301,34 @@ private:
 			if (chunk.size() == 0) {
 				break;
 			}
+			// A relation's columns must stay row-aligned: held[0][k] and
+			// held[1][k] have to describe the same source row, because MakeScan
+			// zips them back together by shared index with no row id attached.
+			// Deciding a row's fate (kept or dropped) requires looking at every
+			// column *before* pushing any of them -- checking and pushing one
+			// column at a time, independently, drops rows from whichever
+			// columns happen to hold a NULL and desynchronizes every row after
+			// the first such NULL for a relation with more than one join
+			// column. This was a live bug (FINDINGS): filter once per row,
+			// across all columns, or not at all.
+			std::vector<UnifiedVectorFormat> formats(bound.columns.size());
 			for (idx_t c = 0; c < bound.columns.size(); c++) {
-				auto &vec = chunk.data[c];
-				UnifiedVectorFormat format;
-				vec.ToUnifiedFormat(chunk.size(), format);
-				for (idx_t row = 0; row < chunk.size(); row++) {
-					const auto index = format.sel->get_index(row);
-					if (!format.validity.RowIsValid(index)) {
-						// A NULL never equals anything, so a NULL key cannot
-						// contribute to an inner join's count. Dropping the row
-						// is both correct and cheaper than encoding a value that
-						// can never match.
-						continue;
-					}
-					held[c].push_back(ValueToInt64(vec.GetType(), format, index));
+				chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
+			}
+			for (idx_t row = 0; row < chunk.size(); row++) {
+				bool all_valid = true;
+				for (idx_t c = 0; c < bound.columns.size() && all_valid; c++) {
+					all_valid = formats[c].validity.RowIsValid(formats[c].sel->get_index(row));
+				}
+				if (!all_valid) {
+					// A NULL in any of this relation's join columns can never
+					// equal anything, so the row can never contribute to an
+					// inner join's count.
+					continue;
+				}
+				for (idx_t c = 0; c < bound.columns.size(); c++) {
+					const auto index = formats[c].sel->get_index(row);
+					held[c].push_back(ValueToInt64(chunk.data[c].GetType(), formats[c], index));
 				}
 			}
 		}

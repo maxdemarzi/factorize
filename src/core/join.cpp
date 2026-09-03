@@ -35,6 +35,19 @@ FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const At
 	}
 	FactorizedRelation relation(FTree::Scan(attributes), types);
 	const size_t rows = columns.empty() ? 0 : columns[0].size();
+	// One caller (table_function.cpp) used to build `columns` by filtering NULLs
+	// independently per column, which desynchronizes rows the moment one column
+	// has a NULL and a sibling doesn't -- a relation's several columns must
+	// describe the same rows in the same order, or this zips unrelated values
+	// together. Catch it here, at the one place that assumes it, rather than
+	// trusting every future caller to get it right.
+	for (size_t c = 0; c < columns.size(); c++) {
+		if (columns[c].size() != rows) {
+			throw std::runtime_error("MakeScan: column " + std::to_string(c) + " has " +
+			                         std::to_string(columns[c].size()) + " rows, expected " + std::to_string(rows) +
+			                         " (columns of one relation must be row-aligned)");
+		}
+	}
 	const auto &level = relation.GetLayout().Level(0);
 	// Attributes are sorted inside the node and payload columns are ordered by
 	// width, so map each input column to its payload slot once.
@@ -282,7 +295,9 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 		// The build side is the lower part. Index its flattening contexts by
 		// key; each match replays one of them beneath a probe record.
 		Arena snapshots;
+		snapshots.SetMemoryLimit(GetGlobalMemoryLimit());
 		ChainingHashTable<const Record *> table;
+		table.SetMemoryLimit(GetGlobalMemoryLimit());
 		const auto lower_parents_local = lower_parents;
 		IterateKeyPath(lower_plan, 0, lower_key.plan_index, lower_parents_local, lower.Rep(), lower_ctx, [&]() {
 			const uint64_t key = lower_key.Read(lower_plan, lower.Rep(), lower_ctx);
@@ -323,6 +338,7 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 		// Bottom-insert: the build side is the upper part, so it is materialized
 		// first and the table points at the records probes append to (Figure 11).
 		ChainingHashTable<Record> table;
+		table.SetMemoryLimit(GetGlobalMemoryLimit());
 		IterateLevel(upper_plan, 0, upper.Rep(), upper_ctx, 0, [&]() {
 			Record root = out.AppendRoot();
 			MaterializeSubtree(upper_plan, 0, upper.Rep(), upper_ctx, out, root,
@@ -389,9 +405,10 @@ struct LowerSizeCounter {
 				// Fixed by the indexing pass: exactly one instance.
 				slot_total = Of(child.first);
 			} else {
-				IterateLevel(plan, child.first, input, ctx, 0, [&]() { slot_total += Of(child.first); });
+				IterateLevel(plan, child.first, input, ctx, 0,
+				            [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
 			}
-			size *= slot_total;
+			size = CheckedCardinalityMul(size, slot_total);
 			if (size == 0) {
 				return 0;
 			}
@@ -416,8 +433,9 @@ struct OutputCounter {
 		int64_t size = 1;
 		for (const auto &child : level.children) {
 			int64_t slot_total = 0;
-			IterateLevel(plan, child.first, input, ctx, 0, [&]() { slot_total += Of(child.first); });
-			size *= slot_total;
+			IterateLevel(plan, child.first, input, ctx, 0,
+			            [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
+			size = CheckedCardinalityMul(size, slot_total);
 			if (size == 0) {
 				return 0;
 			}
@@ -427,12 +445,12 @@ struct OutputCounter {
 			// the summed size of everything that matches this key.
 			int64_t matched = 0;
 			table.ForEachMatch(key.Read(plan, input, ctx), [&](int64_t subtree) {
-				matched += subtree;
+				matched = CheckedCardinalityAdd(matched, subtree);
 				if (matches) {
 					(*matches)++;
 				}
 			});
-			size *= matched;
+			size = CheckedCardinalityMul(size, matched);
 		}
 		return size;
 	}
@@ -483,6 +501,7 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 	// Index the lower side by key, storing the size each match would contribute
 	// rather than a handle to records that are never created.
 	ChainingHashTable<int64_t> table;
+	table.SetMemoryLimit(GetGlobalMemoryLimit());
 	IterateKeyPath(lower_plan, 0, lower_key.plan_index, lower_parents, lower.Rep(), lower_ctx, [&]() {
 		LowerSizeCounter counter {lower_plan, lower_on_key_path, lower.Rep(), lower_ctx};
 		table.Insert(lower_key.Read(lower_plan, lower.Rep(), lower_ctx), counter.Of(0));

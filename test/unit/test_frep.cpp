@@ -15,8 +15,10 @@
 #include "../../src/core/layout.hpp"
 
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -249,6 +251,44 @@ static void TestCount() {
 	std::printf("       %zu records, %zu bytes for 20,000,000 flat tuples\n", big.RecordCount(), big.BytesAllocated());
 }
 
+//! CheckedCardinalityAdd/Mul is what SubtreeSize/Count (and join.cpp's
+//! LowerSizeCounter/OutputCounter, the arithmetic FactorizedCountJoin runs for
+//! every real query) now route every accumulation through, in place of plain
+//! `+=`/`*=` that silently wrapped past INT64_MAX. Building an f-tree whose
+//! true cardinality exceeds int64 range is impractical (it would need to
+//! actually hold that many records, or the exponential-win property this
+//! whole engine exists for would have to be defeated on purpose); testing the
+//! checked primitives directly at the boundary is the honest regression test
+//! for this fix, the same way the memory-limit path is tested by exercising
+//! the limit check itself rather than by building an exabyte relation.
+static void TestOverflowIsCaught() {
+	std::printf("Overflow\n");
+	constexpr int64_t max = std::numeric_limits<int64_t>::max();
+
+	bool threw = false;
+	try {
+		CheckedCardinalityMul(max, 2);
+	} catch (const std::exception &) {
+		threw = true;
+	}
+	ExpectTrue(threw, "multiplying past INT64_MAX throws");
+
+	threw = false;
+	try {
+		CheckedCardinalityAdd(max, 1);
+	} catch (const std::exception &) {
+		threw = true;
+	}
+	ExpectTrue(threw, "adding past INT64_MAX throws");
+
+	// Values that fit exactly must not be rejected -- this is a boundary,
+	// not a blanket ban on large numbers.
+	ExpectEq<int64_t>(CheckedCardinalityMul(max, 1), max, "multiplying by 1 at the boundary is exact, not rejected");
+	ExpectEq<int64_t>(CheckedCardinalityAdd(max, 0), max, "adding 0 at the boundary is exact, not rejected");
+	ExpectEq<int64_t>(CheckedCardinalityMul(0, max), 0, "multiplying by 0 never overflows, regardless of the other operand");
+	ExpectEq<int64_t>(CheckedCardinalityMul(1000, 1000), 1000000, "ordinary multiplication is unaffected");
+}
+
 int main() {
 	std::printf("factorize core: layout / arena / f-representation\n\n");
 	TestLayout();
@@ -258,6 +298,8 @@ int main() {
 	TestInlining();
 	std::printf("\n");
 	TestCount();
+	std::printf("\n");
+	TestOverflowIsCaught();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

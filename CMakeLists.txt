@@ -8,7 +8,11 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+# This is a no-op for the factorize targets specifically -- see the comment
+# below at the CXX_STANDARD 14 override for why, and why 14 is correct. Left
+# at 14 (not 17) so this line does not contradict that override even though it
+# currently does not take effect.
+set(CMAKE_CXX_STANDARD "14" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)

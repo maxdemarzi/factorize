@@ -2,6 +2,7 @@
 
 #include <map>
 #include <set>
+#include <stdexcept>
 
 namespace factorize {
 
@@ -77,7 +78,28 @@ AttributeId ShallowestEquivalent(EquivalenceClasses &classes, const FTree &tree,
 	return best;
 }
 
+//! Every f-tree/materialize traversal downstream of a plan (ftree.cpp,
+//! materialize.cpp) is plain C++ recursion, one stack frame per tree level,
+//! with no depth cap of its own -- a stack overflow crashes the whole process,
+//! not just the offending query, which is a worse failure mode than any
+//! std::runtime_error this codebase otherwise uses for bad input. Tree depth
+//! is bounded by the number of relations in the worst case (a pure chain, no
+//! equality propagation flattening it into a shallower star), so bounding
+//! relation count here protects every downstream traversal at the one place
+//! every caller's query already passes through, without touching each
+//! traversal individually. 500 is generous relative to any real workload
+//! (FINDINGS' own bytes-per-record table tops out at 12 relations) and
+//! conservative relative to a 1MB thread stack even allowing several stacked
+//! recursive calls per tree level.
+static constexpr size_t kMaxRelations = 500;
+
 Plan BuildPlan(const QueryGraph &graph) {
+	if (graph.RelationCount() > kMaxRelations) {
+		Plan plan;
+		plan.reason = "too many relations (" + std::to_string(graph.RelationCount()) + " > " +
+		              std::to_string(kMaxRelations) + "); f-tree traversals recurse per level with no depth cap";
+		return plan;
+	}
 	Plan plan;
 	std::set<size_t> joined;
 	std::vector<bool> used(graph.predicates.size(), false);
@@ -219,10 +241,17 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 		return result;
 	}
 	try {
+		if (graph.column_types.size() != graph.RelationCount()) {
+			throw std::runtime_error("QueryGraph::column_types must have one entry per relation");
+		}
 		AttributeTypes types;
 		for (size_t relation = 0; relation < graph.RelationCount(); relation++) {
+			if (graph.column_types[relation].size() != graph.column_counts[relation]) {
+				throw std::runtime_error("QueryGraph::column_types[" + std::to_string(relation) +
+				                         "] must have one entry per column");
+			}
 			for (size_t column = 0; column < graph.column_counts[relation]; column++) {
-				types.emplace_back(AttributeOf(graph, relation, column), ValueType::INT32);
+				types.emplace_back(AttributeOf(graph, relation, column), graph.column_types[relation][column]);
 			}
 		}
 

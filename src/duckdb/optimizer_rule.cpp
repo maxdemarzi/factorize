@@ -194,7 +194,14 @@ void FactorizeOptimizerExtension::Optimize(OptimizerExtensionInput &input, uniqu
 	}
 
 	auto mode = GetFactorizeMode(context);
-	if (mode == FactorizeMode::OFF) {
+	// AUTO is intended to fire only when a cost gate agrees (optimizer_rule.hpp);
+	// no gate exists yet, and the operator's answer is a hardcoded stub, not a
+	// real count. Treating AUTO as OFF until the gate lands keeps the option's
+	// documented distinction from FORCE true instead of silently absent -- the
+	// prior behavior (AUTO == FORCE) let a stub answer flow through HAVING,
+	// ORDER BY or arithmetic over the aggregate with no error and no visible
+	// "42" anywhere in the output.
+	if (mode == FactorizeMode::OFF || mode == FactorizeMode::AUTO) {
 		return;
 	}
 	RewriteRecursive(input, plan);
@@ -211,10 +218,11 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 
 	// Default is 'off' while the operator is a Phase 0 stub that returns a
 	// constant. Phase 3 flips the default to 'auto' once it computes real counts.
-	config.AddExtensionOption("factorize_mode",
-	                          "Factorized execution: 'off', 'auto' (fire when the cost gate agrees) or "
-	                          "'force' (fire whenever the plan shape matches; benchmarking only)",
-	                          LogicalType::VARCHAR, Value("off"));
+	config.AddExtensionOption(
+	    "factorize_mode",
+	    "Factorized execution: 'off', 'auto' (intended to fire when the cost gate agrees; behaves as 'off' "
+	    "until Phase 3 implements the gate) or 'force' (fire whenever the plan shape matches; benchmarking only)",
+	    LogicalType::VARCHAR, Value("off"));
 	config.AddExtensionOption("factorize_debug_print_plan",
 	                          "Print the post-optimizer logical plan seen by the factorize rule", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false));

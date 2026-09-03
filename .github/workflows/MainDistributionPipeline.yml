@@ -17,20 +17,27 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
+# v1.5-variegata is a branch, not a tag (confirmed via `git ls-remote --heads`
+# vs `--tags`), so a name-based ref here or in ci_tools_version can move to a
+# different commit than the one actually vendored in this repo's
+# extension-ci-tools submodule -- CI's build/lint logic drifting independently
+# of the pinned engine it is supposed to be testing. Pinned to the exact commit
+# `git ls-tree HEAD extension-ci-tools` reports (matches the branch tip at the
+# time of pinning; update deliberately alongside the submodule, not silently).
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@72e76e99cd7fee45a99739cd118ec2db64e034ec
     with:
       duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: 72e76e99cd7fee45a99739cd118ec2db64e034ec
       extension_name: factorize
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@72e76e99cd7fee45a99739cd118ec2db64e034ec
     with:
       duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: 72e76e99cd7fee45a99739cd118ec2db64e034ec
       extension_name: factorize
       format_checks: 'format;tidy'

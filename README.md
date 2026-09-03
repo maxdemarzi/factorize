@@ -9,24 +9,26 @@ Efficient Factorized Execution for Relational Systems* (PVLDB 19(11):3006–3019
 2026). Derived from the paper only — no GPLv3 source was read or ported
 ([DECISIONS](DECISIONS.md) D1). MIT licensed.
 
-## Status: research core, no extension surface yet
+## Status: explicit SQL surface works, transparent integration does not
 
-Be clear about what this is. The engine and the cost model work and are
-measured. **The extension surface is not built.** Everything below was run
-through `src/bench/standalone.cpp`, not through DuckDB.
+Be clear about what this is. The engine, the cost model, and an explicit
+`factorized_count()` table function all work and are measured against real
+DuckDB storage. **Plain SQL is not yet transparently accelerated** — that
+needs the optimizer rule to actually decide when to fire, which does not
+exist yet.
 
 | | state |
 |---|---|
 | f-representation engine (`src/core/`) | working, measured |
 | MCV statistics and cost model | working, measured |
-| gate (fire/decline decision) | working, measured |
-| DuckDB optimizer integration | **not built** — Phase 0 binding spike only |
-| table function / SQL surface | **not built** |
+| gate (fire/decline decision) | working, measured (standalone harness) |
+| `factorized_count()` table function | working — 238 CE queries, 0 mismatches against published sizes and stock DuckDB (DECISIONS D16) |
+| DuckDB optimizer integration (`factorize_mode='auto'`) | **not built** — the matcher exists but is a Phase 0 stub with no cost gate wired in; `'auto'` currently behaves as `'off'` rather than firing ungated |
 | parallelism | **not built** — single-threaded |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
-v1.5.5, so the code compiles as an extension; it just does not yet do anything
-from SQL.
+v1.5.5. `factorized_count()` is reachable from SQL today; ordinary
+`count(*)` queries are not yet automatically rewritten to use it.
 
 ## What it does
 

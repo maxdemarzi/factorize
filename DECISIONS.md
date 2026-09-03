@@ -257,3 +257,119 @@ debug + ASAN, so nothing measured here is a timing. Statistics are computed
 exactly from the data just scanned rather than sampled from the catalog --
 DuckDB carries approximate distinct counts and no MCV list, which is Phase 3's
 problem (D13).
+
+## D17 — Adversarial review of the whole tree; two P0 data-integrity bugs fixed before ever reaching origin
+
+Ran the full orchestrated adversarial-repo-review protocol
+(test/adversarial-repo-review.prompt) against the working tree at 6e55ce6f
+(branch phase2-extension-surface, at the time still unpushed -- Phase 2's own
+commits had not left this machine). Repo-map, split-plan, six serial
+specialists with a handoff ledger, synthesis: verdict BLOCK, 2 P0, 9 P1, 17
+P2, 28 findings total. Full report and every specialist artifact under
+tmp/20260903-adversarial-*.md (gitignored; not reproduced here).
+
+Every P0/P1 disposition below was independently re-verified against the
+actual source before being trusted, not taken on the report's word -- in one
+case (the NULL-desync bug) the review's evidence was right but the mechanism
+turned out worse than first stated.
+
+Fixed, each with a regression test, all under test/unit/:
+
+- P0: ExecuteCount hardcoded every column to ValueType::INT32 (plan.cpp), so
+  any BIGINT/UBIGINT join key outside int32 range was silently truncated via
+  static_cast<int32_t> in join.cpp::MakeScan -- two distinct 64-bit values
+  differing only above bit 31 became the same key, with no error.
+  QueryGraph::column_types is now required (not defaulted) at every call
+  site; table_function.cpp's RequireIntegerKey returns the real width,
+  correcting a second latent instance of the same class of bug along the
+  way -- UINTEGER (0..4294967295) does not fit a signed INT32 slot despite
+  being nominally 32 bits, and needs INT64 storage. test_plan.cpp asserts the
+  specific alias case: two BIGINT values sharing low 32 bits must not
+  collide.
+- P0: StorageSource::Load filtered NULLs independently per column
+  (table_function.cpp), desynchronizing a relation's columns from each other
+  the moment one column held a NULL a sibling didn't -- ordinary star-schema
+  shapes, not an edge case. Worse than the review stated: since MakeScan
+  indexes every column up to columns[0].size(), a relation whose later
+  column ended up shorter than column 0 was an out-of-bounds vector read,
+  not merely a misalignment. Fixed by deciding a row's fate across all of a
+  relation's columns at once. Added a row-count assertion inside MakeScan
+  itself so this class of bug cannot recur silently regardless of where it
+  is next introduced. factorized_count.test gained a composite-key NULL case
+  engineered to fabricate a nonexistent row (p=3,q=2) under the old bug.
+- P1: unchecked int64 overflow in the count arithmetic
+  (frep.cpp::SubtreeSize/Count, join.cpp's LowerSizeCounter/OutputCounter --
+  the arithmetic FactorizedCountJoin runs for every real query).
+  CheckedCardinalityAdd/Mul (frep.hpp) use portable manual overflow checks,
+  not __builtin_mul_overflow/__builtin_add_overflow: those are GCC/Clang-only
+  and this project's CI has a plain-MSVC Windows target (windows_amd64,
+  distinct from windows_amd64_mingw) that does not support them -- the
+  review's own suggested fix would have broken that target.
+- P1: the memory limit only covered the output FRepresentation's arena, not
+  ChainingHashTable's entry arena or the top-insert snapshot arena, so a
+  large build side with a tiny output could exhaust memory with no check
+  regardless of how small the eventual count was. Fixed at the Arena
+  primitive itself (SetMemoryLimit, checked in Allocate) rather than by
+  threading a parameter through each caller individually, so every Arena in
+  the codebase is covered by one change, including ones added later.
+- P1: unbounded recursion depth across every f-tree/materialize traversal,
+  proportional to join-chain length, with nothing capping how many relations
+  a caller (a public table function taking a caller-supplied list) can
+  supply. BuildPlan now refuses more than 500 relations before any recursion
+  runs -- generous against any real workload (12 relations is the most
+  FINDINGS' own tables go to) and conservative against a 1MB thread stack
+  even allowing several stacked calls per tree level. The full hardening fix
+  (convert the hottest traversals to explicit-stack iteration) is deferred;
+  the cap is the "minimal" fix the review itself named.
+- P1: factorize_mode='auto' was byte-identical to 'force' -- no cost gate
+  exists yet, so the option's own documented promise ("fire when the cost
+  gate agrees") was silently false, and a stub-fabricated 42 could flow into
+  HAVING/arithmetic over the aggregate with no visible 42 anywhere in the
+  output. AUTO now behaves as OFF until Phase 3 implements a real gate;
+  factorize_phase0.test gained a regression case.
+- P1: the benchmark harness's "unsupported" CSV row was missing 3 trailing
+  fields against the 14-column header, misaligning every downstream column
+  and crashing analyze-ce.py on the first declined query in any run.
+- P1: README.md's Status table claimed the table function and optimizer
+  integration were "not built" one commit after three commits shipped
+  exactly those things. Rewritten against the actual state.
+- P1: CI's reusable-workflow refs were pinned to @v1.5-variegata, a branch
+  (confirmed live via git ls-remote --heads vs --tags), not a tag -- CI's
+  build/lint logic could silently drift to a different commit than the one
+  actually vendored in this repo's extension-ci-tools submodule. Pinned both
+  uses: refs and both ci_tools_version inputs to the exact SHA
+  git ls-tree HEAD extension-ci-tools reports.
+- P1 (closed as a side effect): plan.cpp had zero unit-test coverage, the
+  module containing the ExecuteCount P0. test/unit/test_plan.cpp is new.
+- P2 hygiene taken along the way: the leftover CMAKE_CXX_STANDARD "17"
+  default in CMakeLists.txt (a no-op today, but contradicted the file's own
+  C++14 rationale 30 lines later) changed to 14; .gitmodules's branch = main
+  on both submodules (a footgun for a future git submodule update --remote,
+  which would silently move off the pinned commits) removed rather than
+  corrected to two different actual refs.
+
+Deliberately not fixed, and why:
+
+- P1: g_memory_limit is a process-global, unsynchronized size_t. Now read
+  from more call sites than before (every Arena/ChainingHashTable the
+  memory-limit fix above touches), which is a slightly larger surface for
+  the exact same pre-existing race, not a new one. Not reachable today --
+  Phase 4 parallelism does not exist -- but a real landmine for whenever it
+  does. Left open rather than redesigned under time pressure; the right fix
+  (capture the limit once per query, thread it explicitly or make it
+  thread-local) touches every call site this pass already touched once and
+  deserves its own dedicated pass with test cycles, not a second pass
+  bolted onto this one.
+- 16 P2 items (dead scripts, untested rejection paths, duplicated MCV
+  computation between standalone.cpp and table_function.cpp, Arena's
+  move-safety, license copyright text, doc staleness in test/README.md and
+  docs/UPDATING.md) are recorded in the full report but not actioned here.
+
+Verification: every fix has a dedicated regression test. Full core suite
+(asan+ubsan and -O2, test_ftree/test_frep/test_join/test_cost/test_plan) is
+98 checks, 0 failures across both configurations. One false alarm along the
+way: a background WSL compile briefly showed an error for arena.hpp's new
+memory_limit member that turned out to be a torn read of the file mid-edit
+(the compiler running concurrently with an in-progress Edit call), not a
+real failure -- discarded once the on-disk state was re-read directly and a
+clean rebuild confirmed it.

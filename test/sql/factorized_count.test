@@ -88,6 +88,29 @@ SELECT * FROM factorized_count(['a', 'nullable'], ['a.s = nullable.s']);
 ----
 20
 
+# A relation contributing TWO join columns, with NULLs in different rows of
+# different columns. This is the composite-key shape that exposed a real bug:
+# NULLs used to be filtered independently per column, which desynchronizes a
+# relation's columns from each other. Filtering (NULL,2) out of column p but
+# keeping it in column q, and symmetrically for (3,NULL), used to fabricate a
+# row (p=3, q=2) that never existed in the source data. Correct behaviour
+# drops a row from every column at once if any of its join columns is NULL:
+# only (1,1) and (2,2) survive, each contributing 10*10 = 100 (a.s has 10
+# rows per distinct value 0..9), for a total of 200 -- not the 300 the
+# desynchronized version would compute by fabricating (3,2).
+statement ok
+CREATE TABLE composite AS SELECT * FROM (VALUES (1, 1), (NULL, 2), (3, NULL), (2, 2)) v(p, q);
+
+query I
+SELECT count(*) FROM a x, a y, composite WHERE x.s = composite.p AND y.s = composite.q;
+----
+200
+
+query I
+SELECT * FROM factorized_count(['a x', 'a y', 'composite'], ['x.s = composite.p', 'y.s = composite.q']);
+----
+200
+
 # Wider integer types are accepted and compared by value.
 statement ok
 CREATE TABLE wide AS SELECT (i % 10)::BIGINT AS s, i::BIGINT AS d FROM range(100) t(i);

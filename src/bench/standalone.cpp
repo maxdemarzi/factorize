@@ -73,6 +73,11 @@ struct Query {
 	QueryGraph Graph() const {
 		QueryGraph graph;
 		graph.column_counts.assign(tables.size(), 2);
+		// CE tables are two int32_t columns (TableCache::Table::s/d), never
+		// wider. Explicit rather than defaulted: ExecuteCount now requires every
+		// caller to say so, instead of assuming it (FINDINGS, the ExecuteCount
+		// INT32 hardcoding bug).
+		graph.column_types.assign(tables.size(), {ValueType::INT32, ValueType::INT32});
 		graph.predicates = predicates;
 		graph.cyclic = cyclic;
 		return graph;
@@ -663,7 +668,7 @@ int main(int argc, char **argv) {
 			}
 			if (!plan.complete) {
 				unsupported++;
-				std::printf("%s,%s,%lld,,,,,,,,unsupported: %s\n", query.name.c_str(),
+				std::printf("%s,%s,%lld,,,,,,,,,,,unsupported: %s\n", query.name.c_str(),
 				            query.cyclic ? "cyclic" : "acyclic", static_cast<long long>(query.expected),
 				            plan.reason.c_str());
 				std::fflush(stdout);

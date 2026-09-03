@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <vector>
 
 namespace factorize {
@@ -55,6 +56,17 @@ public:
 	//! address stays valid for the lifetime of the arena.
 	Byte *Allocate(size_t bytes) {
 		const size_t aligned = (bytes + kAlign - 1) & ~(kAlign - 1);
+		// FRepresentation's own segment allocator has checked itself against a
+		// caller-supplied limit from the start; this arena, used bare by
+		// ChainingHashTable's entries and by the top-insert snapshot arena in
+		// join.cpp, did not, and a large build side with a small output could
+		// exhaust memory with no check at all regardless of how small the
+		// counted/materialized result turned out to be. Checked here rather
+		// than only in FRepresentation so every Arena is covered by the one
+		// change, not by remembering to wrap each new caller individually.
+		if (memory_limit != 0 && allocated + aligned > memory_limit) {
+			throw std::runtime_error("arena exceeded its memory limit");
+		}
 		if (used + aligned > capacity) {
 			Grow(aligned);
 		}
@@ -62,6 +74,14 @@ public:
 		used += aligned;
 		allocated += aligned;
 		return result;
+	}
+
+	//! Caps total bytes this arena will hand out; 0 (the default) means
+	//! unlimited. Set once, before any allocation the caller wants covered --
+	//! typically right after construction, from the same limit
+	//! FRepresentation::SetMemoryLimit uses.
+	void SetMemoryLimit(size_t bytes) {
+		memory_limit = bytes;
 	}
 
 	//! Total bytes handed out. Used for memory accounting; Phase 2 reports this
@@ -109,6 +129,8 @@ private:
 	size_t allocated = 0;
 	size_t reserved = 0;
 	size_t next_chunk_bytes;
+	//! 0 = unlimited.
+	size_t memory_limit = 0;
 };
 
 } // namespace factorize

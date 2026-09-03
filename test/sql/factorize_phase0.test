@@ -69,6 +69,23 @@ SELECT count(*) FROM a LEFT JOIN b ON a.x = b.x;
 ----
 1000
 
+# AUTO is documented as "fire when the cost gate agrees" -- no gate exists yet
+# (Phase 3), so AUTO must behave as OFF, not silently as FORCE. This was a live
+# regression: AUTO and FORCE were byte-identical, so a user opting into the
+# supposedly gated mode got the same fabricated stub answer as 'force'.
+statement ok
+SET factorize_mode = 'auto';
+
+query I
+SELECT count(*) FROM a, b WHERE a.x = b.x;
+----
+1000
+
+query I
+SELECT current_setting('factorize_mode');
+----
+auto
+
 statement ok
 SET factorize_mode = 'off';
 

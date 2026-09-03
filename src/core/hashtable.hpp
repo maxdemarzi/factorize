@@ -131,6 +131,14 @@ public:
 		return arena.BytesAllocated() + directory.capacity() * sizeof(Entry *);
 	}
 
+	//! Caps the entry arena the same way FRepresentation caps its own; 0 means
+	//! unlimited. One `Entry` is allocated per `Insert`, so an unbounded build
+	//! side previously grew this arena with no check regardless of how small
+	//! the eventual output was.
+	void SetMemoryLimit(size_t bytes) {
+		arena.SetMemoryLimit(bytes);
+	}
+
 private:
 	size_t Slot(uint64_t key) const {
 		// Take the high bits, as the paper does. `mask` guards the bits == 0

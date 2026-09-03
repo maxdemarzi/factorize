@@ -48,6 +48,16 @@ struct Predicate {
 struct QueryGraph {
 	//! Columns each relation exposes. Join columns are indices into this.
 	std::vector<size_t> column_counts;
+	//! The storage width of each column: column_types[relation][column].
+	//! Required to match column_counts exactly -- ExecuteCount throws rather
+	//! than default a missing entry. There used to be a default (every column
+	//! was silently ValueType::INT32), and it silently truncated BIGINT/UBIGINT
+	//! join keys via a narrowing static_cast: two values differing only above
+	//! bit 31 became indistinguishable, with no error. A caller whose columns
+	//! are genuinely always 32-bit (the CE benchmark harness) still has to say
+	//! so explicitly, which is one line per relation and costs nothing next to
+	//! what the implicit version cost.
+	std::vector<std::vector<ValueType>> column_types;
 	std::vector<Predicate> predicates;
 	//! Set when the graph has a cycle. Cyclic queries are refused by the gate;
 	//! the paper reports them 32% slower.

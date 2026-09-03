@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -670,6 +671,66 @@ static void TestFusedCount() {
 	}
 }
 
+//! The memory limit used to check only the OUTPUT arena (FRepresentation),
+//! which a large-build/tiny-output query sails past: one entry goes into the
+//! hash table per BUILD row regardless of whether it ever matches, and
+//! top-insert additionally snapshots every build row's flattening context, so
+//! a large build side grows real memory with the output staying tiny the
+//! whole time. This constructs exactly that shape -- 200,000 distinct build
+//! keys, a 2-row probe matching only two of them -- under a limit generous
+//! enough for the couple of output records but nowhere near enough for
+//! 200,000 hash table entries, and checks the join throws instead of
+//! allocating past the caller's budget.
+static void TestMemoryLimitCoversBuildSide() {
+	std::printf("Memory limit on the build side (hash table / snapshot arena)\n");
+	enum : AttributeId { A = 0 };
+	const AttributeTypes types = {{A, ValueType::INT32}};
+
+	constexpr int64_t build_rows = 200000;
+	std::vector<int64_t> build_keys(static_cast<size_t>(build_rows));
+	for (int64_t i = 0; i < build_rows; i++) {
+		build_keys[static_cast<size_t>(i)] = i; // every key distinct
+	}
+	std::vector<int64_t> probe_keys = {0, 1}; // matches exactly two build rows
+
+	JoinKeys keys;
+	keys.build = {A};
+	keys.probe = {A};
+
+	// Tight enough that ~200,000 hash table entries cannot fit, generous
+	// enough that the couple of matched output records alone would.
+	constexpr size_t tight_limit = 200 * 1024;
+
+	for (auto mode : {JoinMode::TOP_INSERT, JoinMode::BOTTOM_INSERT}) {
+		auto make_build = [&] { return MakeScan({A}, types, {build_keys}); };
+		auto make_probe = [&] { return MakeScan({A}, types, {probe_keys}); };
+
+		SetGlobalMemoryLimit(0); // unlimited, to confirm the shape itself is fine
+		bool ok_unlimited = false;
+		try {
+			const auto result = FactorizedJoin(make_build(), make_probe(), keys, mode);
+			ok_unlimited = (result.Count() == 2);
+		} catch (const std::exception &) {
+			ok_unlimited = false;
+		}
+		Expect(ok_unlimited,
+		      std::string("unlimited: 200,000-row build side joins fine (") +
+		          (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ")");
+
+		SetGlobalMemoryLimit(tight_limit);
+		bool threw = false;
+		try {
+			FactorizedJoin(make_build(), make_probe(), keys, mode);
+		} catch (const std::exception &) {
+			threw = true;
+		}
+		SetGlobalMemoryLimit(0); // reset -- global state, later tests must not inherit this
+		Expect(threw, std::string("tight limit: build-side arena is caught, not silently unbounded (") +
+		                  (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ")");
+	}
+	Report("memory limit covers the hash table and top-insert snapshot arena, not only the output");
+}
+
 int main() {
 	std::printf("factorize core: joins\n\n");
 	TestDifferential();
@@ -685,6 +746,8 @@ int main() {
 	TestDiamondMerge();
 	std::printf("\n");
 	TestFusedCount();
+	std::printf("\n");
+	TestMemoryLimitCoversBuildSide();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

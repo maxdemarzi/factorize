@@ -25,9 +25,40 @@
 #include "layout.hpp"
 
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 namespace factorize {
+
+//! Cardinality arithmetic, checked. Sizes and counts here are never negative
+//! by construction (they count records or tuples), so the only failure mode
+//! is "too large to represent," and these throw rather than wrap.
+//!
+//! `SubtreeSize`/`Count` and their join.cpp counterparts (LowerSizeCounter,
+//! OutputCounter -- the arithmetic FactorizedCountJoin actually runs for the
+//! final join of every query) used to multiply and sum plain int64_t with no
+//! check at all: a handful of joins with moderate fan-out compounds past
+//! INT64_MAX while the f-representation itself stays tiny -- factorization
+//! keeping the *representation* small is exactly what removes the flat
+//! result's own size as a natural ceiling on the count. Deliberately not
+//! __builtin_mul_overflow/__builtin_add_overflow: those are GCC/Clang
+//! extensions, and this project's CI builds a plain-MSVC Windows target
+//! (`windows_amd64`, distinct from `windows_amd64_mingw`) that does not
+//! support them.
+inline int64_t CheckedCardinalityAdd(int64_t a, int64_t b) {
+	if (a > std::numeric_limits<int64_t>::max() - b) {
+		throw std::runtime_error("factorized count exceeds the representable range (int64 overflow)");
+	}
+	return a + b;
+}
+
+inline int64_t CheckedCardinalityMul(int64_t a, int64_t b) {
+	if (a != 0 && b > std::numeric_limits<int64_t>::max() / a) {
+		throw std::runtime_error("factorized count exceeds the representable range (int64 overflow)");
+	}
+	return a * b;
+}
 
 //! A pointer to one record, tagged with the level whose layout describes it.
 //!

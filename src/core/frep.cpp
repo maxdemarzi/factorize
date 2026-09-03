@@ -155,8 +155,8 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 		// Siblings are a Cartesian product, so slots multiply; the children
 		// within one slot are alternatives, so they sum.
 		int64_t slot_total = 0;
-		ForEachChild(record, slot_index, [&](Record child) { slot_total += SubtreeSize(child); });
-		size *= slot_total;
+		ForEachChild(record, slot_index, [&](Record child) { slot_total = CheckedCardinalityAdd(slot_total, SubtreeSize(child)); });
+		size = CheckedCardinalityMul(size, slot_total);
 		if (size == 0) {
 			// An empty slot makes the whole subtree contribute nothing; the
 			// remaining slots cannot change that.
@@ -171,7 +171,7 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 
 int64_t FRepresentation::Count() const {
 	int64_t total = 0;
-	ForEachRoot([&](Record root) { total += SubtreeSize(root); });
+	ForEachRoot([&](Record root) { total = CheckedCardinalityAdd(total, SubtreeSize(root)); });
 	return total;
 }
 
