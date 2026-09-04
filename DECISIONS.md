@@ -537,3 +537,59 @@ measurements cannot separate a per-record term from a per-input-row one. And
 the engine is single-threaded against a DuckDB that used 3.5 cores on the
 queries above; the gap the gate is measuring is partly a gap in parallelism,
 which is Phase 4's subject and would move these numbers.
+
+## D20 — Phase 4: parallelism by partitioning the join key, and the default that hid it
+
+**The design.** The paper parallelises inside the join: concurrent bottom-inserts
+into one shared representation, with only the insertion-point nodes locked. This
+does something else -- each thread counts one bucket of a hash partition of the
+join key, and the buckets are summed. Every output tuple assigns one value to
+that attribute, so bucketing on it cuts the output into disjoint pieces, and
+thread-count invariance follows from the partition rather than from locking
+discipline. The trade is that a bucket still has to look at every row to find
+itself, and that insertion never has to be made thread-safe (risk R5, which this
+sidesteps rather than solves).
+
+Two details that are not optional. A bucket that will not fit is subdivided
+*within itself* -- the buckets of a finer modulus congruent to it -- so a thread
+refining its own work cannot touch another's. And the memory cap is thread-local,
+so it is divided by the number of buckets; handing every thread the whole budget
+would let N threads use N times it.
+
+**The bug worth recording.** The first version ran on one thread whatever
+`threads` was set to, and nothing about the operator was wrong. DuckDB never
+asked: `Pipeline::ScheduleParallel` gives up when the pipeline's *sink* is
+serial, the sink is the result collector, and DuckDB picks its single-threaded
+form when it believes the plan preserves insertion order.
+`PhysicalOperator::SourceOrder()` defaults to `INSERTION_ORDER`, and this
+operator had never said otherwise -- so a source emitting exactly one row was
+treated as order-bearing, and `ParallelSource()` was never consulted at all.
+
+Declaring `NO_ORDER` is the entire fix, and it is worth being clear about why
+the tests did not find it: they assert answers, and the answers were right the
+whole time. A default in a base class that the extension never mentions is
+invisible to any test that does not measure the thing it silently governs.
+
+Measured on the four-way self-join whose result is 1.08e13 tuples:
+
+| threads | time | speedup |
+|---|---|---|
+| 1 | 82.7s | 1.00x |
+| 2 | 47.2s | 1.75x |
+| 4 | 29.3s | 2.83x |
+| 8 | 24.3s | 3.40x |
+
+Identical answers throughout. The query stock DuckDB does not finish in 180
+seconds now answers in 24. Scaling is well short of linear, and the reason is
+inherent to the design: every bucket reads every row to find its own, so the
+filtering pass does not divide even though the join does. Phase 4's stated exit
+bar (>=8x at 32 threads) remains unmeasurable here -- this box has 8 logical
+cores (open item O4) -- and on the evidence of 3.4x at 8, partition-parallelism
+alone would not reach it.
+
+Two smaller changes went in alongside, neither of which moved the timings: the
+scan decides a column's type once per batch rather than once per value, and
+relations are read once into a shared snapshot rather than once per thread. Both
+were hypotheses about the flat scaling, and both were wrong about that -- the
+sink was the answer -- but a scan that re-decides a type 18 million times is
+worth not having either way.

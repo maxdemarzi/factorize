@@ -36,7 +36,11 @@ timed() {
         tail -1
 }
 
-echo "query,fired,off_s,auto_s,ratio,status"
+# `force_s` times *this engine* on every query, whether or not the gate wanted
+# it. Without that column the only measurements of our own cost come from the
+# queries the gate already chose, which is the sample most likely to flatter it
+# -- re-fitting on it once produced a model built from a single query.
+echo "query,fired,off_s,auto_s,force_s,ratio,status"
 while IFS='|' read -r name expected sql; do
     [ -n "$name" ] || continue
 
@@ -57,15 +61,16 @@ PY
 
     off=$(timed off "$plain") || off=""
     auto=$(timed auto "$plain") || auto=""
+    force=$(timed force "$plain") || force=""
 
     if [ -z "$off" ]; then
         # 'off' could not finish inside the timeout: the largest kind of win, and
         # not a ratio.
-        printf '%s,%s,,%s,,off-timeout\n' "$name" "$fired" "${auto:-}"
+        printf '%s,%s,,%s,%s,,off-timeout\n' "$name" "$fired" "${auto:-}" "${force:-}"
         continue
     fi
     if [ -z "$auto" ]; then
-        printf '%s,%s,%s,,,auto-timeout\n' "$name" "$fired" "$off"
+        printf '%s,%s,%s,,%s,,auto-timeout\n' "$name" "$fired" "$off" "${force:-}"
         continue
     fi
     ratio=$(awk -v a="$off" -v b="$auto" 'BEGIN { if (b > 0) printf "%.3f", a / b; else print "" }')
@@ -81,5 +86,5 @@ PY
         awk -v r="$ratio" 'BEGIN { exit !(r < 0.8) }'; then
         status=REGRESSION
     fi
-    printf '%s,%s,%s,%s,%s,%s\n' "$name" "$fired" "$off" "$auto" "$ratio" "$status"
+    printf '%s,%s,%s,%s,%s,%s,%s\n' "$name" "$fired" "$off" "$auto" "${force:-}" "$ratio" "$status"
 done < tmp/ce_runnable.psv

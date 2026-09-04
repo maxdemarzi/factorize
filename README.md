@@ -23,7 +23,7 @@ SELECT count(*) FROM watdiv1052651 a, watdiv1052651 b,
                      watdiv1052651 c, watdiv1052651 d
  WHERE a.s = b.s AND b.s = c.s AND c.s = d.s;
 
-auto: 10,835,546,035,024   in 81 seconds
+auto: 10,835,546,035,024   in 24 seconds (8 threads)
 off:  no answer in 180 seconds
 ```
 
@@ -43,7 +43,7 @@ were fitted on one machine — `scripts/refit-cost.py` re-fits them on yours.
 | optimizer rule | working — matches inner equi-join `count(*)`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key: slower, never a failure |
-| parallelism | **not built** — single-threaded, against a DuckDB that uses every core |
+| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20) |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
 v1.5.5.

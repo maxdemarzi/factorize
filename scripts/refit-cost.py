@@ -107,10 +107,13 @@ def main():
             input_rows, flat = sizes
             if row["off_s"]:
                 duckdb_samples.append((input_rows, flat, float(row["off_s"]) * 1000.0))
-            # Only the queries the gate actually took over measure *our* engine;
-            # in the rest 'auto' is the stock plan wearing a different name.
-            if row["auto_s"] and row["fired"] == "yes":
-                ours_samples.append((input_rows, flat, float(row["auto_s"]) * 1000.0))
+            # 'force' times this engine on every query, which is the only
+            # unbiased sample of it. Reading our cost off 'auto' instead means
+            # reading it off the queries the gate already liked -- and once the
+            # gate is well calibrated that is a sample of one.
+            ours = row.get("force_s") or (row["auto_s"] if row["fired"] == "yes" else "")
+            if ours:
+                ours_samples.append((input_rows, flat, float(ours) * 1000.0))
 
     print(f"duckdb: {len(duckdb_samples)} samples, ours: {len(ours_samples)} samples")
     duckdb = fit(duckdb_samples, 0.25)
