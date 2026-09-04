@@ -166,6 +166,22 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                  size_t slices, PathStrategy strategy = PathStrategy::LEVELWISE);
 
+//! Counts one bucket of the partition: the tuples whose join key hashes to
+//! `slice` of `slices`. Summing every bucket gives the whole count, and the
+//! buckets are independent, which is what lets them run on separate threads.
+ExecuteResult ExecuteCountSlice(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                size_t slice, size_t slices, PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! One bucket, subdivided further if it does not fit.
+//!
+//! The subdivision refines the same partition rather than replacing it: the
+//! buckets of a finer modulus that fall inside bucket `slice` are exactly those
+//! congruent to it, so a bucket can be cut up without the pieces overlapping
+//! any other thread's work.
+ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source,
+                                            JoinMode mode, size_t slice, size_t slices,
+                                            PathStrategy strategy = PathStrategy::LEVELWISE);
+
 //! Runs `plan` whole, and if the representation does not fit, runs it again in
 //! more and more slices until it does.
 //!

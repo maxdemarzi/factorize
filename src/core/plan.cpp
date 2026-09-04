@@ -395,6 +395,9 @@ public:
 			if (HashKey(static_cast<uint64_t>(keys[row])) % slices != slice) {
 				continue;
 			}
+			// Kept, and every column of the row is kept with it: the row
+			// alignment MakeScan depends on is as load-bearing here as it is in
+			// the scan.
 			for (size_t column = 0; column < columns.size(); column++) {
 				held[column].push_back(columns[column][row]);
 			}
@@ -455,24 +458,78 @@ std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
 
 } // namespace
 
+ExecuteResult ExecuteCountSlice(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                size_t slice, size_t slices, PathStrategy strategy) {
+	if (slices <= 1) {
+		return ExecuteCount(graph, plan, source, mode, strategy);
+	}
+	auto key_column = ChooseSliceColumns(graph);
+	if (key_column.empty()) {
+		ExecuteResult result;
+		result.error = "no join key reaches more than one relation, so slicing cannot shrink anything";
+		return result;
+	}
+	SlicedSource sliced(source, key_column, slice, slices);
+	auto result = ExecuteCount(graph, plan, sliced, mode, strategy);
+	result.slices = slices;
+	return result;
+}
+
+ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source,
+                                            JoinMode mode, size_t slice, size_t slices, PathStrategy strategy) {
+	auto result = ExecuteCountSlice(graph, plan, source, mode, slice, slices, strategy);
+	if (result.ok || !result.out_of_memory) {
+		return result;
+	}
+	// Refine this bucket, and only this bucket. A modulus of `slices * factor`
+	// splits bucket `slice` into the buckets congruent to it, and touches no
+	// other bucket -- which is what makes this safe to do on one thread while
+	// others are working on theirs.
+	for (size_t factor = 8; factor <= 4096; factor *= 8) {
+		const size_t finer = slices * factor;
+		int64_t total = 0;
+		size_t records = 0;
+		size_t bytes = 0;
+		bool fits = true;
+		for (size_t part = 0; part < factor && fits; part++) {
+			auto piece = ExecuteCountSlice(graph, plan, source, mode, slice + part * slices, finer, strategy);
+			if (!piece.ok) {
+				if (!piece.out_of_memory) {
+					return piece;
+				}
+				fits = false;
+				result = piece;
+				break;
+			}
+			total = CheckedCardinalityAdd(total, piece.count);
+			records = records > piece.records ? records : piece.records;
+			bytes = bytes > piece.bytes ? bytes : piece.bytes;
+		}
+		if (fits) {
+			ExecuteResult refined;
+			refined.ok = true;
+			refined.count = total;
+			refined.records = records;
+			refined.bytes = bytes;
+			refined.slices = finer;
+			return refined;
+		}
+	}
+	return result;
+}
+
 ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                  size_t slices, PathStrategy strategy) {
 	ExecuteResult result;
 	if (slices <= 1) {
 		return ExecuteCount(graph, plan, source, mode, strategy);
 	}
-	auto key_column = ChooseSliceColumns(graph);
-	if (key_column.empty()) {
-		result.error = "no join key reaches more than one relation, so slicing cannot shrink anything";
-		return result;
-	}
 
 	int64_t total = 0;
 	size_t records = 0;
 	size_t bytes = 0;
 	for (size_t slice = 0; slice < slices; slice++) {
-		SlicedSource sliced(source, key_column, slice, slices);
-		auto part = ExecuteCount(graph, plan, sliced, mode, strategy);
+		auto part = ExecuteCountSlice(graph, plan, source, mode, slice, slices, strategy);
 		if (!part.ok) {
 			part.slices = slices;
 			return part;

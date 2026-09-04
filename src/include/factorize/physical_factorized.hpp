@@ -44,9 +44,17 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
-	//! Single scalar output: parallelising the source would buy nothing.
+	//! One row comes out, but the work behind it divides.
+	//!
+	//! Each thread counts one bucket of a hash partition of the join key and the
+	//! buckets are summed, which makes the answer independent of how many
+	//! threads ran -- the partition is the same partition however it is dealt
+	//! out. The paper parallelises inside the join instead, across concurrent
+	//! bottom-inserts into a shared representation; this trades that efficiency
+	//! for not having to make insertion thread-safe, and for an invariance that
+	//! holds by construction rather than by locking discipline.
 	bool ParallelSource() const override {
-		return false;
+		return true;
 	}
 
 protected:
