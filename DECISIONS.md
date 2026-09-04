@@ -593,3 +593,56 @@ relations are read once into a shared snapshot rather than once per thread. Both
 were hypotheses about the flat scaling, and both were wrong about that -- the
 sink was the answer -- but a scan that re-decides a type 18 million times is
 worth not having either way.
+
+## D21 — The cost coefficients, checked against an unbiased sample
+
+D19's coefficients were fitted on 24 measurements of this engine, all of them
+queries the *previous* gate had chosen -- the sample most likely to flatter it.
+Re-fitting after Phase 4 exposed how badly that biases: with a well-calibrated
+gate firing on one query in the corpus, the sample was one query, and replaying
+the resulting model would have fired on 14 with 8 of them slower. The old
+regressions, re-derived from a single point.
+
+The calibration now times `'force'` on every query, which measures this engine
+whether or not the gate wanted it. On 104 such samples:
+
+| | shipped | unbiased re-fit |
+|---|---|---|
+| ours, per input row | 1.225e-3 | 1.278e-3 |
+| DuckDB, startup | 9.799 ms | 9.254 ms |
+| DuckDB, per input row | 1.105e-6 | 1.221e-6 |
+| DuckDB, per flat tuple | 8.788e-7 | 9.961e-7 |
+
+Within a few percent throughout, from four times the data and none of the
+selection bias, so the shipped numbers stand. Replaying the re-fit fires on one
+query and that query is faster.
+
+Worth noting what the agreement does *not* say: our per-input-row cost is
+unchanged by Phase 4's parallelism, because the corpus queries are milliseconds
+long and dividing a millisecond across threads buys nothing. The 3.4x is real
+and it is measured on the queries this engine exists for -- which are, once
+again, not the ones in this corpus.
+
+## D22 — DuckDB's own tests, with the extension loaded
+
+Risk R9 is that an optimizer rule sees every plan in every query, so the blast
+radius is the whole engine rather than the queries it takes over. The evidence
+that matters is DuckDB's own suite passing with the extension in the process,
+at the default `factorize_mode='off'` -- the configuration a user gets by
+installing it and doing nothing, and the one where a change in results would be
+least forgivable.
+
+| suite | assertions | result |
+|---|---|---|
+| `test/sql/join/*` | 13,745 | pass (3 skipped, require tpch) |
+| `test/sql/aggregate/*` | 251,914 | pass (9 skipped) |
+| `test/optimizer/*` | 4,218 | pass (23 skipped) |
+
+`scripts/duckdb-regression.sh` runs these three: joins are the shape the rule
+matches, aggregates are the operator it replaces, and the optimizer tests are
+where a rule that rewrites plans wrongly surfaces first.
+
+The plan also asks for a version matrix (§7.1). This extension supports exactly
+one DuckDB version -- v1.5.5, pinned in D4 -- because the C++ API it uses is
+version-locked (D5), so a matrix over versions it does not claim to support
+would test nothing. The matrix that exists is over platforms, minus WASM.
