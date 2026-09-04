@@ -183,17 +183,22 @@ nosuchtable
 statement ok
 CREATE TABLE chainable AS SELECT i % 50 AS s, i % 50 AS d FROM range(5000) t(i);
 
+# Under a cap too small for the whole representation, the answer is assembled
+# from slices of the join key instead of being refused. The cap is still
+# honoured -- it is what decides slicing is needed -- but it costs passes over
+# the input rather than costing the answer. This used to be a clean error, back
+# when there was nothing better to do than fail.
 statement ok
 SET memory_limit = '10MB';
 
-statement error
+query I
 SELECT * FROM factorized_count(['chainable p', 'chainable q', 'chainable r'],
                                ['p.d = q.s', 'q.d = r.s']);
 ----
-memory limit
+50000000
 
 statement ok
-RESET memory_limit;
+SET memory_limit = '1GB';
 
 # ... and with room it answers: 5000 rows, each key value matching 100 rows at
 # each of two further levels.

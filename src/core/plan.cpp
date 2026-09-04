@@ -358,8 +358,156 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 		result.records = accumulated.Rep().RecordCount();
 		result.bytes = accumulated.Rep().BytesAllocated();
 		result.ok = true;
+	} catch (const MemoryLimitExceeded &error) {
+		result.error = error.what();
+		result.out_of_memory = true;
 	} catch (const std::exception &error) {
 		result.error = error.what();
+	}
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Slicing
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+//! Hands on one hash bucket of another source.
+//!
+//! Relations holding an attribute of the sliced class are filtered to the rows
+//! whose key falls in the bucket; the rest are passed through untouched, since
+//! their rows can only join with keys that survived anyway.
+class SlicedSource : public RelationSource {
+public:
+	SlicedSource(RelationSource &inner, std::vector<int> key_column, size_t slice, size_t slices)
+	    : inner(inner), key_column(std::move(key_column)), slice(slice), slices(slices) {
+	}
+
+	const std::vector<std::vector<int64_t>> &Columns(size_t relation) override {
+		const auto &columns = inner.Columns(relation);
+		if (key_column[relation] < 0) {
+			return columns;
+		}
+		const auto &keys = columns[static_cast<size_t>(key_column[relation])];
+		held.assign(columns.size(), {});
+		for (size_t row = 0; row < keys.size(); row++) {
+			if (HashKey(static_cast<uint64_t>(keys[row])) % slices != slice) {
+				continue;
+			}
+			for (size_t column = 0; column < columns.size(); column++) {
+				held[column].push_back(columns[column][row]);
+			}
+		}
+		return held;
+	}
+
+	ColumnStats Stats(size_t relation, size_t column) override {
+		return inner.Stats(relation, column);
+	}
+
+private:
+	RelationSource &inner;
+	//! The column of each relation to bucket on, or -1 to pass the relation
+	//! through whole.
+	std::vector<int> key_column;
+	size_t slice;
+	size_t slices;
+	std::vector<std::vector<int64_t>> held;
+};
+
+//! Picks the equivalence class to slice on: the one reaching the most
+//! relations, since filtering those is what makes a pass small. Returns the
+//! per-relation column to bucket on, or an empty vector if no class reaches
+//! more than one relation, in which case slicing cannot help.
+std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
+	EquivalenceClasses classes(graph);
+	std::map<size_t, std::vector<int>> by_class;
+	std::map<size_t, size_t> reach;
+	for (size_t relation = 0; relation < graph.RelationCount(); relation++) {
+		for (size_t column = 0; column < graph.column_counts[relation]; column++) {
+			const auto root = classes.Find(AttributeOf(graph, relation, column));
+			auto &columns = by_class[root];
+			if (columns.empty()) {
+				columns.assign(graph.RelationCount(), -1);
+			}
+			if (columns[relation] < 0) {
+				columns[relation] = static_cast<int>(column);
+				reach[root]++;
+			}
+		}
+	}
+	size_t best = 0;
+	size_t best_reach = 1;
+	bool found = false;
+	for (const auto &entry : reach) {
+		if (entry.second > best_reach) {
+			best = entry.first;
+			best_reach = entry.second;
+			found = true;
+		}
+	}
+	if (!found) {
+		return {};
+	}
+	return by_class[best];
+}
+
+} // namespace
+
+ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                 size_t slices, PathStrategy strategy) {
+	ExecuteResult result;
+	if (slices <= 1) {
+		return ExecuteCount(graph, plan, source, mode, strategy);
+	}
+	auto key_column = ChooseSliceColumns(graph);
+	if (key_column.empty()) {
+		result.error = "no join key reaches more than one relation, so slicing cannot shrink anything";
+		return result;
+	}
+
+	int64_t total = 0;
+	size_t records = 0;
+	size_t bytes = 0;
+	for (size_t slice = 0; slice < slices; slice++) {
+		SlicedSource sliced(source, key_column, slice, slices);
+		auto part = ExecuteCount(graph, plan, sliced, mode, strategy);
+		if (!part.ok) {
+			part.slices = slices;
+			return part;
+		}
+		total = CheckedCardinalityAdd(total, part.count);
+		// The largest slice is what had to fit, so that is what is reported.
+		records = records > part.records ? records : part.records;
+		bytes = bytes > part.bytes ? bytes : part.bytes;
+	}
+	result.ok = true;
+	result.count = total;
+	result.records = records;
+	result.bytes = bytes;
+	result.slices = slices;
+	return result;
+}
+
+ExecuteResult ExecuteCountWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                       PathStrategy strategy) {
+	auto result = ExecuteCount(graph, plan, source, mode, strategy);
+	if (result.ok || !result.out_of_memory) {
+		return result;
+	}
+	// Geometric, so the retries together cost about as much as the pass that
+	// finally works rather than a multiple of it. The ceiling is where slicing
+	// has stopped being the answer: past it the query is not too big overall but
+	// too skewed, with one key value whose own subtree does not fit, and no
+	// number of buckets separates a value from itself.
+	static const size_t kSliceSteps[] = {8, 64, 512, 4096};
+	for (auto slices : kSliceSteps) {
+		auto sliced = ExecuteCountSliced(graph, plan, source, mode, slices, strategy);
+		if (sliced.ok || !sliced.out_of_memory) {
+			return sliced;
+		}
+		result = sliced;
 	}
 	return result;
 }

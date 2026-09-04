@@ -480,8 +480,9 @@ SET factorize_explain = false;
 # The modes still mean what they say.
 #-----------------------------------------------------------------------------
 
-# AUTO promises "fire when the cost gate agrees"; there is no gate yet, so it
-# must behave as OFF rather than as an unguarded FORCE.
+# AUTO fires when the cost gate agrees. On four rows it does not agree: there is
+# no amount of factorization that pays for itself on a table this size, and the
+# gate exists because firing regardless is a measured loss (FINDINGS F16).
 statement ok
 SET factorize_mode = 'auto';
 
@@ -507,3 +508,107 @@ query I
 SELECT count(*) FROM r, s WHERE r.x = s.x;
 ----
 4
+
+#-----------------------------------------------------------------------------
+# Memory. The rule replaced a plan DuckDB could have run, so a representation
+# that does not fit has to cost time, not the answer.
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE chain1 AS SELECT i % 50 AS s, i % 50 AS d FROM range(5000) t(i);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM chain1 p, chain1 q, chain1 r WHERE p.d = q.s AND q.d = r.s;
+----
+50000000
+
+statement ok
+SET memory_limit = '10MB';
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM chain1 p, chain1 q, chain1 r WHERE p.d = q.s AND q.d = r.s;
+----
+50000000
+
+statement ok
+SET memory_limit = '1GB';
+
+statement ok
+SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# The gate. It is the load-bearing part of AUTO, not a safety wrapper: fired
+# unconditionally the engine is a measured loss, because the benefit is
+# concentrated in a minority of queries rather than spread across them.
+#-----------------------------------------------------------------------------
+
+# Multiplicity 10 on every key, so the three-way join is 1000 tuples per key
+# over 2000 keys: two million. Enough work that DuckDB doing it the flat way is
+# well past the floor, small enough that it can still be checked against 'off'.
+statement ok
+CREATE TABLE big_a AS SELECT i % 2000 AS k FROM range(20000) t(i);
+
+statement ok
+CREATE TABLE big_b AS SELECT i % 2000 AS k FROM range(20000) t(i);
+
+statement ok
+CREATE TABLE big_c AS SELECT i % 2000 AS k FROM range(20000) t(i);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
+----
+2000000
+
+statement ok
+SET factorize_mode = 'auto';
+
+# Big enough for the gate to take the bet, and the answer is the same either way
+# -- which is the only property that matters when the gate is wrong.
+query II
+EXPLAIN SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
+----
+2000000
+
+# The margin is a knob, and turning it up far enough declines everything.
+statement ok
+SET factorize_min_gain = 1000000;
+
+query II
+EXPLAIN SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
+----
+2000000
+
+statement ok
+RESET factorize_min_gain;
+
+# FORCE ignores the gate by definition: it fires on the four-row table the gate
+# turned down above.
+statement ok
+SET factorize_mode = 'force';
+
+query II
+EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'off';

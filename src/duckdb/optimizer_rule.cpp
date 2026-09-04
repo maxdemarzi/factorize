@@ -20,6 +20,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 
 #include <algorithm>
 #include <map>
@@ -556,11 +557,112 @@ static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relation
 }
 
 //===--------------------------------------------------------------------===//
+// Gate (plan §5, DECISIONS D14)
+//
+// The decision has to be made before anything is scanned, which is the whole
+// difficulty: the estimator was built and fitted against *exact* per-column
+// statistics, and the catalog has approximations of some of them and none of
+// the rest.
+//===--------------------------------------------------------------------===//
+
+//! Statistics from the catalog, for a gate that must not touch the data.
+//!
+//! Row counts come from DuckDB's own cardinality estimate, which already
+//! accounts for the filters on each scan. Distinct counts come from the
+//! catalog's sketch. There is no MCV list to be had: DuckDB does not keep one,
+//! and an empty one degrades EstimateCost to the textbook estimator rather than
+//! to nonsense (DECISIONS D13) -- it will under-read skew, and the calibration
+//! below is what says whether that matters in practice.
+class CatalogStats : public factorize::RelationSource {
+public:
+	CatalogStats(ClientContext &context, const FactorizedRegion &region, const vector<BoundRelation> &relations)
+	    : context(context), region(region), relations(relations) {
+	}
+
+	const std::vector<std::vector<int64_t>> &Columns(size_t) override {
+		throw InternalException("the factorize gate must not read data");
+	}
+
+	factorize::ColumnStats Stats(size_t relation, size_t column) override {
+		factorize::ColumnStats stats;
+		auto &get = region.relations[relation].get();
+		stats.rows = static_cast<double>(get.EstimateCardinality(context));
+		stats.distinct = stats.rows > 0 ? stats.rows : 1;
+
+		auto &bound = relations[relation];
+		if (column < bound.columns.size()) {
+			auto table = get.GetTable();
+			const auto physical = bound.columns[column];
+			// The catalog is keyed by logical column, the scan by physical one.
+			for (auto &definition : table->GetColumns().Logical()) {
+				if (static_cast<idx_t>(definition.Physical().index) != physical) {
+					continue;
+				}
+				auto statistics = table->GetStatistics(context, definition.Logical().index);
+				if (statistics) {
+					const auto distinct = static_cast<double>(statistics->GetDistinctCount());
+					if (distinct > 0) {
+						// Never more distinct values than rows: the sketch is
+						// over the whole column, while `rows` may already have a
+						// filter applied to it.
+						stats.distinct = std::min(distinct, stats.rows > 0 ? stats.rows : distinct);
+					}
+				}
+				break;
+			}
+		}
+		stats.distinct = stats.distinct < 1 ? 1 : stats.distinct;
+		return stats;
+	}
+
+private:
+	ClientContext &context;
+	const FactorizedRegion &region;
+	const vector<BoundRelation> &relations;
+};
+
+static double DoubleSetting(ClientContext &context, const char *name, double fallback) {
+	Value value;
+	if (!context.TryGetCurrentSetting(name, value) || value.IsNull()) {
+		return fallback;
+	}
+	return value.GetValue<double>();
+}
+
+//! What the engine is allowed to hold, and therefore what the gate should treat
+//! as "will not fit". Matches what the operator sets at execution: half of
+//! DuckDB's limit, because the scanned base columns live outside the arena.
+static idx_t MemoryBudget(ClientContext &context) {
+	const auto &config = DBConfig::GetConfig(context);
+	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
+	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
+	                            : config.options.maximum_memory;
+	return available / 2;
+}
+
+//! Whether factorizing this region is predicted to beat the stock plan.
+static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, const vector<BoundRelation> &relations,
+                       const factorize::QueryGraph &graph, const factorize::Plan &plan, string &reason) {
+	CatalogStats stats(context, region, relations);
+	factorize::CostThresholds thresholds;
+	thresholds.margin = DoubleSetting(context, "factorize_min_gain", thresholds.margin);
+	thresholds.min_duckdb_work_ms = DoubleSetting(context, "factorize_min_work_ms", thresholds.min_duckdb_work_ms);
+	// Predicted not to fit is no longer a refusal -- ExecuteCountWithinMemory
+	// slices instead -- but it is still a reason to decline: every slice is
+	// another pass over the input, and the gate is a bet about time.
+	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
+	// BuildPlan has already refused anything that cannot be arranged as a tree.
+	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
+	reason = estimate.reason;
+	return estimate.fire;
+}
+
+//===--------------------------------------------------------------------===//
 // Rule
 //===--------------------------------------------------------------------===//
 
 //! Walks the plan looking for a factorizable subtree, replacing the first match.
-static void RewriteRecursive(unique_ptr<LogicalOperator> &op, bool explain) {
+static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator> &op, bool gated, bool explain) {
 	FactorizedRegion region;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && MatchAggregate(*op, region)) {
 		vector<BoundRelation> relations;
@@ -570,20 +672,30 @@ static void RewriteRecursive(unique_ptr<LogicalOperator> &op, bool explain) {
 			// the planner cannot order (a disconnected one, most of all) has to
 			// be a decline, not a query that fails halfway through running.
 			auto plan = factorize::BuildPlan(graph);
-			if (plan.complete) {
-				if (explain) {
-					Printer::Print("[factorize] took over: " + DescribeRelations(relations) + " on " +
-					               DescribePredicates(relations, graph) + ", joining " +
-					               DescribeJoinOrder(relations, plan));
+			if (!plan.complete) {
+				region.decline = plan.reason;
+			} else {
+				string gate_reason;
+				// FORCE skips this and only this: the matcher's refusals are
+				// about what the engine can compute at all, while the gate is
+				// about whether computing it that way is a good idea.
+				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason);
+				if (!fire) {
+					region.decline = "gate says no: " + gate_reason;
+				} else {
+					if (explain) {
+						Printer::Print("[factorize] took over: " + DescribeRelations(relations) + " on " +
+						               DescribePredicates(relations, graph) + ", joining " +
+						               DescribeJoinOrder(relations, plan));
+					}
+					auto replacement = make_uniq<LogicalFactorized>(region.aggregate_index, std::move(relations),
+					                                               std::move(graph), std::move(plan));
+					replacement->estimated_cardinality = 1;
+					replacement->ResolveOperatorTypes();
+					op = std::move(replacement);
+					return;
 				}
-				auto replacement = make_uniq<LogicalFactorized>(region.aggregate_index, std::move(relations),
-				                                               std::move(graph), std::move(plan));
-				replacement->estimated_cardinality = 1;
-				replacement->ResolveOperatorTypes();
-				op = std::move(replacement);
-				return;
 			}
-			region.decline = plan.reason;
 		}
 	}
 	// Declining leaves the stock plan in place, which is always correct, and the
@@ -594,7 +706,7 @@ static void RewriteRecursive(unique_ptr<LogicalOperator> &op, bool explain) {
 		Printer::Print("[factorize] declined: " + region.decline);
 	}
 	for (auto &child : op->children) {
-		RewriteRecursive(child, explain);
+		RewriteRecursive(context, child, gated, explain);
 	}
 }
 
@@ -606,13 +718,10 @@ void FactorizeOptimizerExtension::Optimize(OptimizerExtensionInput &input, uniqu
 	}
 
 	auto mode = GetFactorizeMode(context);
-	// AUTO promises to fire only when a cost gate agrees (optimizer_rule.hpp), and
-	// no gate exists yet. Treating AUTO as OFF until one lands keeps the option's
-	// documented distinction from FORCE true rather than silently absent.
-	if (mode == FactorizeMode::OFF || mode == FactorizeMode::AUTO) {
+	if (mode == FactorizeMode::OFF) {
 		return;
 	}
-	RewriteRecursive(plan, ExplainRequested(context));
+	RewriteRecursive(context, plan, mode == FactorizeMode::AUTO, ExplainRequested(context));
 }
 
 FactorizeOptimizerExtension::FactorizeOptimizerExtension() {
@@ -627,11 +736,20 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// The default stays 'off' while 'auto' has no gate to consult: firing on
 	// every matching shape is measurably a loss (FINDINGS F16), so an ungated
 	// default would make the extension slower to install than not to.
-	config.AddExtensionOption(
-	    "factorize_mode",
-	    "Factorized execution: 'off', 'auto' (fire when the cost gate agrees; behaves as 'off' until the gate "
-	    "exists) or 'force' (fire whenever the plan shape matches; benchmarking only)",
-	    LogicalType::VARCHAR, Value("off"));
+	config.AddExtensionOption("factorize_mode",
+	                          "Factorized execution: 'off', 'auto' (fire when the cost gate predicts a win) or "
+	                          "'force' (fire whenever the plan shape matches, ignoring the gate; benchmarking only)",
+	                          LogicalType::VARCHAR, Value("off"));
+	// The margin, not a compression ratio: speedup is compression times a
+	// per-record factor that spans 84x across datasets, so no threshold on
+	// compression alone is right for all of them (DECISIONS D14).
+	config.AddExtensionOption("factorize_min_gain",
+	                          "Fire only when factorizing is predicted to beat the stock plan by this factor",
+	                          LogicalType::DOUBLE, Value::DOUBLE(1.5));
+	config.AddExtensionOption("factorize_min_work_ms",
+	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
+	                          "this many milliseconds; below it there is nothing to win",
+	                          LogicalType::DOUBLE, Value::DOUBLE(10.0));
 	config.AddExtensionOption("factorize_explain",
 	                          "Print, per aggregate, whether the factorize rule took the plan over and why not",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));

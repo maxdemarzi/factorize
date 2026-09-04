@@ -213,7 +213,12 @@ void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output
 	// Bottom-insert is the mode that carries the benefit (FINDINGS F4:
 	// bottom-inserts alone are worth 1.9x, top-inserts 0.98x). Phase 3 chooses
 	// per join; Phase 2 is about data movement, so it takes the better default.
-	const auto result = factorize::ExecuteCount(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
+	// A representation that does not fit is re-counted over a partition of its
+	// join key rather than refused. The cap is still honoured -- it is what
+	// decides that slicing is needed -- but it now costs passes over the input
+	// instead of costing the answer.
+	const auto result =
+	    factorize::ExecuteCountWithinMemory(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
 	if (!result.ok) {
 		throw InvalidInputException("factorized_count: %s", result.error);
 	}

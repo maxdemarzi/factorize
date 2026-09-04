@@ -234,6 +234,90 @@ static void TestRedundantStarAccepted() {
 	Report("one equivalence class stays acyclic however many predicates name it");
 }
 
+//! Slicing has to be exact, not approximate: the count assembled from N
+//! partitions must equal the count taken whole, for every N. Every output tuple
+//! assigns one value to the sliced attribute, so bucketing on that value cuts
+//! the output into disjoint pieces -- if that reasoning is wrong the sum comes
+//! out short, and only comparing against the undivided answer catches it.
+static void TestSlicingIsExact() {
+	MemorySource source;
+	// Skewed on purpose: one key appears far more often than the rest, so the
+	// buckets are uneven and a slicing bug shows up as a specific shortfall
+	// rather than a rounding-sized one.
+	std::vector<int64_t> left, right;
+	for (int64_t v = 0; v < 40; v++) {
+		const int repeats = (v == 7) ? 50 : 2;
+		for (int i = 0; i < repeats; i++) {
+			left.push_back(v);
+		}
+		for (int i = 0; i < 3; i++) {
+			right.push_back(v);
+		}
+	}
+	source.Add({left});
+	source.Add({right});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 1};
+	graph.column_types = {{ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}};
+
+	const auto plan = BuildPlan(graph);
+	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(whole.ok, "slicing: the undivided run succeeds (" + whole.error + ")");
+	Expect(whole.count == 39 * 2 * 3 + 50 * 3,
+	       "slicing: undivided count is " + std::to_string(39 * 2 * 3 + 50 * 3) + ", got " +
+	           std::to_string(whole.count));
+
+	for (size_t slices : {2u, 3u, 8u, 64u}) {
+		const auto sliced = ExecuteCountSliced(graph, plan, source, JoinMode::BOTTOM_INSERT, slices);
+		Expect(sliced.ok, "slicing: " + std::to_string(slices) + " slices succeed (" + sliced.error + ")");
+		Expect(sliced.count == whole.count, "slicing: " + std::to_string(slices) + " slices give " +
+		                                        std::to_string(sliced.count) + ", undivided gives " +
+		                                        std::to_string(whole.count));
+	}
+	Report("a count assembled from slices equals the count taken whole");
+}
+
+//! The point of the exercise: a query that does not fit must still answer.
+static void TestOutOfMemoryFallsBackToSlices() {
+	MemorySource source;
+	std::vector<int64_t> keys;
+	for (int64_t v = 0; v < 4000; v++) {
+		for (int i = 0; i < 4; i++) {
+			keys.push_back(v);
+		}
+	}
+	source.Add({keys});
+	source.Add({keys});
+	source.Add({keys});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 1, 1};
+	graph.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}};
+
+	const auto plan = BuildPlan(graph);
+	SetGlobalMemoryLimit(0);
+	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(whole.ok, "fallback: unlimited run succeeds (" + whole.error + ")");
+
+	// Tight enough that the undivided representation cannot fit, loose enough
+	// that a slice of it can.
+	SetGlobalMemoryLimit(220 * 1024);
+	const auto refused = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(!refused.ok, "fallback: the undivided run must hit the cap");
+	Expect(refused.out_of_memory, "fallback: hitting the cap must be distinguishable from any other error");
+
+	const auto recovered = ExecuteCountWithinMemory(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(recovered.ok, "fallback: slicing must answer where the undivided run could not (" + recovered.error + ")");
+	Expect(recovered.count == whole.count, "fallback: sliced count is " + std::to_string(recovered.count) +
+	                                           ", unlimited count is " + std::to_string(whole.count));
+	Expect(recovered.slices > 1, "fallback: the answer must be reported as assembled from slices");
+	SetGlobalMemoryLimit(0);
+	Report("a count too large to fit whole is assembled from slices instead of failing");
+}
+
 int main() {
 	std::printf("factorize core: plan\n\n");
 	TestInt32Baseline();
@@ -249,6 +333,10 @@ int main() {
 	TestCyclicGraphRejected();
 	std::printf("\n");
 	TestRedundantStarAccepted();
+	std::printf("\n");
+	TestSlicingIsExact();
+	std::printf("\n");
+	TestOutOfMemoryFallsBackToSlices();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

@@ -28,6 +28,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace factorize {
@@ -40,6 +41,17 @@ namespace factorize {
 //! duckdb::LogicalType::BIGINT`). `Byte` was the core's only C++17
 //! dependency, so dropping it lets the whole extension build at one standard.
 using Byte = unsigned char;
+
+//! Thrown when an allocation would exceed the cap.
+//!
+//! Its own type because it is the one failure a caller can do something about:
+//! the same count, computed over a partition of the join key, needs a fraction
+//! of the memory at once. Every other error means the query cannot be answered
+//! by this engine at all.
+struct MemoryLimitExceeded : std::runtime_error {
+	explicit MemoryLimitExceeded(const std::string &what) : std::runtime_error(what) {
+	}
+};
 
 class Arena {
 public:
@@ -65,7 +77,7 @@ public:
 		// than only in FRepresentation so every Arena is covered by the one
 		// change, not by remembering to wrap each new caller individually.
 		if (memory_limit != 0 && allocated + aligned > memory_limit) {
-			throw std::runtime_error("arena exceeded its memory limit");
+			throw MemoryLimitExceeded("arena exceeded its memory limit");
 		}
 		if (used + aligned > capacity) {
 			Grow(aligned);

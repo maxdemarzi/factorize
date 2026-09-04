@@ -15,14 +15,14 @@ namespace duckdb {
 enum class FactorizeMode : uint8_t {
 	//! Never fire. Also the A/B reference for correctness runs.
 	OFF,
-	//! Intended to fire when the matcher accepts and the cost gate agrees (plan
-	//! Phase 5). The gate does not exist yet -- Phase 0/2's operator is a stub
-	//! that returns a hardcoded constant, not a real count -- so until Phase 3
-	//! lands a gate, AUTO behaves as OFF rather than as an unguarded FORCE.
-	//! Behaving like FORCE was tried and reverted: the option's own
-	//! documentation promises a distinction FORCE explicitly disclaims
-	//! ("benchmarking only"), and honoring that promise by declining is safer
-	//! than honoring it by fabricating a gate that isn't there.
+	//! Fire when the matcher accepts *and* the cost gate predicts a win.
+	//!
+	//! The gate is the load-bearing part, not a safety wrapper: fired
+	//! unconditionally on the CE acyclic corpus the engine is 0.74x stock
+	//! DuckDB, a loss, because the benefit is concentrated in a minority of
+	//! queries rather than spread across them (FINDINGS F16). It estimates
+	//! milliseconds for both engines from catalog statistics and fires on a
+	//! margin (DECISIONS D14).
 	AUTO,
 	//! Fire whenever the matcher accepts, ignoring the gate. Benchmarking only.
 	FORCE

@@ -18,7 +18,7 @@ OverflowSegment *FRepresentation::AllocateSegment(uint32_t capacity, uint32_t re
 	// allocated with doubling capacity, so checking here costs nothing
 	// amortized and cannot be overshot by more than one segment.
 	if (memory_limit != 0 && arena.BytesAllocated() + bytes > memory_limit) {
-		throw std::runtime_error("f-representation exceeded its memory limit");
+		throw MemoryLimitExceeded("f-representation exceeded its memory limit");
 	}
 	auto *segment = reinterpret_cast<OverflowSegment *>(arena.Allocate(bytes));
 	segment->next = nullptr;

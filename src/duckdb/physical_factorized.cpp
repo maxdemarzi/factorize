@@ -62,7 +62,11 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 	// Bottom-insert is the mode that carries the benefit (FINDINGS F4:
 	// bottom-inserts alone are worth 1.9x, top-inserts 0.98x). Choosing per join
 	// is a later step; this takes the better default.
-	const auto result = factorize::ExecuteCount(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
+	// Within memory, not merely up to it: a representation that does not fit is
+	// re-counted over a partition of its join key rather than abandoned. The
+	// rule replaced a plan DuckDB could have run, so failing here would turn a
+	// slow query into no query at all.
+	const auto result = factorize::ExecuteCountWithinMemory(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
 	if (!result.ok) {
 		// The alternative -- returning some other number -- is the one thing this
 		// operator must never do. A query that fails is recoverable by setting

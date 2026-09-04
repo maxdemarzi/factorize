@@ -240,6 +240,15 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		                  Format(thresholds.memory_budget_bytes) + "B budget";
 		return estimate;
 	}
+	// Before the margin, because a query too small to matter is not a query we
+	// lost a bet on -- and because the margin alone would fire on it, cleared by
+	// a startup constant rather than by anything about the query.
+	const double duckdb_work_ms = estimate.duckdb_ms - thresholds.duckdb.startup_ms;
+	if (duckdb_work_ms < thresholds.min_duckdb_work_ms) {
+		estimate.reason = "too small to be worth it: DuckDB's own work is " + Millis(duckdb_work_ms) +
+		                  "ms, under the " + Millis(thresholds.min_duckdb_work_ms) + "ms floor";
+		return estimate;
+	}
 	if (estimate.duckdb_ms < thresholds.margin * estimate.ours_ms) {
 		estimate.reason = "predicted " + Millis(estimate.ours_ms) + "ms against DuckDB's " +
 		                  Millis(estimate.duckdb_ms) + "ms, under the " + Round(thresholds.margin) + "x margin";

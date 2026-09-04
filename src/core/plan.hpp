@@ -132,6 +132,11 @@ struct ExecuteResult {
 	bool ok = false;
 	int64_t count = -1;
 	std::string error;
+	//! Set when the failure was the memory cap rather than anything about the
+	//! query. Only this one is worth retrying, and ExecuteCountWithinMemory does.
+	bool out_of_memory = false;
+	//! How many slices the answer was assembled from; 1 when it fitted whole.
+	size_t slices = 1;
 	//! Records and bytes in the last materialized f-representation. Zero when
 	//! the plan was a single fused count join, which never materializes.
 	size_t records = 0;
@@ -145,5 +150,29 @@ struct ExecuteResult {
 //! these shapes.
 ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                            PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! Runs `plan` `slices` times, each pass keeping only the rows whose join key
+//! falls in one hash bucket, and sums the counts.
+//!
+//! Exact, not approximate. Every output tuple assigns one value to the chosen
+//! attribute -- that is what an equivalence class means -- so bucketing on that
+//! value partitions the output, and the parts sum to the whole. Every relation
+//! holding an attribute of the class is filtered by the same bucket, which is
+//! what makes each pass small: the f-representation shrinks with its inputs.
+//!
+//! Costs one pass over the inputs per slice. That is the trade being made --
+//! the alternative for a query whose representation does not fit is not a
+//! slower answer but no answer.
+ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                 size_t slices, PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! Runs `plan` whole, and if the representation does not fit, runs it again in
+//! more and more slices until it does.
+//!
+//! This is what makes the memory cap a cost rather than a failure, which is
+//! what an optimizer rule needs: a rule that turns a query DuckDB could answer
+//! into one that errors is worse than a rule that never fires.
+ExecuteResult ExecuteCountWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                       PathStrategy strategy = PathStrategy::LEVELWISE);
 
 } // namespace factorize

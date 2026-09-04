@@ -157,6 +157,18 @@ struct CostThresholds {
 	double memory_budget_bytes = 0;
 	//! Refuse cyclic join graphs.
 	bool require_acyclic = true;
+	//! Decline when the work DuckDB is predicted to do -- its per-row and
+	//! per-tuple terms, *excluding* its fixed startup -- is under this many
+	//! milliseconds.
+	//!
+	//! Without it the gate fires on trivially small queries, because the fitted
+	//! `duckdb.startup_ms` of 34ms is larger than anything our side costs on a
+	//! handful of rows, so the margin is cleared by a constant that has nothing
+	//! to do with the query. Below this floor there is nothing to win: DuckDB is
+	//! finishing in microseconds and our fixed costs -- scanning the inputs a
+	//! second time, building a representation -- are the entire runtime. The
+	//! plan (§5.3) asks for this floor in exactly these terms.
+	double min_duckdb_work_ms = 10.0;
 };
 
 //! One observation for calibration: what a query cost an engine, and the two
