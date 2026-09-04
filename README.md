@@ -58,7 +58,26 @@ Shapes the rule takes over: an ungrouped `count(*)` over inner equi-joins of
 stored tables on integer columns, with filters DuckDB pushed into or left above
 the scans. Everything else — outer joins, `GROUP BY`, non-integer keys, cyclic
 join graphs, computed join keys — is declined silently and answered by the
-stock plan.
+stock plan. `SET factorize_explain = true` says which, and why.
+
+### Limitations worth knowing before you switch it on
+
+- **No spilling.** A representation too large for the memory budget is
+  re-counted over a partition of its join key, which costs a pass over the
+  input per partition. Skew is the case that defeats it: no number of buckets
+  separates one value from itself.
+- **An error in the factorized path fails the query.** The plan asks for a
+  fallback to the stock plan instead (§7.5), and this design cannot give one —
+  the rule drops DuckDB's scans at optimize time, so by execution there is no
+  stock plan left to fall back to. What protects you is that the matcher
+  declines anything it cannot model, rather than that failures are recoverable;
+  `factorize_mode='off'` is the recovery.
+- **The cost model's coefficients were fitted on one machine.** They are
+  checked in as defaults, not as constants. `scripts/refit-cost.py` re-fits
+  them against `scripts/calibrate-gate.sh` output from yours.
+- **One DuckDB version.** The C++ extension API is version-locked; this builds
+  against v1.5.5 and no other.
+- **Not built for WASM,** deliberately — see the CI configuration.
 
 ## What it does
 
