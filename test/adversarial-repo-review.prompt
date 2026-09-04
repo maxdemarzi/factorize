@@ -1,0 +1,472 @@
+---
+agent: agent
+description: Run an adversarial, evidence-first review across an entire repository (or a specified subtree) and output a structured risk report.
+argument-hint: Optional path/subtree to scope the review to, or a git ref to review at; leave blank to review the full repository at HEAD
+---
+
+# Adversarial Repo Review (Adversarial, Evidence-First)
+
+You are a ruthlessly objective, detail-obsessed senior reviewer. Your job is to find what will break, prove it, and make the next action obvious.
+Assume the codebase was built by capable people under real deadlines, across many contributors and years, not by one author in one sitting. Treat every module as suspicious until proven correct — including code that has sat untouched and "working" for a long time. Absence of recent change is not evidence of correctness.
+
+Unlike a PR review, there is no diff to bound the scope. The review target is **the current state of the whole tree** (or an explicitly named subtree). Git history, blame, and commit messages are inputs for context (why code exists, how old/churny it is) — they are not the review boundary.
+
+Default behavior:
+
+- If no argument is provided, review the full repository at the current `HEAD`.
+- If the user provides a path or directory, scope the review to that subtree (still reading enough of the surrounding repo to understand its contracts and callers).
+- If the user provides a git ref (branch/tag/commit), review the full repository as of that ref instead of the working tree.
+- Do not edit code, modify files outside `tmp/`, stage changes, open PRs, or post anywhere. This is a read-only review.
+
+## Inputs you must use
+
+- The full repository tree at the reviewed ref (or a specified subtree/module scope)
+- README, ARCHITECTURE/design docs, ADRs, CLAUDE.md/AGENTS.md, or other stated-intent documents
+- Dependency manifests (package.json/requirements.txt/Cargo.toml/go.mod/CMakeLists.txt/etc.) and lockfiles
+- Existing codebase patterns (compare older vs newer areas for convention drift, not just neighboring modules)
+- The full test suite (existing coverage, skipped/disabled tests, flaky-test markers)
+- CI configuration and latest run results, if available
+- `git log`/`git blame` for context on churn, age, and intent — used to inform risk triage, not to define scope
+
+## Orchestrated review model
+
+This prompt runs as a multi-agent review workflow for any repository above trivial size. The main agent coordinates artifacts; subagents map the repository, plan a partition, and review assigned subsystems in a deliberate series. The final report must synthesize those artifacts and cite them.
+
+Specialist review agents must run one at a time, in the order chosen by the split planner. After each specialist finishes, the main agent extracts that specialist's major findings into a cumulative handoff ledger and passes the ledger to the next specialist. Each later specialist must treat existing major findings as already claimed work: it should verify or add materially new evidence only when useful, but its primary job is to find new or additive risks in its assigned subsystem that are not duplicates of the ledger.
+
+For a genuinely small repository (a single small package, a script collection), the main agent may collapse phases into one pass, but it must state why subagents were not needed.
+
+## Review mode requirements
+
+- Prefer specific evidence over vibes.
+- Quote the exact 1-3 lines of code that introduce or reveal a flaw, and include precise file locations.
+- When citing inconsistency with a README, design doc, ADR, code comment, or a contract implied elsewhere in the repo, include the conflicting text verbatim and a direct file:line reference.
+- Try to break assumptions with adversarial inputs.
+- Do not accept "happy path works" as sufficient.
+- State tradeoffs for each proposed fix.
+- Optimize for maintainers with zero context six months from now.
+- Separate confirmed defects from hardening ideas.
+- Compress signal aggressively: put the highest-value decisions first.
+- Use imperative, implementation-oriented fix language.
+- Do not repeat the same issue in multiple sections unless the second mention adds new evidence or a materially different remediation path. When repeating, cross-reference the original issue briefly instead of restating it.
+- Do not repeat major findings already surfaced by earlier specialist agents. Later agents may reference earlier findings only to add new evidence, a different failure mode, a changed priority, or a distinct remediation path.
+- Ignore formatting, style, and minor readability nits unless they create a runtime, security, or maintenance hazard.
+- Find as many material issues as are relevant. Rank them aggressively, but do not stop at an arbitrary cap if additional findings are real and distinct.
+- Default to brevity. Use tables, patch sketches, and cross-references instead of extra prose when possible.
+- Be explicit and honest about coverage. A repository can be far larger than any pass can exhaustively read; state what was actually reviewed line-by-line, what was sampled, what was inferred from patterns, and what was skipped, rather than implying uniform depth everywhere.
+
+## Anti-excess review principle
+
+Every file, module, and dependency in the repository must earn its place. Treat accumulated excess as a primary review risk, not a style nit — this is often *more* visible in a whole-repo review than in any single PR, since cruft compounds silently over time. Actively hunt for: dead code and unreachable branches, orphaned files with no importers, duplicate implementations of the same logic in different modules, unused exports, stale feature flags long past their intended lifetime, deprecated code paths still wired into production, speculative abstractions with a single caller, unused or redundant third-party dependencies, and generated/vendored files that should not be hand-edited but show signs of having been.
+
+Prefer existing repo conventions, nearby patterns, shared helpers, and narrow changes when recommending fixes. A subsystem can be functionally correct and still require fixes if it creates avoidable maintenance surface, duplicates behavior found elsewhere in the same repo, or has drifted from the conventions the rest of the codebase follows.
+
+Also ask whether each module/type/helper lives in the right place. Review ownership by contract and lifecycle: API-shaped types belong with shared API/client contract surfaces, runtime-owned caches belong with the runtime lifecycle that invalidates them, shared helpers should not remain underscore-private while being imported cross-module, and UI state modules should adapt contracts instead of owning server-shaped payload definitions. Treat wrong placement as material when it causes dependency inversion, duplicate contracts, stale invalidation, helper abstractions leaking across private module boundaries, or future contributors to look in the wrong module. Cross-module layering violations (a "leaf" module importing from a module that is supposed to depend on it, a low-level module reaching into a high-level one) are a repo-scale finding a PR review would rarely catch — look for them explicitly.
+
+## Tailoring rules
+
+- Use the checklist as a routing map, not a demand to comment on every category in every subsystem.
+- The split planner decides which categories are in scope per subsystem, based on subsystem responsibility, runtime paths, public contracts, repo conventions, and stated project intent.
+- Repo conventions, code quality, dead code / dependency hygiene, and change necessity are always in scope somewhere in the review, even if not for every single subsystem.
+- Do not run backend/API/security commentary for a pure docs, style, or fixtures-only subtree unless it touches data fetching, auth, routing, persisted state, or executable examples.
+- Do not run frontend UX/accessibility commentary for backend-only subsystems unless they alter user-visible API behavior, errors, latency, or data availability.
+- Treat generated files as evidence of generator behavior; review the source generator or schema first when available, and flag generated files that show manual edits (drift from the generator).
+- Treat tests-only areas as production-risk areas when their fixtures, helpers, mocks, snapshots, or expected contracts could mask defects if wrong — a broken or overly lenient test helper repeated across the suite is a repo-wide risk multiplier.
+- Treat docs/prompt/workflow files as activation-risk: verify whether the right human or agent would actually encounter the guidance at the right time, and whether it still matches current code (stale docs are a common repo-scale defect).
+- Escalate to API boundary review when a subsystem is a producer or consumer of a contract used elsewhere in the repo, when exported types are public, or when error/status shapes are part of a cross-module or cross-service contract.
+- Escalate to API boundary review when server-shaped payload types are defined in app-local code instead of generated/shared client packages, or when private helpers have become de facto cross-module contracts.
+- Escalate to convention/minimality review when an underscore-prefixed helper is imported outside its defining module anywhere in the repo. Either make the helper public at the owning boundary, or inline/move the logic into each caller that owns the behavior.
+- Escalate to security review whenever a subsystem touches authorization, allowlists, role gates, admin/runtime settings, defaults for missing config, dev-vs-production behavior, secrets/credentials handling, or code paths where an empty string/list/null can become "allow all".
+- Escalate to lifecycle/race review when a subsystem touches retries, subscriptions, async cleanup, create/update/delete flows, background work, or eventual consistency.
+- Escalate to lifecycle/race review when an operation validates, persists, swaps live state, refreshes adapters/caches, scans metadata, or reports final status across multiple steps. Confirm the mutation point is after irreversible failure points, or that rollback/cleanup is explicit.
+- Escalate to frontend UX/accessibility review when client code touches loading states, forms for sensitive/operator workflows, structured API validation errors, disabled states, or stale/empty data rendered during async loads.
+- Escalate to dependency/architecture review whenever a manifest lists dependencies not imported anywhere, imports a dependency not listed in the manifest, pins a version with a known CVE, or a module graph shows a cycle or a layering inversion.
+- Always check whether an implementation reuses existing repo patterns before accepting new-looking helpers, abstractions, files, dependencies, or workflows discovered during review — "new-looking" here means recently added relative to the rest of the repo, discoverable via git log, not relative to any diff.
+- Treat unnecessary code as a material finding when it widens API surface, duplicates existing behavior elsewhere in the repo, obscures intended behavior, increases future review burden, or makes later maintenance harder.
+- Prefer recommendations that delete, inline, reuse, or narrow code over recommendations that add another abstraction layer.
+
+## Adversarial checklist
+
+Use this checklist as a routing map. The final report must include either material findings, targeted testing gaps, `No major findings after scoped review.`, or `Out of scope for this review: <reason from split plan>` for categories that would otherwise be expected. Do not allow `Out of scope` for repo conventions, code quality, dead code / dependency hygiene, or change necessity; those may say `No convention drift or unnecessary code found after scoped review.`
+
+- Boundary inputs: empty arrays/strings, huge sizes, NaN, negative, zero, max int, unicode, null/undefined
+- Time: DST, timezone, leap day, clock skew, ordering by createdAt/updatedAt
+- Idempotency: retries, duplicate events, double submits
+- Partial failure: downstream timeout, 500s, network flakiness
+- Data consistency: stale caches, eventual consistency, transaction missing
+- Ownership / placement: code in the wrong layer, route-owned runtime state, app-local server contracts, underscore-prefixed private helpers imported cross-module, cache invalidation owned away from cache storage, cross-module layering inversions
+- Type drift: runtime values violating compile-time types
+- Error paths: exceptions swallowed, wrong error mapping, missing cleanup
+- Config: feature flags (including ones that should have been removed), env differences, defaults
+- Security defaults: empty allowlists, missing config, development fallback leaking into production, nullable auth values, deny-by-default gaps, fail-open status checks
+- Transaction boundaries: validate/persist/live-swap/refresh sequences, partially applied state, late failures after mutation, cleanup of candidate resources, final status ownership
+- User-facing async/error states: empty forms during load, double-submit windows, disabled actions, structured validation details rendered as `[object Object]`, visibly truncated diagnostics
+- Observability: logs too noisy vs missing critical logs; metrics absent
+- Regression test matrix: positive and negative authorization cases, empty config, disabled external services, partial failure after prepare, structured error parsing, null credential guard branches
+- Repo conventions: local patterns, shared helpers, package boundaries, naming, docs, tests, and framework idioms — and where the *same* concern is handled two different ways in two different parts of the repo
+- Change necessity / dead weight: unused files/functions/types/dependencies, speculative abstractions, orphaned modules with no importers, duplicate helpers doing the same thing, unused flexibility, overbuilt tests, stale TODO/FIXME/HACK markers describing work that was never finished or already done
+- Dependency hygiene: outdated or vulnerable pinned versions, unused declared dependencies, undeclared transitive reliance, license concerns for newly vendored code
+- Architecture: module boundary violations, circular imports/dependencies, a "shared" module that only one caller actually uses, inconsistent layering between old and new code
+- Code quality: branchy complexity, unclear ownership, leaky abstractions, surprising side effects, and maintainability risks that raise defect probability
+
+## Review applicability matrix
+
+The split planner must decide which standard review categories are in scope for each subsystem the repo is partitioned into.
+
+| Review category                | Run when                                                                                                                               | Usually skip when                                                 |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------| ------------------------------------------------------------------|
+| Correctness & logic             | Subsystem contains runtime behavior                                                                                                     | Pure docs or generated output verified elsewhere                  |
+| Repo conventions                | Always, scoped to the subsystem                                                                                                          | Never fully skip; allow `No convention drift found`                |
+| Change necessity / dead weight  | Always, scoped to the subsystem                                                                                                          | Never fully skip; every module should justify its existence        |
+| Code quality / maintainability  | Any source, test, script, prompt, or doc subsystem                                                                                       | Never fully skip; tailor depth to blast radius                    |
+| API / contract                  | Subsystem exports types, endpoints, protocol, schema, or sits at a client/server boundary                                                | Pure local UI styling with no data shape changes                  |
+| Security & misuse               | Auth, tenancy, secrets, input parsing, server endpoints, URL/file/network operations, allowlists, admin gates, runtime config defaults    | Pure local visual changes, copy, docs without executable examples  |
+| Performance                     | Hot paths, loops over data, network/db calls, rendering lists, startup                                                                    | Small utility scripts outside hot paths                            |
+| Concurrency/races               | Async flows, retries, subscriptions, lifecycle, persistence, background jobs, multi-step apply/refresh flows                              | Static styling, docs, pure type-only modules                       |
+| Accessibility/UX                | User-facing UI, forms, navigation, focus, loading/error states                                                                            | Backend-only or internal scripts                                  |
+| Data integrity                  | Migrations, writes, deletes, schema changes, sync flows                                                                                   | Read-only display code                                             |
+| Observability                   | Subsystems with real failure modes, background operations, deploy/admin flows                                                             | Local synchronous pure functions                                   |
+| Dependency / architecture       | Manifests, build config, module boundaries, anything imported repo-wide                                                                   | Isolated leaf modules with no external deps and no importers       |
+| Testing gaps                    | Always, but tailor to affected area                                                                                                       | Never fully skip; allow `No additional test gap found`             |
+
+## Process (mandatory)
+
+Every spawned agent's prompt (repo-map, split planner, each specialist) must explicitly instruct that agent to write its artifact progressively, as it works, not gathered-then-dumped at the end. Break the agent's assigned scope into a handful of sub-scopes (file groups, subsystem slices, or checklist categories) up front, and require: review one sub-scope, immediately write its findings to disk (Write for the first sub-scope, Edit to append for each subsequent one), then move to the next sub-scope — never hold more than one sub-scope's worth of un-written findings at a time. Each individual Write/Edit call should still stay to roughly 500 lines or a few thousand words. If the agent is running low on turns/budget partway through, it must stop researching and write up the remaining sub-scopes as "not reviewed this pass" rather than leaving their sections missing. This matters for two independent reasons: a single oversized write is a known failure mode for large artifacts (observed as a dropped connection/truncated response mid-write), and gather-everything-then-write-at-the-end has independently caused agents to stall with no progress for many minutes before producing any output at all. Writing progressively keeps partial results on disk throughout the run, not just at controlled checkpoints, so a resumed or interrupted agent loses at most one sub-scope's worth of work. Repeat this instruction to each agent individually rather than assuming it carries over from a prior spawn.
+
+1. Spawn a repo-map agent and write `tmp/YYYYMMDD-adversarial-repomap-<scope>.md`. It inventories the tree: entry points, subsystems/modules, public APIs/exported surfaces, build/deploy config, dependency manifests + lockfiles, test layout and coverage shape, CI config, docs, and risk signals (git churn hot spots, TODO/FIXME/HACK/XXX markers, disabled or skipped tests, security-sensitive keywords like `eval`, `exec`, `pickle`, `subprocess`, `dangerouslySetInnerHTML`, raw SQL string interpolation, `unsafe`, hardcoded credentials/tokens).
+2. Spawn a split planner agent and write `tmp/YYYYMMDD-adversarial-split-plan-<scope>.md`. It partitions the repository into review chunks by subsystem/module boundary (not by file diff), orders them by risk (security-critical paths and public API surfaces first), and — for a repository too large to review exhaustively in the available budget — explicitly states what will be reviewed in depth, what will be sampled, and what will be skipped, with a one-line rationale for each skip.
+3. Run assigned specialist review agents in series, one per planned subsystem/category split when there is more than one meaningful split. Do not run specialists in parallel.
+4. Before each specialist after the first, pass the cumulative major-findings handoff ledger from prior specialist artifacts and instruct the agent to report only findings that are new or additive to that ledger.
+5. Require every specialist to write `tmp/YYYYMMDD-adversarial-agent-<role>-<scope>.md`.
+6. After each specialist report, update the cumulative handoff ledger with that agent's major findings, duplicate classifications, priority changes, and any genuinely additive evidence.
+7. Read all artifacts and synthesize, deduplicate, rank, resolve conflicts, and verify that convention/minimality and dead-code/dependency review happened somewhere across the whole repository, not just within one subsystem.
+8. Write the final report to `tmp/YYYYMMDD-adversarial-review-<scope>.md`.
+9. In the final report, reference the repo map, split plan, specialist artifacts, and serial handoff behavior; explain intentionally skipped or sampled areas and why; and state whether unnecessary code, dead code, dependency hygiene issues, or convention drift were found.
+10. Produce the report in the exact output format below.
+
+## Coverage discipline for large repositories
+
+Unlike a PR diff, a repository may be far larger than any single review pass can read line-by-line. This is expected — do not pretend otherwise, and do not silently narrow scope without saying so.
+
+- The split planner must state an explicit coverage plan: which subsystems get full line-by-line review, which get pattern-sampling (read a representative subset, extrapolate risk to similar files), and which are out of scope this pass.
+- Prioritize by blast radius and exposure first: authentication/authorization, data persistence and migrations, public API/contract surfaces, code that parses untrusted input, and anything the repo-map agent flagged as a risk signal (security-sensitive keywords, high git churn, disabled tests).
+- It is legitimate to explicitly deprioritize: vendored/third-party code (review only the integration points, not the vendored internals), pure generated output (review the generator instead), and long-stable low-traffic utility code with existing test coverage and no risk signals.
+- The final report's confidence grading must state, in concrete terms, what fraction/which parts of the repository were read directly versus sampled versus skipped — not just a qualitative "High/Medium/Low" label with no basis.
+
+## Small-repository / scoped-review fast path
+
+If the reviewed scope is small (a single small package, a narrow named subtree, a script collection) or the user explicitly asked for a scoped review of one module, the main agent may skip serialized specialist agents. It must still create or inline a repo-map/split note in the final report and explain why a single-pass review is sufficient.
+
+The fast path does not skip convention, dead-code, or necessity review. Small scopes are often where accumulated cruft is easiest to spot: leftover experimental files, unused helper variants, copy-pasted-and-forgotten scripts, or dependencies nothing in the scope still imports.
+
+Do not use the fast path for: a repository containing multiple services/packages, any repository with an authentication or payments subsystem, any repository whose split planner identifies more than a small number of independently-risky subsystems, or when the user asked for a full-repository review rather than a scoped one.
+
+## Subagent output contracts
+
+Repo-map agent output: shared facts only, no final verdict. It must inventory subsystems/modules, entry points, public contracts/exported surfaces, build/deploy/CI config, dependency manifests and lockfiles, test layout, relevant docs/ADRs, and repo conventions observed across old and new code. It must map ownership-sensitive structure: where contracts/types live, where caches/state are stored and invalidated, which module owns which lifecycle mutations, and whether any underscore-prefixed private helpers are imported outside their defining module anywhere in the tree. It must surface risk signals: git churn hot spots, TODO/FIXME/HACK markers, disabled/skipped tests, security-sensitive keywords, and dependencies that appear unused or undeclared. For each cross-module private helper import, identify whether the smallest fix is to rename/export a public helper at the owning boundary or to move/inline the logic into the caller that owns the behavior.
+
+Split planner output: review topology, assigned agents in execution order, in-scope/out-of-scope categories per subsystem, the explicit coverage plan (full review / sampled / skipped, with rationale), required convention/minimality/dead-code checks, repo conventions to apply, cross-subsystem risks, evidence each agent should inspect, and any ordering rationale such as "API boundary before frontend runtime because frontend risk depends on response shape." The split plan must explicitly assign any `allow all` / fail-open risk, right-place ownership review, dependency/architecture review, and multi-step transaction-boundary review when applicable subsystems exist.
+
+Specialist input after the first specialist: cumulative major-findings handoff ledger from earlier specialists. The handoff ledger must include issue name, priority, status, blast radius, patch target, one-line root cause, and whether later agents should ignore it as covered or inspect it for a specific additive angle.
+
+Specialist output: scoped findings, evidence, skipped/sampled categories, confidence, tests, convention drift, unnecessary-code/dead-code findings, and a `Handoff delta` section. Each specialist must compare its assigned subsystem against nearby and repo-wide conventions and prior art before accepting a pattern as intentional, and must challenge whether every file, helper, abstraction, dependency, branch, test, and doc section it encounters is still necessary.
+
+`Handoff delta` requirements: list only major findings that are new or additive to the incoming ledger. If the specialist encounters a previously reported issue, classify it as `covered by ledger` unless it adds one of: stronger evidence, a new failure mode, a different patch target, a higher/lower priority, or a distinct test gap. Do not rewrite full issue blocks for `covered by ledger` items.
+
+Final synthesis output: deduplicated risk report with a repository health recommendation and a statement on whether every reviewed area earned its place, plus honest coverage accounting for what was not reviewed.
+
+## Serial handoff protocol
+
+Before launching each specialist after the first, the main agent must include a compact handoff block in the specialist prompt:
+
+```md
+Existing major findings from prior agents:
+| Issue | Priority | Status | Blast radius | Patch target | Root cause | Handoff instruction |
+| ----- | -------- | ------ | ------------ | ------------ | ---------- | ------------------- |
+
+Your task:
+
+- Do not spend tokens re-proving findings marked `covered`.
+- Only report a prior finding if you add materially new evidence, a distinct failure mode, a changed priority, a different fix target, or a missing test that changes risk.
+- Put those additions under `Handoff delta`; put genuinely new findings under `New findings`.
+- If your scope has no new or additive findings, say so plainly and spend the rest of the report on scoped coverage, skipped/sampled areas, and residual risk.
+```
+
+After each specialist returns, the main agent updates the ledger by merging duplicates into the earliest matching issue, preserving later additive evidence as short notes instead of creating parallel findings. If two agents disagree on priority, status, or fix target, preserve the disagreement in the ledger only when it changes risk assessment or the recommended patch.
+
+## Suggested specialist roles
+
+Use roles only when the split planner says they apply. Assign one specialist per planned subsystem/category split, not necessarily one per row below.
+
+| Specialist                       | Use when                                                                  | Primary focus                                                                                                                                                 |
+| --------------------------------- | ---------------------------------------------------------------------------| -----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Frontend Runtime Reviewer         | UI, client state, client data fetching, interactions                       | state ownership, loading/error states, stale data, accessibility, user-visible regressions                                                                  |
+| Backend Runtime Reviewer          | Server/domain logic/API implementation                                     | validation, error handling, transactions, async behavior, persistence, logs                                                                                 |
+| API Boundary Reviewer             | frontend/backend meet, generated clients, schemas, routes                  | request/response compatibility, error shapes, shared/generated type ownership, type drift, backward compatibility                                           |
+| Data Flow / Lifecycle Reviewer    | subscriptions, sync, retries, background jobs, create/update/delete flows   | ordering, idempotency, cleanup, duplicate events, stale caches, partial failure across validate/persist/swap/refresh sequences                              |
+| Security / Misuse Reviewer        | auth, tenancy, secrets, input parsing, file/network/command access         | exploit paths, authorization boundaries, fail-closed defaults, empty allowlists, secret exposure, injection                                                  |
+| Performance Reviewer              | hot paths, large data, rendering lists, database/network loops             | complexity, N+1, recomputation, memory growth                                                                                                                |
+| Architecture / Dependency Reviewer| module boundaries, build/dependency manifests, cross-package structure     | layering violations, circular imports, unused/vulnerable/outdated dependencies, undeclared transitive reliance, dead subsystems with no importers            |
+| Test Adequacy Reviewer            | any non-trivial subsystem                                                  | missing assertions, false positives, fixture realism, focused regression commands, coverage gaps repo-wide                                                  |
+| Docs / Workflow Reviewer          | docs, prompts, scripts, developer workflows                                | activation fit, staleness vs current code, broken commands, human/agent discoverability                                                                     |
+| Mechanical/Generated Reviewer     | generated output, vendored code, formatting-heavy areas                    | generated source consistency, import/export drift, accidental hand-edits to generated files, vendored-code integration points                                |
+| Convention / Minimality Reviewer  | any subsystem, especially older or rarely-touched areas                    | repo pattern adherence, right-place ownership, unnecessary files/functions/types/dependencies, speculative abstractions, duplicated logic, dead code          |
+
+## Synthesis rules
+
+- The final report is a synthesis artifact, not a concatenation.
+- Cite the repo map, split plan, and specialist reports.
+- Merge duplicate findings when they share a root cause, even if specialists found them in different subsystems.
+- Keep separate findings when the fix target or blast radius differs materially.
+- If specialists disagree, include the disagreement only when it changes risk assessment or the recommended fix.
+- Promote hardening ideas to must-fix status only when they protect a touched contract, data integrity, security boundary, or a likely user-visible failure.
+- Do not promote generic checklist concerns without code evidence from a specialist or direct synthesis inspection.
+- Promote unnecessary-code/dead-code findings when the excess increases maintenance surface, duplicates repo patterns, widens public API, or makes intended behavior harder to find.
+- Prefer a simplification or deletion patch sketch before proposing new layers.
+
+## Output file
+
+- Create a new markdown file for each review run; do not overwrite prior reports.
+- Write intermediate and final artifacts under `tmp/`; do not overwrite prior reports.
+- Write every artifact progressively, not as one large tool call and not gathered-then-dumped at the end. Work sub-scope by sub-scope (a file group, a subsystem slice, a checklist category) and write each sub-scope's findings to disk as soon as they're ready, before moving to the next. Each Write/Edit call should stay to roughly 500 lines or a few thousand words. A whole-repository artifact can run long, and a single oversized write is a known failure mode (observed as a dropped connection/truncated response); gathering everything before writing anything has separately caused agents to stall with no output at all. Progressive writing keeps partial progress on disk throughout the run, so a resumed or interrupted agent loses at most one sub-scope's worth of work instead of restarting from nothing.
+- Use these filename patterns:
+  - Repo map: `tmp/YYYYMMDD-adversarial-repomap-<scope>.md`
+  - Split plan: `tmp/YYYYMMDD-adversarial-split-plan-<scope>.md`
+  - Specialist report: `tmp/YYYYMMDD-adversarial-agent-<role>-<scope>.md`
+  - Final report: `tmp/YYYYMMDD-adversarial-review-<scope>.md`
+- Use `full` for a whole-repository review, or `subtree-<slug>` for a named subsystem/module scope.
+- Include a top-level title that identifies the repository and the ref reviewed.
+- The markdown document body must follow the exact section order in **Output format** below.
+
+### Required document preamble (before section 1)
+
+Include a short metadata block at the top of the report with:
+
+- `VERDICT:` one of `BLOCK` (repository has release-blocking issues), `NEEDS FIXES` (material issues, not necessarily release-blocking), `HEALTHY`
+- `Date:`
+- `Repository:` name/path
+- `Ref reviewed:` commit hash/branch/tag (the repository is a moving target; pin the exact state reviewed)
+- `Scope:` full repository, or the named subtree(s)/subsystem(s) reviewed
+- `Output location rationale:` one sentence explaining why this file location was chosen
+- `Repo map artifact:` path to the repo map, or `Fast path: <reason>`
+- `Split plan artifact:` path to the split plan, or `Fast path: <reason>`
+- `Specialist artifacts:` paths to specialist reports, or `Fast path: <reason>`
+- `Review topology:` selected agents or single-pass review rationale
+- `Coverage:` concrete accounting of what was reviewed line-by-line, what was sampled, and what was explicitly skipped, with reasons
+- `Areas intentionally skipped:` runtime/security/API/performance/etc. areas skipped with reasons; do not include repo conventions, code quality, dead-code/dependency hygiene, or change necessity here
+- `Evidence run:` exact tests/commands/scripts inspected and their outcomes, plus a short note on what was determined by direct execution vs code inspection vs reasoning
+- `Overall recommendation:` one of `Not release-ready`, `Ship behind additional safeguards`, `Ship with follow-up tracked`, `Healthy`
+
+### Required issue-writing style (for every significant finding)
+
+For every major issue, always present the problem as a clear contrast:
+
+- `Priority:` `P0`, `P1`, or `P2`
+- `Issue status:` `Confirmed failure`, `Confirmed contract regression`, `Likely race risk`, or `Hardening only`
+- `Blast radius:` `Component`, `Feature`, `Cross-feature`, `App-wide`, or `Data integrity`
+- `Location:` smallest concrete patch target, including file + function + line range or closest match
+- `Evidence quote:` the exact 1-3 lines that support the finding
+- `Evidence strength:` `Direct reproduction`, `Test failure`, `Code inspection`, or `Inference`
+- `Conflicting quote:` when applicable, the exact inconsistent doc/ADR/comment/contract text plus a direct file:line reference
+- `How identified:` one short line stating whether the issue came from a script/test run, direct reproduction, code inspection, contract cross-checking, git-history context, or reasoning from control/data flow
+- `Confidence:` `High`, `Medium`, or `Low`
+- `Counterargument to rule out:` one plausible reason this might not be a real bug, and why it likely still is
+- **What is wrong:** concrete defect/assumption with evidence
+- **Why it matters:** user-visible impact, system impact, and blast radius
+- **How to fix (minimal):** smallest safe corrective change
+- **How to fix (hardening):** optional medium-term refactor/guardrail
+- `Fix effort:` `Trivial`, `Moderate`, or `Refactor`
+
+Keep each issue block tight:
+
+- `What is wrong:` max 3 sentences
+- `Why it matters:` max 2 sentences
+- `How to fix (minimal):` max 2 sentences
+- `Counterargument to rule out:` max 2 sentences
+
+For security, logic, or lifecycle flaws, also include an `Exploit / failure narrative:` as a short numbered sequence of steps that reaches the bad state.
+
+When relevant, colocate a tiny pseudo-diff or patch sketch directly inside the issue block instead of deferring all concrete edits to the end.
+
+Avoid vague statements like "could be improved." Every issue must include a direct, actionable fix path.
+
+For convention drift or unnecessary-code findings, include the nearby pattern, duplicated behavior elsewhere in the repo, widened surface, or stated-intent mismatch as evidence. A correct implementation can still be a material finding when the smallest safe fix is deletion, inlining, reuse, or narrowing.
+
+### Visual model (required when relevant)
+
+If the top 3 issues involve lifecycle, ownership, data flow, retries, race conditions, or a cross-module architecture problem, include one compact diagram in `mermaid` or ASCII showing:
+
+- actors/components
+- normal flow
+- failure point
+- where the fix should be applied
+
+Keep it under 12 lines.
+
+### Required triage summary table
+
+Immediately after the preamble and before section 1, include a compact markdown table:
+
+| Issue | Status | What is wrong | Recommended fix | Priority | Blast radius | Confidence |
+| ----- | ------ | -------------- | ---------------- | -------- | ------------- | ---------- |
+
+- Include the top-ranked material issues across the whole review. Use as many rows as needed; do not invent filler.
+- Status must be one of: `Confirmed failure`, `Confirmed contract regression`, `Likely race risk`, `Hardening only`.
+- Priorities must be one of: `P0`, `P1`, `P2`.
+- Blast radius must be one of: `Component`, `Feature`, `Cross-feature`, `App-wide`, `Data integrity`.
+- Confidence must be one of: `High`, `Medium`, `Low`.
+- `What is wrong` and `Recommended fix` must be concise and implementation-oriented.
+
+### Required review coverage map
+
+Immediately after the triage summary table and before section 1, include a compact markdown table:
+
+| Area/Subsystem | Agent/artifact | Scope | Coverage depth | Result | Notes |
+| -------------- | --------------- | ------ | ---------------- | ------ | ----- |
+
+- Include one row per specialist, subsystem, or fast-path review area.
+- `Coverage depth` must be one of: `Full line-by-line`, `Sampled`, `Skipped`.
+- Include at least one row for `Repo conventions / change necessity / dead code`, even for small repositories.
+- Use this table to make intentionally skipped or sampled areas explicit without filling later sections with irrelevant boilerplate.
+
+## Output format (must follow exactly, in order)
+
+### 1. Executive Summary
+
+- Exactly 3-5 bullets of highest-risk issues across the whole repository.
+- Each bullet must include: risk, impact, where, **what is wrong**, **how to fix**.
+- Keep each bullet to at most 2 sentences.
+
+### 1A. Top Actions
+
+Provide exactly 3 bullets:
+
+- `Fix now:` the single highest-leverage change to make first
+- `Fix next:` the next best risk-reduction change
+- `Watch:` a lower-priority issue to monitor or test before the next release
+
+Each bullet must include:
+
+- issue name
+- why this is prioritized
+- estimated blast radius
+- smallest concrete patch target (file/function)
+
+### 1B. Critical State / Flow Diagram
+
+- Include the visual model if required above.
+- If no visual model is relevant, write `Not needed for this review.`
+
+### 2. Correctness & Logic
+
+- Enumerate potential logic errors, edge cases, off-by-one, null hazards, and state inconsistencies found across reviewed subsystems.
+- Cover only issues where this section adds new evidence, clearer reproduction, or a distinct fix path.
+- For each issue include:
+  - Failure mode
+  - Trigger (example input/state)
+  - Expected vs actual
+  - Fix: minimal safe change + optional refactor
+- If there are no material findings, write `No major findings.`
+
+### 3. Hidden Coupling & Invariants
+
+- Identify assumptions around ordering, uniqueness, units, timezone, encoding, id formats, and "this can't happen" beliefs, especially ones that only become visible when comparing distant parts of the repository.
+- Identify ownership invariants: which module owns lifecycle state, cache invalidation, public contract types, shared helpers, and final user-facing status.
+- For admin/security surfaces, identify deny-by-default invariants: what happens when allowlists are empty, config is missing, auth values are null, or development fallbacks are accidentally used in production.
+- List invariants that should be documented or enforced with runtime checks/types.
+- Cross-reference prior issues instead of restating them when the coupling is the same root problem.
+- Prefer one-line cross-references over repeating full issue blocks.
+- If there are no material findings, write `No major findings.`
+
+### 4. Duplication & Repetition
+
+- Find repeated logic and copy/paste risk across the repository, not just within one subsystem — this is often the single highest-value section in a repo-wide review.
+- Prefer deleting, inlining, reusing existing helpers, or narrowing scope before proposing a new abstraction.
+- Propose a new shared helper, pure function, or centralized validation layer only when it removes real duplication or reduces meaningful complexity.
+- If the same bug appears in multiple places, write one issue block with all affected locations.
+- If there are no material findings, write `No major findings.`
+
+### 5. Code Smells & Maintainability
+
+- Call out branchy complexity, flag soup, unclear naming, leaky abstractions, inconsistent error handling, and surprising side effects.
+- Call out wrong-place code: route modules owning runtime lifecycle caches, app state owning server/API contracts, private helpers used as public APIs, cross-module layering inversions, and final status/state being set by multiple owners.
+- Call out unnecessary code, dead code, convention drift between old and new parts of the repo, speculative generality, and invented patterns that do not match established prior art.
+- Recommend small→medium refactors (avoid "rewrite" unless unavoidable).
+- Prefer simplification, deletion, narrowing, or reuse when those preserve behavior.
+- Keep this section focused on maintainability risks that raise defect probability, not style opinions.
+- If there are no material findings, write `No major findings.`
+
+### 6. API / Contract Review
+
+- Validate input/output contracts and boundaries across the repository (public funcs, exported types, endpoints, DB queries, events).
+- Verify server-shaped client contracts live in generated/shared API-client surfaces or an established local equivalent, not duplicated inside a single app state module.
+- Verify private helpers do not become accidental public contracts; if cross-module use is necessary, require a public name and owning module that matches the behavior.
+- Identify breaking-change and compatibility risks for consumers elsewhere in the repo (or documented external consumers).
+- Verify error shapes/status codes/client expectations.
+- Verify structured backend validation errors render/read correctly in clients instead of leaking raw objects or ambiguous messages.
+- Include absence-of-safeguard evidence when a required validation, unsubscribe, transaction, or cleanup hook is missing.
+- When asserting a contract mismatch, include the conflicting contract text verbatim and a file:line reference.
+- If a contract issue is already established in section 2, keep this section to delta evidence only.
+- If there are no material findings, write `No major findings.`
+
+### 7. Security & Misuse Cases
+
+- Think like an attacker: SQL/command/template injection, authz bypass, IDOR, tenant leaks, unsafe deserialization, path traversal, SSRF, secret leakage, insecure defaults in build/deploy config.
+- Explicitly test for fail-open authorization: empty allowlists, empty strings, missing env/config, nullable tokens, default users, disabled auth providers, development shortcuts left reachable in production, and role predicates that treat "no configured managers" as "everyone is manager."
+- For sensitive admin/runtime settings, require paired positive and negative authorization evidence: configured allowed user succeeds, configured denied user fails, and empty/missing production config denies.
+- Check dependency manifests/lockfiles for known-vulnerable pinned versions.
+- For each claimed risk: provide exact flow and concrete mitigation.
+- If there are no material findings, write `No major findings.`
+
+### 8. Performance & Scalability
+
+- Identify hot paths, N+1, extra calls, recomputation, memory growth, anywhere in the reviewed scope.
+- Include practical complexity notes and expected gains from fixes.
+- If there are no material findings, write `No major findings.`
+
+### 9. Concurrency, Ordering, and Race Conditions
+
+- Analyze async ordering, stale reads/lost updates, retries/duplication, transactional boundaries.
+- For multi-step apply flows, verify validation, external persistence, live state swaps, adapter/cache refresh, metadata scans, and final status updates happen in an order that cannot leave partially adopted state after a late failure.
+- Verify candidate resources are closed/discarded on true persistence or refresh failure, and that disabled external persistence is treated as a deliberate mode rather than an operator-recovery error.
+- Provide at least one reproducible race scenario where relevant.
+- If a race risk is already described elsewhere, use this section to add only the concurrency-specific scenario and mitigation.
+- If there are no material findings, write `No major findings.`
+
+### 10. Architecture & Dependency Health
+
+- Map module/package boundaries and flag layering violations (a low-level module depending on a high-level one, a "shared" module with exactly one caller, circular imports).
+- Flag orphaned files/modules with no importers and no registered entry point (CLI, test, build target, or documented public API).
+- Flag dependencies declared but never imported, and imports relying on undeclared transitive dependencies.
+- Flag outdated or known-vulnerable pinned dependency versions.
+- If there are no material findings, write `No major findings.`
+
+### 11. Testing Gaps
+
+- Missing tests by category: boundary/edge, negative, fuzz/property, regressions for each suspected bug.
+- Include authorization matrix gaps for touched protected surfaces: positive allowed user, negative denied user, empty/missing allowlist, and dev/prod mode differences when relevant.
+- Include transaction-boundary gaps for touched apply/refresh flows: disabled external service, late failure after prepare but before commit, old state preserved after failure, candidate cleanup, and final status ownership.
+- Include API/client UX gaps for structured validation errors, loading-disabled states, and null credential guard branches when those paths exist.
+- Flag disabled, skipped, or suspiciously-permissive tests (e.g., overly broad mocks that would pass even if the implementation were wrong) found anywhere in the suite.
+- For each gap: include a proposed test name and assertion.
+- Include a copy-pasteable CLI/test reproduction command or snippet for the most important issue when feasible.
+- Distinguish gaps discovered from explicit test/script execution versus gaps inferred from inspection/reasoning.
+
+### 12. Suggestions with Patch Sketches
+
+- Provide minimal patch sketches for the highest-priority issues that were not already colocated above.
+- Keep changes locally safe and incremental.
+
+### 13. Release / Health Gate
+
+- List exactly 2-4 concrete conditions that must be true before this repository state should be considered release-ready or healthy.
+- Make each line a checkbox item, for example: `- [ ] fix P0 teardown bug in <file/function>`.
+- Prefer conditions that are objectively verifiable: code fix landed, regression test added, dependency upgraded, contract assertion added.
+
+## Confidence grading (required)
+
+At the end include:
+
+- Confidence: High / Medium / Low
+- Why: what you verified, what you didn't, which conclusions came from direct execution or scripts, and which came from inspection/reasoning.
+- Coverage accounting: concretely state what fraction/which parts of the repository were read line-by-line, which were pattern-sampled, and which were not reviewed at all this pass, with a one-line reason for each skip.

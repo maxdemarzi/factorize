@@ -122,8 +122,11 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
                             JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE, JoinStats *stats = nullptr);
 
 //! Memory cap applied to every f-representation the core creates; 0 = none.
-//! Set once per query by the caller. The DuckDB operator will drive this from
-//! `memory_limit` and fall back to the stock plan when it trips (plan Phase 7).
+//!
+//! Per thread, despite the name, and set by whoever is about to run the engine
+//! on that thread. Exceeding it throws MemoryLimitExceeded, which
+//! ExecuteCountWithinMemory answers by re-counting over a partition of the join
+//! key rather than by giving up.
 void SetGlobalMemoryLimit(size_t bytes);
 size_t GetGlobalMemoryLimit();
 

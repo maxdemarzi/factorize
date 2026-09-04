@@ -10,7 +10,19 @@ namespace factorize {
 // FactorizedRelation
 //===--------------------------------------------------------------------===//
 namespace {
-size_t g_memory_limit = 0;
+//! Thread-local, not a process global.
+//!
+//! As a plain global this was a data race waiting for the first thread: two
+//! queries running at once, or two slices of one query, would read and write it
+//! together, and the symptom would be one query silently running under
+//! another's cap. Nothing was parallel yet, so nothing had happened -- which is
+//! the worst kind of latent bug, because it looks fine until the change that
+//! makes it fire is unrelated to it.
+//!
+//! The cost of thread-local is that a worker thread starts with no cap rather
+//! than inheriting one, so anything that runs the engine on a thread it did not
+//! set up has to set the limit there too.
+thread_local size_t g_memory_limit = 0;
 }
 
 void SetGlobalMemoryLimit(size_t bytes) {

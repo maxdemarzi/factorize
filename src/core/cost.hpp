@@ -131,9 +131,27 @@ struct CostThresholds {
 	//! Our own cost, fitted to sit *above* 75% of observed runs. A gate must be
 	//! pessimistic about the engine it is choosing and optimistic about the one
 	//! it is rejecting, or its errors all point at regressions.
-	EngineCost ours {0.0, 2.214e-4, 1.694e-4};
-	//! DuckDB's cost, fitted to sit below 75% of observed runs.
-	EngineCost duckdb {34.33, 5.674e-6, 3.946e-5};
+	//!
+	//! The per-input-row term is re-fitted (scripts/refit-cost.py) against the
+	//! extension actually running inside DuckDB, which made it 5.5x more
+	//! expensive than the harness measurement it replaces: 2.214e-4 was fitted
+	//! on the standalone benchmark, and the engine in situ is slower than the
+	//! engine on a bench. The per-record term is inherited, because these
+	//! measurements cannot separate it.
+	EngineCost ours {0.0, 1.225e-3, 1.694e-4};
+	//! DuckDB's cost, fitted to sit below 25% of observed runs.
+	//!
+	//! Also re-fitted, and this is where the gate was going wrong. The old
+	//! per-result-tuple charge of 3.946e-5 ms/tuple is 45x DuckDB's measured
+	//! cost, because for a `count(*)` DuckDB carries no payload columns through
+	//! the join -- the tuples flowing through its pipeline are empty, and it
+	//! counts them at a rate the old constant did not imagine. Over-charging
+	//! DuckDB per tuple is precisely the error that makes a gate fire on queries
+	//! DuckDB was about to win, and it fired on seven of them.
+	//!
+	//! These are this machine's numbers. That is not a disclaimer to be
+	//! apologised for -- it is why the fitting script is checked in.
+	EngineCost duckdb {9.799, 1.105e-6, 8.788e-7};
 	//! Fire only when we are predicted to beat DuckDB by this factor.
 	double margin = 1.5;
 	//! Bytes an f-representation record occupies: a fixed header plus a slot

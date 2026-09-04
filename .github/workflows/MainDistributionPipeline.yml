@@ -32,6 +32,14 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: 72e76e99cd7fee45a99739cd118ec2db64e034ec
       extension_name: factorize
+      # WASM is excluded deliberately, not accidentally (plan §7.6). The engine
+      # holds an entire f-representation in memory with no spilling, and sizes
+      # it against DuckDB's memory_limit; under wasm32 the address space makes
+      # that budget meaningless, and the parallelism the design is heading for
+      # has no threads to run on. Building a target we would have to describe as
+      # "loads, then fails on anything worth using it for" is worse than not
+      # shipping it.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
