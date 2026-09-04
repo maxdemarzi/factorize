@@ -9,25 +9,41 @@ Efficient Factorized Execution for Relational Systems* (PVLDB 19(11):3006–3019
 2026). Derived from the paper only — no GPLv3 source was read or ported
 ([DECISIONS](DECISIONS.md) D1). MIT licensed.
 
-## Status: plain SQL is accelerated on request, not yet by default
+## Status: plain SQL is accelerated automatically, on the queries where it pays
 
 The engine, the cost model, an explicit `factorized_count()` table function and
-the optimizer rule all work against real DuckDB storage. Ordinary `count(*)`
-queries are taken over and answered by the factorized engine — but only with
-`SET factorize_mode='force'`. **The rule does not fire on its own yet**: that
-needs the cost gate wired into the optimizer, and a query whose
-f-representation runs out of memory needs to fall back to the stock plan
-instead of failing.
+the optimizer rule all work against real DuckDB storage. With
+`SET factorize_mode='auto'` an ordinary `count(*)` over an equi-join is taken
+over when the gate predicts a win, and left alone otherwise.
+
+What that is worth, measured on a release build (DECISIONS D19):
+
+```
+SELECT count(*) FROM watdiv1052651 a, watdiv1052651 b,
+                     watdiv1052651 c, watdiv1052651 d
+ WHERE a.s = b.s AND b.s = c.s AND c.s = d.s;
+
+auto: 10,835,546,035,024   in 81 seconds
+off:  no answer in 180 seconds
+```
+
+And what it is not worth: across the 119 CE queries whose results DuckDB *can*
+materialise, the gate fires on one of them, because for a `count(*)` DuckDB
+carries no payload columns through a join and counts empty tuples faster than
+this engine can build a representation. Geomean 1.06x, no query regressing.
+The gate exists to tell those two regimes apart, and the coefficients it uses
+were fitted on one machine — `scripts/refit-cost.py` re-fits them on yours.
 
 | | state |
 |---|---|
 | f-representation engine (`src/core/`) | working, measured |
 | MCV statistics and cost model | working, measured |
-| gate (fire/decline decision) | working, measured (standalone harness) |
+| gate (fire/decline decision) | working — re-fitted against in-DuckDB timings, no regression on any query it fires on (DECISIONS D19) |
 | `factorized_count()` table function | working — 238 CE queries, 0 mismatches against published sizes and stock DuckDB (DECISIONS D16) |
-| optimizer rule under `factorize_mode='force'` | working — matches inner equi-join `count(*)`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
-| `factorize_mode='auto'` | **not built** — behaves as `'off'`. Needs the cost gate, and fallback-on-overflow rather than an error |
-| parallelism | **not built** — single-threaded |
+| optimizer rule | working — matches inner equi-join `count(*)`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
+| `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
+| memory | no spilling. A representation that will not fit is re-counted over a partition of its join key: slower, never a failure |
+| parallelism | **not built** — single-threaded, against a DuckDB that uses every core |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
 v1.5.5.

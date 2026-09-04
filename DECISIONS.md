@@ -479,3 +479,61 @@ was dropped at optimize time -- so fallback means keeping that subtree as a
 child of `LogicalFactorized` and planning it as well. `force` is documented as
 benchmarking-only and a clean error is defensible there; `auto` cannot ship
 until this is fixed.
+
+## D19 — Phases 5 and 6: the gate was calibrated against the wrong model of DuckDB, and the corpus measures the wrong regime
+
+Two findings, and the second explains the first.
+
+**The shipped cost model over-charged DuckDB by 45x per result tuple.**
+Timing every CE query under `'off'` and `'auto'` on a release build
+(`scripts/calibrate-gate.sh`, 119 queries) failed the phase's own exit
+criterion: geomean 1.229x, but seven queries regressed and the worst ran 143x
+slower -- 74ms against 10s. Re-fitting the model on those measurements
+(`scripts/refit-cost.py`) found the error in both directions at once:
+
+| | shipped | measured here | |
+|---|---|---|---|
+| DuckDB, per result tuple | 3.946e-5 ms | 8.788e-7 ms | 45x too pessimistic |
+| DuckDB, startup | 34.33 ms | 9.80 ms | 3.5x |
+| ours, per input row | 2.214e-4 ms | 1.225e-3 ms | 5.5x too optimistic |
+
+The per-tuple term is the one that matters, and the reason is specific: for a
+`count(*)` DuckDB carries **no payload columns** through the join. The tuples
+in its pipeline are empty, and it counts them at a rate the fitted constant did
+not imagine. A gate that over-charges the engine it is rejecting fires on
+queries that engine was about to win, and it fired on seven.
+
+Compounded, the model believed factorizing was ~250x more favourable than it
+is. With the measured coefficients the gate wants the result to be roughly a
+thousand times the input before it fires, and re-running the calibration gives
+**geomean 1.057 with no regression on any query it fires on** -- the exit
+criterion, met. It now fires on 1 of these 119 queries.
+
+**Which is the right answer, because this corpus is the wrong regime.** The
+runnable subset tops out at 8e8 result tuples, where DuckDB is entirely
+comfortable; D15 already said the project's target is the regime the benchmark
+excludes. That regime is real and was measured earlier (tmp/ce_excluded_*.csv):
+DuckDB times out past 180s on results from 1e10 to 1.3e17, while the engine
+answers a 9.7e11-tuple count in 4 seconds.
+
+Confirmed end to end with the shipping build, on a four-way self-join of a
+4.5M-row table over 40k distinct keys:
+
+    SELECT count(*) FROM watdiv1052651 a, watdiv1052651 b,
+                         watdiv1052651 c, watdiv1052651 d
+     WHERE a.s = b.s AND b.s = c.s AND c.s = d.s;
+
+    factorize_mode='auto': 10,835,546,035,024 in 80.8s, gate fired unprompted
+    factorize_mode='off':  no answer in 180s (DuckDB's own measured per-tuple
+                           rate puts it near 2.6 hours)
+
+So the calibrated gate does both halves of its job: it declines the regime
+where DuckDB wins, and it fires where DuckDB cannot finish at all.
+
+**What this does not say.** The coefficients are this machine's, which is why
+the fitting script is checked in rather than the numbers being presented as
+constants. `ours.per_output` is inherited rather than re-fitted -- these
+measurements cannot separate a per-record term from a per-input-row one. And
+the engine is single-threaded against a DuckDB that used 3.5 cores on the
+queries above; the gap the gate is measuring is partly a gap in parallelism,
+which is Phase 4's subject and would move these numbers.

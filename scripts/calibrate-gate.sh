@@ -70,9 +70,15 @@ PY
     fi
     ratio=$(awk -v a="$off" -v b="$auto" 'BEGIN { if (b > 0) printf "%.3f", a / b; else print "" }')
     status=ok
-    # A ratio under 1 means 'auto' was slower. The exit criterion is about how
-    # far under, so the threshold is named here rather than left to the reader.
-    if awk -v r="$ratio" 'BEGIN { exit !(r < 0.8) }'; then
+    # A ratio under 1 means 'auto' was slower, but only two kinds of row can
+    # mean it. If the gate declined, 'auto' *is* the stock plan and the two
+    # numbers are the same query timed twice -- a ratio of 0.7 there measures
+    # the clock, not the extension. And under a few tens of milliseconds the
+    # clock is most of what is being measured either way. Flagging those as
+    # regressions buries the ones that are real: the first calibration run
+    # reported twelve, and five of them were this.
+    if [ "$fired" = yes ] && awk -v a="$off" 'BEGIN { exit !(a > 0.05) }' &&
+        awk -v r="$ratio" 'BEGIN { exit !(r < 0.8) }'; then
         status=REGRESSION
     fi
     printf '%s,%s,%s,%s,%s,%s\n' "$name" "$fired" "$off" "$auto" "$ratio" "$status"
