@@ -9,26 +9,31 @@
 
 #pragma once
 
+#include "factorize/storage_source.hpp"
+
 #include "duckdb/execution/physical_operator.hpp"
 
 namespace duckdb {
 
 //! Executes the factorized region.
 //!
-//! Phase 0: a pure source emitting one constant row, to verify the physical
-//! plumbing. Phase 3 makes it a sink+source pipeline breaker (plan §3.2) --
-//! Sink() feeds base-table vectors into the f-representation builder, Finalize()
-//! runs the semiring traversal, GetData() emits the single scalar.
+//! A pure source with no children: it scans the base tables itself, builds the
+//! f-representation, and emits the one scalar the region computes. Reading
+//! storage directly rather than being fed by child pipelines is what lets this
+//! share `factorized_count()`'s already-measured path end to end (DECISIONS
+//! D18); the cost is that the matcher must refuse any scan the plan would have
+//! restricted, since there is no child left to apply the restriction.
 class PhysicalFactorized : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 public:
-	PhysicalFactorized(PhysicalPlan &physical_plan, vector<LogicalType> types, int64_t stub_value,
-	                   idx_t estimated_cardinality);
+	PhysicalFactorized(PhysicalPlan &physical_plan, vector<LogicalType> types, vector<BoundRelation> relations,
+	                   factorize::QueryGraph graph, factorize::Plan plan, idx_t estimated_cardinality);
 
-	//! Phase 0 stand-in for the aggregate result.
-	int64_t stub_value;
+	vector<BoundRelation> relations;
+	factorize::QueryGraph graph;
+	factorize::Plan plan;
 
 public:
 	string GetName() const override;

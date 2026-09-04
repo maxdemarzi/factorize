@@ -33,6 +33,7 @@ set(DUCKDB_GLUE_SOURCES
     src/duckdb/logical_factorized.cpp
     src/duckdb/physical_factorized.cpp
     src/duckdb/optimizer_rule.cpp
+    src/duckdb/storage_source.cpp
     src/duckdb/table_function.cpp)
 
 set(EXTENSION_SOURCES

@@ -208,3 +208,40 @@ SELECT * FROM factorized_count(['chainable p', 'chainable q', 'chainable r'],
                                ['p.d = q.s', 'q.d = r.s']);
 ----
 50000000
+
+# An empty relation empties the join. This used to crash rather than answer:
+# DataTable::InitializeScan asserts on a table with no row groups at all, and
+# nothing in the CE corpus is empty, so the scan path never met one.
+statement ok
+CREATE TABLE no_rows (s INTEGER, d INTEGER);
+
+query I
+SELECT * FROM factorized_count(['chainable p', 'no_rows q'], ['p.d = q.s']);
+----
+0
+
+query I
+SELECT count(*) FROM chainable p, no_rows q WHERE p.d = q.s;
+----
+0
+
+# Rows the transaction has not committed yet are part of the answer too: the
+# scan has to see local storage, not only what is on disk.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO no_rows VALUES (1, 1), (1, 2);
+
+query I
+SELECT * FROM factorized_count(['chainable p', 'no_rows q'], ['p.d = q.s']);
+----
+200
+
+query I
+SELECT count(*) FROM chainable p, no_rows q WHERE p.d = q.s;
+----
+200
+
+statement ok
+ROLLBACK;

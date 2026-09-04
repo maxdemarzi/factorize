@@ -103,6 +103,38 @@ Plan BuildPlan(const QueryGraph &graph) {
 	Plan plan;
 	std::set<size_t> joined;
 	std::vector<bool> used(graph.predicates.size(), false);
+	EquivalenceClasses classes(graph);
+
+	// A relation can only attach where every edge carrying it into the joined set
+	// reaches attributes that end up on *one* f-tree level, and section 4.3
+	// guarantees that happens exactly when the already-joined side of each of
+	// those edges shares an equivalence class. A triangle is the smallest graph
+	// that fails: its third relation reaches the other two through two different
+	// classes at once.
+	//
+	// This is checked here rather than left to the engine because the engine's
+	// answer is an exception thrown partway through a running query
+	// ("key attributes did not converge on one level"). Planning is where a
+	// caller can still do something about it -- the table function reports which
+	// query it cannot run, and the optimizer rule quietly leaves the stock plan
+	// alone.
+	auto converges = [&](const std::vector<Predicate> &edges) {
+		bool have_first = false;
+		AttributeId first = 0;
+		for (const auto &edge : edges) {
+			const bool left_joined = joined.count(edge.left_relation) > 0;
+			const auto attribute =
+			    left_joined ? AttributeOf(graph, edge.left_relation, static_cast<size_t>(edge.left_column))
+			                : AttributeOf(graph, edge.right_relation, static_cast<size_t>(edge.right_column));
+			if (!have_first) {
+				first = attribute;
+				have_first = true;
+			} else if (!classes.SameClass(first, attribute)) {
+				return false;
+			}
+		}
+		return true;
+	};
 
 	// Seed with the relation carrying the first predicate.
 	const size_t seed = graph.predicates.empty() ? 0 : graph.predicates[0].left_relation;
@@ -127,11 +159,21 @@ Plan BuildPlan(const QueryGraph &graph) {
 			plan.reason = "join graph is disconnected";
 			return plan;
 		}
-		auto best = candidates.begin();
+		// A candidate whose edges do not converge is skipped rather than refused:
+		// another relation may attach cleanly now, and the residual-predicate
+		// check below still catches an edge that never gets used.
+		auto best = candidates.end();
 		for (auto it = candidates.begin(); it != candidates.end(); ++it) {
-			if (it->second.size() > best->second.size()) {
+			if (!converges(it->second)) {
+				continue;
+			}
+			if (best == candidates.end() || it->second.size() > best->second.size()) {
 				best = it;
 			}
+		}
+		if (best == candidates.end()) {
+			plan.reason = "cyclic join graph: no relation attaches on a single key";
+			return plan;
 		}
 		plan.steps.push_back(PlanStep {best->first, best->second});
 		joined.insert(best->first);

@@ -21,15 +21,17 @@ SELECT current_setting('factorize_mode');
 ----
 off
 
-# 'force' takes the plan over. The Phase 0 operator is a stub that ignores its
-# children and emits a constant, so 42 here means the whole chain fired.
+# 'force' takes the plan over, and answers with the real count -- the chain this
+# file was written to prove composes now carries a factorized region rather than
+# a constant. That the number is unchanged from 'off' is the whole point;
+# test/sql/factorized_optimizer.test is where that is checked across shapes.
 statement ok
 SET factorize_mode = 'force';
 
 query I
 SELECT count(*) FROM a, b WHERE a.x = b.x;
 ----
-42
+1000
 
 # ... and EXPLAIN shows the operator.
 query II

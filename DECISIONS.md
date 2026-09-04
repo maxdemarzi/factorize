@@ -373,3 +373,109 @@ memory_limit member that turned out to be a torn read of the file mid-edit
 (the compiler running concurrently with an in-progress Edit call), not a
 real failure -- discarded once the on-disk state was re-read directly and a
 clean rebuild confirmed it.
+
+## D18 — Phase 3: the optimizer rule computes real counts, by reusing Phase 2's path rather than building a second one
+
+The rule matched plan shapes from Phase 0 onward but replaced them with an
+operator that returned a hardcoded 42. It now runs the query.
+
+**The design choice: reuse, not a native sink.** The obvious reading of the
+plan (§3.2) is a sink+source pipeline breaker, with the base-table scans as
+real children feeding `Sink()`. That needs N-ary sink pipelines, which nothing
+in DuckDB's operator set does for free and which this codebase has never
+built. The alternative -- keep `PhysicalFactorized` a childless *source* that
+scans the base tables itself, exactly as `factorized_count()` does -- reuses
+the scan/plan/execute path already measured against 238 CE queries end to end.
+Same `StorageSource`, same `BuildPlan`, same `ExecuteCount`; the only new code
+is the part that reads a join graph out of a bound plan instead of out of
+argument strings.
+
+What that buys: the risky half of the work was already validated. What it
+costs, and it is the defining constraint of the whole design: **the rule drops
+the plan's own scans, so any restriction on them that is not carried across
+would never be applied by anything.** Not a slow query -- a wrong count. Every
+matcher decision below follows from that single sentence.
+
+`BoundRelation` and `StorageSource` moved out of `table_function.cpp` into a
+shared header so there is one implementation of the scan, its NULL rule and its
+statistics. It also stopped re-resolving tables by name: the optimizer takes
+the `TableCatalogEntry` straight from the plan DuckDB already bound, because
+re-resolving a bare name against the search path at execution time could find a
+*different* table than the query was planned against.
+
+**Four bugs, all found by tests, none by reading.** The first three were in the
+new code; the fourth was already on origin/main.
+
+- **Rejecting `dynamic_filters` rejected everything.** DuckDB's own
+  JoinFilterPushdown pass attaches a `DynamicTableFilterSet` to the probe-side
+  scan of essentially every join. Treating that as "this scan is restricted"
+  declined every query the rule exists for. They only ever remove rows that
+  could not have joined, so ignoring them leaves the count unchanged.
+- **Statistics propagation restricts scans, and the rule has to honour it.**
+  DuckDB derives a range from one side of a join (`s <= 75843`), pushes it into
+  most of the scans as `table_filters` and leaves it above the rest as a
+  `LOGICAL_FILTER`. Refusing either shape declines most real plans: it was 111
+  of 119 CE queries. Rather than decline, `BindRegion` now re-keys DuckDB's own
+  pushed-down filter set onto our scan and translates a filter above the scan
+  (`column <op> constant`, `IS [NOT] NULL`) into the same `TableFilter` types,
+  and the storage layer applies them. **This is deliberately not an expression
+  evaluator.** Anything more complex declines, because evaluating arbitrary
+  expressions here would be a second implementation of DuckDB's semantics
+  judged against a count that has to equal DuckDB's exactly. The side effect is
+  that filtered queries went from "declined" to "supported": `WHERE a.x = 5`
+  factorizes now.
+- **Cyclic joins died halfway through executing.** A triangle cannot be
+  arranged as an f-tree -- its third relation reaches the other two through two
+  different equivalence classes, so its keys never land on one level -- and the
+  engine discovered this mid-flight with "key attributes did not converge on
+  one level". The check belongs in `BuildPlan`, which is where a caller can
+  still do something about it, and it is now there: a relation attaches only
+  where the already-joined side of every edge carrying it shares an
+  equivalence class. Counting predicates against relations (what the harness
+  does) would be wrong in the other direction -- a star written with a
+  redundant third predicate is *not* cyclic, and both cases are now unit
+  tested.
+- **Scanning an empty table crashed, on main, since Phase 2.**
+  `DataTable::InitializeScan` asserts when a table has no row groups at all.
+  Nothing in the CE corpus is empty, so `factorized_count()` never met one. The
+  fix moves both entry points onto the scan API DuckDB's own sequential scan
+  uses (`InitializeParallelScan`/`NextParallelScan`), which handles the empty
+  case and, separately, is the one that sees rows still uncommitted in the
+  transaction's local storage -- the old path got that wrong too.
+
+**Observability, because the second bug cost a 31-minute rebuild to find.**
+`factorize_explain` prints, per aggregate, either what was taken over or the
+specific reason it was not ("join key w is VARCHAR, not an integer"). The
+matcher declines constantly and silently by design, so without this the symptom
+of a broken matcher is indistinguishable from a correctly conservative one.
+EXPLAIN now also carries the relations, predicates and join order.
+
+**AUTO still behaves as OFF.** The gate is the next piece of work, and until it
+exists `auto` promises something it cannot do. Firing unconditionally is
+measurably a loss (F16), so the default stays `off`.
+
+**Measured.** The CE corpus, run as plain SQL through the rule rather than
+through `factorized_count()`:
+
+| | takes over | answers correctly | wrong |
+|---|---|---|---|
+| before the filter work | 8 / 119 | — | 0 |
+| carrying pushed-down and above-scan filters | 59 / 77 measured | 54 | 0 |
+| ... and BETWEEN | **119 / 119** | **110** | **0** |
+
+Each step was a decline the matcher had no business making, and none of them
+was visible by reading -- the first cost a full rebuild cycle to find, which is
+what `factorize_explain` now exists to prevent. Also: 178 sqllogictest
+assertions, and 100 core checks under both asan+ubsan and -O2, all passing.
+
+**Known limitation, and it is the blocker for AUTO:** the 9 queries that do not
+answer correctly do not answer at all -- their f-representation exceeds the
+memory budget and the query *fails* under `force` rather than falling back to
+the stock plan. All 9 are the shapes FINDINGS F17 already identified as the
+regime where result size does not predict memory (7 watdiv, 2 yago chains).
+Plan item 3.8 called for an abortable operator for exactly this reason. Under
+the reuse-first design there is nothing to fall back *to* -- the stock subtree
+was dropped at optimize time -- so fallback means keeping that subtree as a
+child of `LogicalFactorized` and planning it as well. `force` is documented as
+benchmarking-only and a clean error is defensible there; `auto` cannot ship
+until this is fixed.

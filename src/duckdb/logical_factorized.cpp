@@ -6,12 +6,16 @@
 
 namespace duckdb {
 
-LogicalFactorized::LogicalFactorized(idx_t table_index_p) : LogicalExtensionOperator(), table_index(table_index_p) {
+LogicalFactorized::LogicalFactorized(idx_t table_index_p, vector<BoundRelation> relations_p,
+                                     factorize::QueryGraph graph_p, factorize::Plan plan_p)
+    : LogicalExtensionOperator(), table_index(table_index_p), relations(std::move(relations_p)),
+      graph(std::move(graph_p)), plan(std::move(plan_p)) {
 }
 
 void LogicalFactorized::ResolveTypes() {
-	// The sealed island emits exactly one scalar (plan §1.1). Phase 3 widens this
-	// to the semiring's result type (§4.5), not to a tuple stream.
+	// The sealed island emits exactly one scalar (plan §1.1). Widening this to
+	// the semiring's other aggregates (§4.5) is a later step; it never becomes a
+	// tuple stream.
 	types = {LogicalType::BIGINT};
 }
 
@@ -35,8 +39,9 @@ string LogicalFactorized::GetExtensionName() const {
 
 InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Phase"] = "0 (stub)";
-	result["Value"] = to_string(stub_value);
+	result["Relations"] = DescribeRelations(relations);
+	result["Predicates"] = DescribePredicates(relations, graph);
+	result["Join Order"] = DescribeJoinOrder(relations, plan);
 	return result;
 }
 
@@ -47,8 +52,9 @@ void LogicalFactorized::Serialize(Serializer &serializer) const {
 }
 
 PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-	// Phase 0 ignores children entirely; the operator is a pure source.
-	return planner.Make<PhysicalFactorized>(types, stub_value, estimated_cardinality);
+	// A pure source: it has no children to plan, because it reads the tables in
+	// `relations` itself rather than being fed by them.
+	return planner.Make<PhysicalFactorized>(types, relations, graph, plan, estimated_cardinality);
 }
 
 } // namespace duckdb

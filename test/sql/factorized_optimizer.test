@@ -1,0 +1,509 @@
+# name: test/sql/factorized_optimizer.test
+# description: The optimizer rule computes real counts, and every answer matches factorize_mode='off'
+# group: [sql]
+
+require factorize
+
+# Every expected value below is also the value stock DuckDB produces with the
+# rule switched off: the rule is a drop-in replacement or it is a bug. Shapes
+# the matcher declines are here for the same reason -- a decline has to leave
+# the right answer behind, not merely avoid firing.
+
+statement ok
+CREATE TABLE r AS SELECT * FROM (VALUES (1), (1), (2), (3)) t(x);
+
+statement ok
+CREATE TABLE s AS SELECT * FROM (VALUES (1), (2), (2), (4)) t(x);
+
+# x=1: 2*1, x=2: 1*2, x=3 and x=4 join with nothing.
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+4
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+4
+
+# ... and the operator is the one that answered.
+query II
+EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# EXPLAIN has to say what was taken over, or a silent rewrite is undebuggable.
+query II
+EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+physical_plan	<REGEX>:.*(r.x = s.x|s.x = r.x).*
+
+#-----------------------------------------------------------------------------
+# Shapes the region is for.
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE hub AS SELECT * FROM (VALUES (1), (1), (2)) t(k);
+
+statement ok
+CREATE TABLE arm1 AS SELECT * FROM (VALUES (1), (1), (1), (2)) t(k);
+
+statement ok
+CREATE TABLE arm2 AS SELECT * FROM (VALUES (1), (2), (2)) t(k);
+
+# Star. k=1: 2*3*1 = 6, k=2: 1*1*2 = 2.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM hub, arm1, arm2 WHERE hub.k = arm1.k AND hub.k = arm2.k;
+----
+8
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM hub, arm1, arm2 WHERE hub.k = arm1.k AND hub.k = arm2.k;
+----
+8
+
+# Equality propagation: the same star written as a chain of predicates must give
+# the same answer, because the two predicates put all three in one class.
+query I
+SELECT count(*) FROM hub, arm1, arm2 WHERE hub.k = arm1.k AND arm1.k = arm2.k;
+----
+8
+
+statement ok
+CREATE TABLE chain_a AS SELECT * FROM (VALUES (1), (2)) t(x);
+
+statement ok
+CREATE TABLE chain_b AS SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30)) t(x, y);
+
+statement ok
+CREATE TABLE chain_c AS SELECT * FROM (VALUES (10), (10), (30)) t(y);
+
+# Chain: (1,10) matches two c rows, (1,20) none, (2,30) one.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM chain_a, chain_b, chain_c WHERE chain_a.x = chain_b.x AND chain_b.y = chain_c.y;
+----
+3
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM chain_a, chain_b, chain_c WHERE chain_a.x = chain_b.x AND chain_b.y = chain_c.y;
+----
+3
+
+# Self-join: two scans of one table, which is the case relation identity has to
+# get right. Paths of length two in 1->2, 1->3, 2->3, 3->1.
+statement ok
+CREATE TABLE edge AS SELECT * FROM (VALUES (1, 2), (1, 3), (2, 3), (3, 1)) t(src, dst);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM edge e1, edge e2 WHERE e1.dst = e2.src;
+----
+5
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM edge e1, edge e2 WHERE e1.dst = e2.src;
+----
+5
+
+# A self-join's EXPLAIN has to distinguish the two scans of the one table.
+query II
+EXPLAIN SELECT count(*) FROM edge e1, edge e2 WHERE e1.dst = e2.src;
+----
+physical_plan	<REGEX>:.*edge#1.*
+
+# A triangle cannot be arranged as an f-tree at all: its third relation reaches
+# the other two through two different equivalence classes, so its keys never
+# land on one level. The planner refuses it, which has to show up as the stock
+# plan answering -- not as a query that dies partway through.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM edge a, edge b, edge c WHERE a.dst = b.src AND b.dst = c.src AND c.dst = a.src;
+----
+3
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM edge a, edge b, edge c WHERE a.dst = b.src AND b.dst = c.src AND c.dst = a.src;
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM edge a, edge b, edge c WHERE a.dst = b.src AND b.dst = c.src AND c.dst = a.src;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+#-----------------------------------------------------------------------------
+# NULLs and widths, the two places the table function had live bugs.
+#-----------------------------------------------------------------------------
+
+# A NULL join key equals nothing, including another NULL. A relation with two
+# join columns is the case that broke: dropping NULLs per column rather than per
+# row desynchronises the columns and fabricates rows that never existed.
+statement ok
+CREATE TABLE holes AS SELECT * FROM (VALUES (1, 1), (NULL, 2), (3, NULL), (2, 2)) t(p, q);
+
+statement ok
+CREATE TABLE keys1 AS SELECT * FROM (VALUES (1), (2), (3)) t(k);
+
+statement ok
+CREATE TABLE keys2 AS SELECT * FROM (VALUES (1), (2)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM holes, keys1, keys2 WHERE holes.p = keys1.k AND holes.q = keys2.k;
+----
+2
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM holes, keys1, keys2 WHERE holes.p = keys1.k AND holes.q = keys2.k;
+----
+2
+
+# Keys past int32. Two BIGINTs sharing their low 32 bits must stay distinct --
+# truncating them into a signed 32-bit slot merges them silently.
+statement ok
+CREATE TABLE wide_l AS SELECT * FROM (VALUES (4294967296), (1)) t(k);
+
+statement ok
+CREATE TABLE wide_r AS SELECT * FROM (VALUES (4294967296), (4294967296), (1)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM wide_l, wide_r WHERE wide_l.k = wide_r.k;
+----
+3
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM wide_l, wide_r WHERE wide_l.k = wide_r.k;
+----
+3
+
+# Mixed widths across one edge.
+statement ok
+CREATE TABLE narrow AS SELECT CAST(k AS INTEGER) AS k FROM (VALUES (1), (2), (2)) t(k);
+
+statement ok
+CREATE TABLE wide AS SELECT CAST(k AS BIGINT) AS k FROM (VALUES (2), (3)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM narrow, wide WHERE narrow.k = wide.k;
+----
+2
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM narrow, wide WHERE narrow.k = wide.k;
+----
+2
+
+# An empty relation empties the whole region.
+statement ok
+CREATE TABLE nothing (k INTEGER);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM r, nothing WHERE r.x = nothing.k;
+----
+0
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM r, nothing WHERE r.x = nothing.k;
+----
+0
+
+#-----------------------------------------------------------------------------
+# Filters. The region replaces the plan's scans, so a filter it dropped would
+# not be applied by anything -- these count the filtered join or they are a
+# wrong answer, not a slow one.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND r.x = 1;
+----
+2
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND s.x > 1;
+----
+2
+
+# The filtered column is not a join key here, so it is read only to be filtered.
+query I
+SELECT count(*) FROM chain_a, chain_b WHERE chain_a.x = chain_b.x AND chain_b.y > 15;
+----
+2
+
+# A filter that removes everything.
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND r.x = 99;
+----
+0
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND r.x = 1;
+----
+2
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND s.x > 1;
+----
+2
+
+query I
+SELECT count(*) FROM chain_a, chain_b WHERE chain_a.x = chain_b.x AND chain_b.y > 15;
+----
+2
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND r.x = 99;
+----
+0
+
+# A range. DuckDB's statistics propagation writes two-sided ranges as BETWEEN,
+# and it is the commonest thing left above a scan on a real join plan.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM chain_a, chain_b WHERE chain_a.x = chain_b.x AND chain_b.y BETWEEN 15 AND 35;
+----
+2
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND r.x >= 1 AND r.x <= 1;
+----
+2
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM chain_a, chain_b WHERE chain_a.x = chain_b.x AND chain_b.y BETWEEN 15 AND 35;
+----
+2
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND r.x >= 1 AND r.x <= 1;
+----
+2
+
+# An OR cannot become a per-column filter set, whose members are ANDed, so this
+# declines -- and the stock plan still answers.
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x AND (r.x = 1 OR r.x = 2);
+----
+4
+
+# A filter on a non-integer column is fine as long as the join keys are
+# integers: it is scanned to be filtered, never packed into a slot.
+statement ok
+CREATE TABLE labelled AS SELECT * FROM (VALUES (1, 'keep'), (2, 'drop'), (2, 'keep')) t(k, tag);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM labelled, s WHERE labelled.k = s.x AND labelled.tag = 'keep';
+----
+3
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM labelled, s WHERE labelled.k = s.x AND labelled.tag = 'keep';
+----
+3
+
+#-----------------------------------------------------------------------------
+# Declines. Each has to leave the correct answer behind.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET factorize_mode = 'force';
+
+# Non-integer join keys have no fixed-width slot.
+statement ok
+CREATE TABLE words_l AS SELECT * FROM (VALUES ('a'), ('b')) t(w);
+
+statement ok
+CREATE TABLE words_r AS SELECT * FROM (VALUES ('a'), ('a')) t(w);
+
+query I
+SELECT count(*) FROM words_l, words_r WHERE words_l.w = words_r.w;
+----
+2
+
+# An outer join is not an inner one.
+query I
+SELECT count(*) FROM r LEFT JOIN s ON r.x = s.x;
+----
+5
+
+# An inequality is not an equality.
+query I
+SELECT count(*) FROM r, s WHERE r.x < s.x;
+----
+8
+
+# GROUP BY is not the sealed island's shape.
+query II
+SELECT r.x, count(*) FROM r, s WHERE r.x = s.x GROUP BY r.x ORDER BY r.x;
+----
+1	2
+2	2
+
+# Only COUNT(*) is a v1 aggregate.
+query I
+SELECT sum(r.x) FROM r, s WHERE r.x = s.x;
+----
+6
+
+query I
+SELECT count(DISTINCT r.x) FROM r, s WHERE r.x = s.x;
+----
+2
+
+# One relation has nothing to factorize.
+query I
+SELECT count(*) FROM r;
+----
+4
+
+# A cross product is a disconnected graph, which the join order refuses.
+query I
+SELECT count(*) FROM r, s;
+----
+16
+
+# Not a stored table: nothing to re-scan.
+query I
+SELECT count(*) FROM range(4) t(x), s WHERE t.x = s.x;
+----
+3
+
+# A computed join key is not a bare column reference.
+query I
+SELECT count(*) FROM r, s WHERE r.x + 1 = s.x;
+----
+5
+
+#-----------------------------------------------------------------------------
+# The region is sealed: it has to compose with whatever surrounds it.
+#-----------------------------------------------------------------------------
+
+query I
+SELECT (SELECT count(*) FROM r, s WHERE r.x = s.x) * 2;
+----
+8
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x HAVING count(*) > 3;
+----
+4
+
+# A factorizable region nested under a shape that is not factorizable itself.
+query II
+SELECT k, cnt FROM (SELECT 1 AS k, count(*) AS cnt FROM r, s WHERE r.x = s.x) t;
+----
+1	4
+
+#-----------------------------------------------------------------------------
+# Declines have to be askable-about. The rule turns queries down constantly and
+# silently by design, so without this the symptom of a broken matcher is nothing
+# happening -- which is also the symptom of a correctly conservative one.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET factorize_explain = true;
+
+statement ok
+SELECT count(*) FROM r, s WHERE r.x = s.x;
+
+statement ok
+SELECT count(*) FROM words_l, words_r WHERE words_l.w = words_r.w;
+
+statement ok
+SET factorize_explain = false;
+
+#-----------------------------------------------------------------------------
+# The modes still mean what they say.
+#-----------------------------------------------------------------------------
+
+# AUTO promises "fire when the cost gate agrees"; there is no gate yet, so it
+# must behave as OFF rather than as an unguarded FORCE.
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+4
+
+statement ok
+SET factorize_mode = 'off';
+
+query II
+EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM r, s WHERE r.x = s.x;
+----
+4

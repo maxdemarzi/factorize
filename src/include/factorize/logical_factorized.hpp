@@ -10,27 +10,36 @@
 
 #pragma once
 
+#include "factorize/storage_source.hpp"
+
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 
 namespace duckdb {
 
 //! Logical placeholder for the factorized region.
 //!
-//! Phase 0: carries no f-tree and ignores its children; it exists to prove the
-//! OptimizerExtension -> LogicalExtensionOperator -> PhysicalOperator chain
-//! composes against the pinned DuckDB version. Phase 3 gives it the f-tree, the
-//! per-level layouts, and the base-table LOGICAL_GETs as real children.
+//! It has no children. The matcher's subtree is dropped rather than carried,
+//! because the operator reads the base tables itself through the same storage
+//! path `factorized_count()` uses (DECISIONS D18) -- which is why MatchLeaf
+//! refuses any scan that returns less than the whole table.
 class LogicalFactorized : public LogicalExtensionOperator {
 public:
 	static constexpr const char *NAME = "FACTORIZED";
 
 public:
-	explicit LogicalFactorized(idx_t table_index);
+	LogicalFactorized(idx_t table_index, vector<BoundRelation> relations, factorize::QueryGraph graph,
+	                  factorize::Plan plan);
 
 	//! Table index owning this operator's single output column.
 	idx_t table_index;
-	//! Phase 0 stand-in for the aggregate result.
-	int64_t stub_value = 42;
+	//! The tables to scan, and the columns of each that a predicate touches.
+	vector<BoundRelation> relations;
+	//! The join graph, indexed by position in `relations`.
+	factorize::QueryGraph graph;
+	//! The join order, decided when the region was matched. Ordering at match
+	//! time is what lets an unorderable graph be a decline instead of a query
+	//! that fails partway through executing.
+	factorize::Plan plan;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;

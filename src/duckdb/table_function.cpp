@@ -1,49 +1,19 @@
 #include "factorize/table_function.hpp"
 
-#include "../core/plan.hpp"
+#include "factorize/storage_source.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/main/config.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/storage/data_table.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/main/config.hpp"
 
-#include <algorithm>
 #include <map>
 
 namespace duckdb {
 
 namespace {
 
-using factorize::ColumnStats;
 using factorize::Predicate;
 using factorize::QueryGraph;
-using factorize::RelationSource;
-
-//! One relation: a physical table, the alias it is referenced by, and the
-//! columns any predicate touches.
-struct BoundRelation {
-	string table;
-	string alias;
-	//! Physical column indexes, in the order the f-representation sees them.
-	vector<idx_t> columns;
-	//! Column name for each entry of `columns`, for error messages.
-	vector<string> column_names;
-	//! Storage width for each entry of `columns`, parallel to it.
-	vector<factorize::ValueType> column_types;
-
-	int LocalIndex(idx_t physical) const {
-		for (idx_t i = 0; i < columns.size(); i++) {
-			if (columns[i] == physical) {
-				return static_cast<int>(i);
-			}
-		}
-		return -1;
-	}
-};
 
 struct FactorizedCountBindData : public TableFunctionData {
 	vector<BoundRelation> relations;
@@ -82,32 +52,17 @@ string Trim(const string &text) {
 	return text.substr(start, end - start);
 }
 
-//! An f-representation packs keys into fixed-width slots, so a join key has to
-//! be an integer of known width. Rejecting here, by name, beats failing later
-//! inside the core with no idea which column was at fault.
-//!
-//! Returns the storage width the core must use for this column. This is not
-//! simply "32-bit types get INT32, 64-bit types get INT64": factorize::INT32
-//! is a *signed* 32-bit slot, and UINTEGER's range (0..4294967295) does not
-//! fit in one -- a value above INT32_MAX would be silently truncated exactly
-//! like the bug this function's caller exists to prevent. UINTEGER needs
-//! INT64 storage despite being nominally 32 bits.
+//! Named the relation explicitly, the caller gets told why its key will not do
+//! -- failing later inside the core with no idea which column was at fault is
+//! the alternative. The optimizer rule wants the opposite of this and declines
+//! silently, which is why the type mapping itself lives in TryIntegerKeyType.
 factorize::ValueType RequireIntegerKey(const LogicalType &type, const string &alias, const string &column) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-		return factorize::ValueType::INT32;
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:
-		return factorize::ValueType::INT64;
-	default:
+	factorize::ValueType value_type;
+	if (!TryIntegerKeyType(type, value_type)) {
 		throw BinderException("factorized_count: join key %s.%s is %s; only integer keys are supported", alias, column,
 		                      type.ToString());
 	}
+	return value_type;
 }
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
@@ -135,12 +90,11 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			throw BinderException("factorized_count: empty table specification");
 		}
 		BoundRelation relation;
-		relation.table = words[0];
 		relation.alias = words.size() > 1 && !StringUtil::CIEquals(words[1], "as")
 		                     ? words[1]
 		                     : (words.size() > 2 ? words[2] : words[0]);
-		auto &catalog_entry =
-		    Catalog::GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, INVALID_SCHEMA, relation.table);
+		auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, INVALID_SCHEMA, words[0]);
+		relation.entry = catalog_entry;
 		if (relation_of_alias.count(relation.alias)) {
 			throw BinderException("factorized_count: duplicate relation name '%s'; use an alias", relation.alias);
 		}
@@ -218,151 +172,6 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	return std::move(result);
 }
 
-//! Reads relations out of DuckDB storage on demand.
-//!
-//! Materialises one relation at a time. The queries this engine exists for have
-//! small inputs and enormous results, so holding every base table at once would
-//! be the wrong trade even though it would be simpler.
-class StorageSource : public RelationSource {
-public:
-	StorageSource(ClientContext &context, const FactorizedCountBindData &bind_data)
-	    : context(context), bind_data(bind_data) {
-	}
-
-	const std::vector<std::vector<int64_t>> &Columns(size_t relation) override {
-		if (loaded_relation == relation && !held.empty()) {
-			return held;
-		}
-		Load(relation);
-		loaded_relation = relation;
-		return held;
-	}
-
-	ColumnStats Stats(size_t relation, size_t column) override {
-		const auto &columns = Columns(relation);
-		ColumnStats stats;
-		stats.rows = static_cast<double>(columns[column].size());
-		// Exact statistics, computed from the data just read. DuckDB's catalog
-		// carries approximate distinct counts and no MCV list at all, so Phase 3
-		// has to sample instead -- see DECISIONS D13. Doing it exactly here keeps
-		// Phase 2 about data movement rather than estimation quality.
-		auto sorted = columns[column];
-		std::sort(sorted.begin(), sorted.end());
-		double distinct = 0;
-		std::vector<std::pair<int64_t, double>> frequencies;
-		for (size_t i = 0; i < sorted.size();) {
-			size_t j = i;
-			while (j < sorted.size() && sorted[j] == sorted[i]) {
-				j++;
-			}
-			distinct += 1;
-			frequencies.emplace_back(sorted[i], static_cast<double>(j - i));
-			i = j;
-		}
-		std::sort(frequencies.begin(), frequencies.end(),
-		          [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
-			          return a.second > b.second;
-		          });
-		if (frequencies.size() > MCV_ENTRIES) {
-			frequencies.resize(MCV_ENTRIES);
-		}
-		stats.distinct = std::max(1.0, distinct);
-		stats.mcv = std::move(frequencies);
-		return stats;
-	}
-
-private:
-	//! Matches the harness (DECISIONS D13): measured across five datasets, 128
-	//! entries is where hetio's error settles and more buys almost nothing.
-	static constexpr size_t MCV_ENTRIES = 128;
-
-	void Load(size_t relation) {
-		const auto &bound = bind_data.relations[relation];
-		auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, INVALID_SCHEMA, bound.table);
-		auto &storage = entry.GetStorage();
-		auto &transaction = DuckTransaction::Get(context, entry.catalog);
-
-		vector<StorageIndex> column_ids;
-		vector<LogicalType> types;
-		for (auto physical : bound.columns) {
-			column_ids.emplace_back(physical);
-			types.push_back(entry.GetColumns().GetColumn(PhysicalIndex(physical)).Type());
-		}
-
-		TableScanState state;
-		storage.InitializeScan(context, transaction, state, column_ids);
-
-		held.assign(bound.columns.size(), {});
-		DataChunk chunk;
-		chunk.Initialize(Allocator::Get(context), types);
-		while (true) {
-			chunk.Reset();
-			storage.Scan(transaction, chunk, state);
-			if (chunk.size() == 0) {
-				break;
-			}
-			// A relation's columns must stay row-aligned: held[0][k] and
-			// held[1][k] have to describe the same source row, because MakeScan
-			// zips them back together by shared index with no row id attached.
-			// Deciding a row's fate (kept or dropped) requires looking at every
-			// column *before* pushing any of them -- checking and pushing one
-			// column at a time, independently, drops rows from whichever
-			// columns happen to hold a NULL and desynchronizes every row after
-			// the first such NULL for a relation with more than one join
-			// column. This was a live bug (FINDINGS): filter once per row,
-			// across all columns, or not at all.
-			std::vector<UnifiedVectorFormat> formats(bound.columns.size());
-			for (idx_t c = 0; c < bound.columns.size(); c++) {
-				chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
-			}
-			for (idx_t row = 0; row < chunk.size(); row++) {
-				bool all_valid = true;
-				for (idx_t c = 0; c < bound.columns.size() && all_valid; c++) {
-					all_valid = formats[c].validity.RowIsValid(formats[c].sel->get_index(row));
-				}
-				if (!all_valid) {
-					// A NULL in any of this relation's join columns can never
-					// equal anything, so the row can never contribute to an
-					// inner join's count.
-					continue;
-				}
-				for (idx_t c = 0; c < bound.columns.size(); c++) {
-					const auto index = formats[c].sel->get_index(row);
-					held[c].push_back(ValueToInt64(chunk.data[c].GetType(), formats[c], index));
-				}
-			}
-		}
-	}
-
-	static int64_t ValueToInt64(const LogicalType &type, const UnifiedVectorFormat &format, idx_t index) {
-		switch (type.id()) {
-		case LogicalTypeId::TINYINT:
-			return UnifiedVectorFormat::GetData<int8_t>(format)[index];
-		case LogicalTypeId::SMALLINT:
-			return UnifiedVectorFormat::GetData<int16_t>(format)[index];
-		case LogicalTypeId::INTEGER:
-			return UnifiedVectorFormat::GetData<int32_t>(format)[index];
-		case LogicalTypeId::BIGINT:
-			return UnifiedVectorFormat::GetData<int64_t>(format)[index];
-		case LogicalTypeId::UTINYINT:
-			return UnifiedVectorFormat::GetData<uint8_t>(format)[index];
-		case LogicalTypeId::USMALLINT:
-			return UnifiedVectorFormat::GetData<uint16_t>(format)[index];
-		case LogicalTypeId::UINTEGER:
-			return UnifiedVectorFormat::GetData<uint32_t>(format)[index];
-		case LogicalTypeId::UBIGINT:
-			return static_cast<int64_t>(UnifiedVectorFormat::GetData<uint64_t>(format)[index]);
-		default:
-			throw InternalException("factorized_count: unsupported key type %s", type.ToString());
-		}
-	}
-
-	ClientContext &context;
-	const FactorizedCountBindData &bind_data;
-	std::vector<std::vector<int64_t>> held;
-	size_t loaded_relation = static_cast<size_t>(-1);
-};
-
 struct FactorizedCountGlobalState : public GlobalTableFunctionState {
 	bool emitted = false;
 };
@@ -400,7 +209,7 @@ void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output
 		throw InvalidInputException("factorized_count: %s", plan.reason);
 	}
 
-	StorageSource source(context, bind_data);
+	StorageSource source(context, bind_data.relations);
 	// Bottom-insert is the mode that carries the benefit (FINDINGS F4:
 	// bottom-inserts alone are worth 1.9x, top-inserts 0.98x). Phase 3 chooses
 	// per join; Phase 2 is about data movement, so it takes the better default.

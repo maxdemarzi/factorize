@@ -9,13 +9,15 @@ Efficient Factorized Execution for Relational Systems* (PVLDB 19(11):3006–3019
 2026). Derived from the paper only — no GPLv3 source was read or ported
 ([DECISIONS](DECISIONS.md) D1). MIT licensed.
 
-## Status: explicit SQL surface works, transparent integration does not
+## Status: plain SQL is accelerated on request, not yet by default
 
-Be clear about what this is. The engine, the cost model, and an explicit
-`factorized_count()` table function all work and are measured against real
-DuckDB storage. **Plain SQL is not yet transparently accelerated** — that
-needs the optimizer rule to actually decide when to fire, which does not
-exist yet.
+The engine, the cost model, an explicit `factorized_count()` table function and
+the optimizer rule all work against real DuckDB storage. Ordinary `count(*)`
+queries are taken over and answered by the factorized engine — but only with
+`SET factorize_mode='force'`. **The rule does not fire on its own yet**: that
+needs the cost gate wired into the optimizer, and a query whose
+f-representation runs out of memory needs to fall back to the stock plan
+instead of failing.
 
 | | state |
 |---|---|
@@ -23,12 +25,24 @@ exist yet.
 | MCV statistics and cost model | working, measured |
 | gate (fire/decline decision) | working, measured (standalone harness) |
 | `factorized_count()` table function | working — 238 CE queries, 0 mismatches against published sizes and stock DuckDB (DECISIONS D16) |
-| DuckDB optimizer integration (`factorize_mode='auto'`) | **not built** — the matcher exists but is a Phase 0 stub with no cost gate wired in; `'auto'` currently behaves as `'off'` rather than firing ungated |
+| optimizer rule under `factorize_mode='force'` | working — matches inner equi-join `count(*)`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
+| `factorize_mode='auto'` | **not built** — behaves as `'off'`. Needs the cost gate, and fallback-on-overflow rather than an error |
 | parallelism | **not built** — single-threaded |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
-v1.5.5. `factorized_count()` is reachable from SQL today; ordinary
-`count(*)` queries are not yet automatically rewritten to use it.
+v1.5.5.
+
+```sql
+SET factorize_mode = 'force';        -- 'auto' is not wired to a gate yet
+SET factorize_explain = true;        -- say what was taken over, or why not
+SELECT count(*) FROM a, b, c WHERE a.x = b.x AND b.y = c.y;
+```
+
+Shapes the rule takes over: an ungrouped `count(*)` over inner equi-joins of
+stored tables on integer columns, with filters DuckDB pushed into or left above
+the scans. Everything else — outer joins, `GROUP BY`, non-integer keys, cyclic
+join graphs, computed join keys — is declined silently and answered by the
+stock plan.
 
 ## What it does
 

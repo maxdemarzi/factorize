@@ -198,6 +198,42 @@ static void TestExcessiveRelationCountRejected() {
 	Report("an excessive relation count is rejected before any tree recursion runs");
 }
 
+//! A triangle cannot be arranged as an f-tree: its third relation reaches the
+//! other two through two different equivalence classes at once, so its keys
+//! cannot land on one level. The engine detects this halfway through executing
+//! ("key attributes did not converge on one level"); planning has to detect it
+//! first, or every caller's only signal is a query that dies mid-flight.
+static void TestCyclicGraphRejected() {
+	QueryGraph graph;
+	graph.column_counts = {2, 2, 2};
+	graph.column_types = {{ValueType::INT32, ValueType::INT32},
+	                      {ValueType::INT32, ValueType::INT32},
+	                      {ValueType::INT32, ValueType::INT32}};
+	// a.dst = b.src, b.dst = c.src, c.dst = a.src -- three relations, three
+	// classes, no relation attachable on a single key.
+	graph.predicates = {Predicate {0, 1, 1, 0}, Predicate {1, 1, 2, 0}, Predicate {2, 1, 0, 0}};
+
+	const auto plan = BuildPlan(graph);
+	Expect(!plan.complete, "triangle: BuildPlan must not complete");
+	Report("cyclic join graph is rejected at planning time");
+}
+
+//! The same three relations joined on one shared key are *not* cyclic, however
+//! many predicates say so: equality propagation collapses them into one class,
+//! and a relation attaching through several edges of one class converges fine.
+//! Counting predicates against relations would call this cyclic and refuse a
+//! query the engine handles.
+static void TestRedundantStarAccepted() {
+	QueryGraph graph;
+	graph.column_counts = {1, 1, 1};
+	graph.column_types = {{ValueType::INT32}, {ValueType::INT32}, {ValueType::INT32}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}, Predicate {0, 0, 2, 0}};
+
+	const auto plan = BuildPlan(graph);
+	Expect(plan.complete, "star with a redundant predicate: BuildPlan must complete");
+	Report("one equivalence class stays acyclic however many predicates name it");
+}
+
 int main() {
 	std::printf("factorize core: plan\n\n");
 	TestInt32Baseline();
@@ -209,6 +245,10 @@ int main() {
 	TestDisconnectedGraphRejected();
 	std::printf("\n");
 	TestExcessiveRelationCountRejected();
+	std::printf("\n");
+	TestCyclicGraphRejected();
+	std::printf("\n");
+	TestRedundantStarAccepted();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }
