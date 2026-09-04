@@ -105,6 +105,28 @@ private:
 	const vector<BoundRelation> &relations;
 	std::vector<std::vector<int64_t>> held;
 	size_t loaded_relation = static_cast<size_t>(-1);
+	//! Row offsets surviving the NULL check in the chunk being read. A member
+	//! rather than a local so the allocation is made once, not per chunk.
+	vector<idx_t> kept;
+};
+
+//! Every relation, read once and then read-only, so threads can share it.
+//!
+//! StorageSource holds one relation at a time, which is the right trade for a
+//! single reader. It is the wrong one for several: a thread counting its own
+//! bucket of the join key still has to see every row to find its bucket, so N
+//! threads over a private StorageSource re-read the whole input N times. On a
+//! four-way self-join of 4.5M rows that re-reading *was* the runtime -- eight
+//! threads finished no sooner than one, having done eight times the scanning.
+class SharedRelations : public factorize::RelationSource {
+public:
+	SharedRelations(ClientContext &context, const vector<BoundRelation> &relations);
+
+	const std::vector<std::vector<int64_t>> &Columns(size_t relation) override;
+	factorize::ColumnStats Stats(size_t relation, size_t column) override;
+
+private:
+	std::vector<std::vector<std::vector<int64_t>>> held;
 };
 
 } // namespace duckdb

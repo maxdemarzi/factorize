@@ -86,28 +86,41 @@ string DescribeJoinOrder(const vector<BoundRelation> &relations, const factorize
 	return result;
 }
 
-static int64_t ValueToInt64(const LogicalType &type, const UnifiedVectorFormat &format, idx_t index) {
+//! Appends the surviving rows of one column, deciding the type once for the
+//! whole batch rather than once per value.
+template <class T>
+static void AppendTyped(const UnifiedVectorFormat &format, const vector<idx_t> &kept, std::vector<int64_t> &out) {
+	const auto *values = UnifiedVectorFormat::GetData<T>(format);
+	out.reserve(out.size() + kept.size());
+	for (auto row : kept) {
+		out.push_back(static_cast<int64_t>(values[format.sel->get_index(row)]));
+	}
+}
+
+static void AppendColumn(const LogicalType &type, const UnifiedVectorFormat &format, const vector<idx_t> &kept,
+                         std::vector<int64_t> &out) {
 	switch (type.id()) {
 	case LogicalTypeId::TINYINT:
-		return UnifiedVectorFormat::GetData<int8_t>(format)[index];
+		return AppendTyped<int8_t>(format, kept, out);
 	case LogicalTypeId::SMALLINT:
-		return UnifiedVectorFormat::GetData<int16_t>(format)[index];
+		return AppendTyped<int16_t>(format, kept, out);
 	case LogicalTypeId::INTEGER:
-		return UnifiedVectorFormat::GetData<int32_t>(format)[index];
+		return AppendTyped<int32_t>(format, kept, out);
 	case LogicalTypeId::BIGINT:
-		return UnifiedVectorFormat::GetData<int64_t>(format)[index];
+		return AppendTyped<int64_t>(format, kept, out);
 	case LogicalTypeId::UTINYINT:
-		return UnifiedVectorFormat::GetData<uint8_t>(format)[index];
+		return AppendTyped<uint8_t>(format, kept, out);
 	case LogicalTypeId::USMALLINT:
-		return UnifiedVectorFormat::GetData<uint16_t>(format)[index];
+		return AppendTyped<uint16_t>(format, kept, out);
 	case LogicalTypeId::UINTEGER:
-		return UnifiedVectorFormat::GetData<uint32_t>(format)[index];
+		return AppendTyped<uint32_t>(format, kept, out);
 	case LogicalTypeId::UBIGINT:
-		return static_cast<int64_t>(UnifiedVectorFormat::GetData<uint64_t>(format)[index]);
+		return AppendTyped<uint64_t>(format, kept, out);
 	default:
 		throw InternalException("factorize: unsupported key type %s", type.ToString());
 	}
 }
+
 
 StorageSource::StorageSource(ClientContext &context_p, const vector<BoundRelation> &relations_p)
     : context(context_p), relations(relations_p) {
@@ -224,23 +237,51 @@ void StorageSource::Load(size_t relation) {
 		for (idx_t c = 0; c < bound.columns.size(); c++) {
 			chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
 		}
+		// Which rows survive is decided first, for the whole chunk, so that the
+		// per-column work below can be a tight typed loop instead of a switch
+		// per value. Reading 18 million rows a row at a time, re-deciding the
+		// column's type for each one, was most of the runtime of a query whose
+		// join is supposed to be the expensive part.
+		kept.clear();
 		for (idx_t row = 0; row < chunk.size(); row++) {
 			bool all_valid = true;
 			for (idx_t c = 0; c < bound.columns.size() && all_valid; c++) {
 				all_valid = formats[c].validity.RowIsValid(formats[c].sel->get_index(row));
 			}
-			if (!all_valid) {
-				// A NULL in any of this relation's join columns can never equal
-				// anything, so the row can never contribute to an inner join's
-				// count.
-				continue;
+			if (all_valid) {
+				kept.push_back(row);
 			}
-			for (idx_t c = 0; c < bound.columns.size(); c++) {
-				const auto index = formats[c].sel->get_index(row);
-				held[c].push_back(ValueToInt64(chunk.data[c].GetType(), formats[c], index));
-			}
+			// A NULL in any of this relation's join columns can never equal
+			// anything, so the row can never contribute to an inner join's count
+			// -- and it is dropped from every column at once, never one column at
+			// a time, which is the rule the row alignment above depends on.
+		}
+		for (idx_t c = 0; c < bound.columns.size(); c++) {
+			AppendColumn(chunk.data[c].GetType(), formats[c], kept, held[c]);
 		}
 	}
+}
+
+SharedRelations::SharedRelations(ClientContext &context, const vector<BoundRelation> &relations) {
+	StorageSource source(context, relations);
+	held.reserve(relations.size());
+	for (size_t relation = 0; relation < relations.size(); relation++) {
+		// Copied out, because StorageSource overwrites its buffer on the next
+		// relation. The copy is the price of reading each relation once instead
+		// of once per thread.
+		held.push_back(source.Columns(relation));
+	}
+}
+
+const std::vector<std::vector<int64_t>> &SharedRelations::Columns(size_t relation) {
+	return held[relation];
+}
+
+factorize::ColumnStats SharedRelations::Stats(size_t relation, size_t column) {
+	factorize::ColumnStats stats;
+	stats.rows = static_cast<double>(held[relation][column].size());
+	stats.distinct = stats.rows > 0 ? stats.rows : 1;
+	return stats;
 }
 
 } // namespace duckdb

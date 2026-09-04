@@ -51,6 +51,10 @@ public:
 	int64_t total = 0;
 	idx_t completed = 0;
 	string error;
+	//! The inputs, read once and shared. Built lazily under `lock` by whichever
+	//! thread arrives first, because reading them is not free and there is no
+	//! point doing it before knowing the operator will run.
+	unique_ptr<SharedRelations> inputs;
 };
 
 unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientContext &context) const {
@@ -91,7 +95,17 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 	// having no data race.
 	factorize::SetGlobalMemoryLimit(gstate.memory_per_slice);
 
-	StorageSource source(client, relations);
+	// Read the inputs once, however many threads want them. Every bucket has to
+	// look at every row to find its own, so a private scan per thread would
+	// re-read the whole input per thread -- which is exactly what made the first
+	// parallel version no faster than the serial one.
+	{
+		lock_guard<mutex> guard(gstate.lock);
+		if (!gstate.inputs) {
+			gstate.inputs = make_uniq<SharedRelations>(client, relations);
+		}
+	}
+	auto &source = *gstate.inputs;
 	// Bottom-insert is the mode that carries the benefit (FINDINGS F4:
 	// bottom-inserts alone are worth 1.9x, top-inserts 0.98x). Choosing per join
 	// is a later step; this takes the better default.

@@ -56,6 +56,18 @@ public:
 	bool ParallelSource() const override {
 		return true;
 	}
+	//! One row has no order to preserve.
+	//!
+	//! Saying so is what makes the parallelism above reachable at all. Left at
+	//! the default INSERTION_ORDER, DuckDB treats the plan as order-preserving,
+	//! picks the single-threaded result collector, and then declines to
+	//! parallelise the pipeline because its *sink* is serial -- ParallelSource()
+	//! is never even consulted. The symptom is a source that looks parallel,
+	//! passes every invariance test, and runs on one thread whatever `threads`
+	//! is set to.
+	OrderPreservationType SourceOrder() const override {
+		return OrderPreservationType::NO_ORDER;
+	}
 
 protected:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
