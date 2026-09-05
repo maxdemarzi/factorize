@@ -1054,6 +1054,59 @@ SELECT n_r.v, count(*) FROM n_r, n_s WHERE n_r.k = n_s.k GROUP BY n_r.v ORDER BY
 5	1
 NULL	1
 
+# The statistics are consulted to decide that, and they see committed row groups
+# only -- DataTable::GetStatistics is row_groups->CopyStats, while the scan also
+# reads rows the current transaction has appended. So the decline can be wrong,
+# and the scan carries a guard for when it is. Both halves are checked here,
+# because a guard that has never fired is a guard nobody has tested.
+statement ok
+CREATE TABLE guard_t (k INTEGER, g INTEGER);
+
+statement ok
+INSERT INTO guard_t VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE guard_u (k INTEGER);
+
+statement ok
+INSERT INTO guard_u VALUES (1), (2);
+
+# Nothing committed is NULL, so the statistics permit the takeover.
+query II
+SELECT guard_t.g, count(*) FROM guard_t, guard_u WHERE guard_t.k = guard_u.k GROUP BY guard_t.g ORDER BY 1;
+----
+10	1
+20	1
+
+statement ok
+BEGIN;
+
+# Uncommitted, so the statistics still say the column has no NULLs and the rule
+# still takes over. The scan is what notices, and it must refuse rather than
+# answer with the NULL group missing.
+statement ok
+INSERT INTO guard_t VALUES (1, NULL);
+
+statement error
+SELECT guard_t.g, count(*) FROM guard_t, guard_u WHERE guard_t.k = guard_u.k GROUP BY guard_t.g;
+----
+contains NULL
+
+statement ok
+ROLLBACK;
+
+# Committed, the statistics see it, and the decline happens before anything is
+# scanned -- so DuckDB answers, and the NULL group is there.
+statement ok
+INSERT INTO guard_t VALUES (1, NULL);
+
+query II
+SELECT guard_t.g, count(*) FROM guard_t, guard_u WHERE guard_t.k = guard_u.k GROUP BY guard_t.g ORDER BY 1;
+----
+10	1
+20	1
+NULL	1
+
 statement ok
 RESET disabled_optimizers;
 

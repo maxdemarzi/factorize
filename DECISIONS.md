@@ -813,6 +813,24 @@ only, so rows appended in the current transaction are not covered, and
 behaviour would turn a working query into an error under `auto`, which breaks
 the contract from the other side; a throw as the backstop keeps it.
 
+The second layer was shipped untested, which is worth admitting because the
+argument that it was covered sounded good: a corpus re-run came back
+byte-for-byte identical across 2590 queries. It could not have exercised the
+guard. The run used `EXPLAIN`, which optimizes without executing, and the guard
+fires at scan time -- and the corpus tables are empty, so executing would not
+have helped either. **A run that cannot reach the code proves nothing about it,
+however many queries it contains.** Exercising it needs data and a transaction:
+
+    committed (1,10),(2,20)   statistics see no NULL -> takes over, answers
+    BEGIN; INSERT (1,NULL)    statistics still see no NULL -> takes over,
+                              and the scan throws
+    committed (1,NULL)        statistics see it -> declines, DuckDB answers,
+                              NULL group present
+
+All three are now in `test/sql/factorized_optimizer.test`. The middle one is the
+whole reason the guard exists, and until it was written the hole was argued for
+rather than demonstrated.
+
 **H1 is the most useful of the six, and it passed.** Filter-only columns never
 enter `bound.columns` -- they are scanned but never read into the row buffer --
 so the drop rule is "any *join* column", not "any scanned column", and filter
