@@ -903,12 +903,77 @@ SELECT sum(s_lonely.v) FROM s_lonely, s_hub WHERE s_lonely.k = s_hub.k;
 ----
 5
 
-# The fold is over integers, so a DECIMAL column is declined -- and answered.
+# DECIMAL is summed, not declined (DECISIONS D10 committed v1 to integer and
+# DECIMAL). Its storage is an integer times a power of ten, so the stored
+# integers are what the fold adds and the scale is reapplied once, to the total
+# -- and on TPC-DS this is where sums actually live: 31 queries whose only
+# matchable aggregate sums a DECIMAL, against 13 reachable without it.
 statement ok
 CREATE TABLE s_money AS SELECT * FROM (VALUES (1, 1.50), (2, 2.25)) t(k, amount);
 
+statement ok
+SET factorize_mode = 'off';
+
 query I
 SELECT sum(s_money.amount) FROM s_money, s_hub WHERE s_money.k = s_hub.k;
+----
+3.75
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(s_money.amount) FROM s_money, s_hub WHERE s_money.k = s_hub.k;
+----
+3.75
+
+# ... and the type comes back as DuckDB's own: sum(DECIMAL(p,s)) is
+# DECIMAL(38,s) whatever p was, so operators above bind against that.
+query I
+SELECT typeof(sum(s_money.amount)) FROM s_money, s_hub WHERE s_money.k = s_hub.k;
+----
+DECIMAL(38,2)
+
+# A DECIMAL multiplied out by the join: the scale must not be applied per row.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(s_money.amount) FROM s_money, s_hub, s_other
+ WHERE s_money.k = s_hub.k AND s_money.k = s_other.k;
+----
+5.25
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(s_money.amount) FROM s_money, s_hub, s_other
+ WHERE s_money.k = s_hub.k AND s_money.k = s_other.k;
+----
+5.25
+
+# Grouped, so the scale is reapplied once per group rather than once per query.
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+query II
+SELECT s_money.k, sum(s_money.amount) FROM s_money, s_hub WHERE s_money.k = s_hub.k
+ GROUP BY s_money.k ORDER BY 1;
+----
+1	1.50
+2	2.25
+
+statement ok
+RESET disabled_optimizers;
+
+# Floating point stays declined, and on purpose: reassociation makes the answer
+# depend on the order it was summed in, and 'auto' must equal 'off' (D10).
+statement ok
+CREATE TABLE s_float AS SELECT * FROM (VALUES (1, 1.5::DOUBLE), (2, 2.25::DOUBLE)) t(k, amount);
+
+query I
+SELECT sum(s_float.amount) FROM s_float, s_hub WHERE s_float.k = s_hub.k;
 ----
 3.75
 

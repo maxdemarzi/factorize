@@ -79,6 +79,19 @@ struct BoundRelation {
 //! rewrite silently and leave the stock plan alone.
 bool TryIntegerKeyType(const LogicalType &type, factorize::ValueType &result);
 
+//! The storage width for a column the region will *sum*, or false if the fold
+//! cannot carry it.
+//!
+//! Wider than a join key, because a summed column is never packed into a key
+//! slot or compared: it only has to be an integer the fold can add. DECIMAL
+//! qualifies, and DECISIONS D10 committed v1 to integer and DECIMAL from the
+//! start -- its storage is an integer times a power of ten, so summing the
+//! stored integers is exact and the scale is reapplied once, to the total.
+//!
+//! Precisions past 18 are refused: DuckDB stores those as int128 and the fold
+//! is over int64.
+bool TrySummableType(const LogicalType &type, factorize::ValueType &result);
+
 //! `a(x, y), b(x)`: the relations, with the columns each one contributes.
 string DescribeRelations(const vector<BoundRelation> &relations);
 //! `a.x = b.x, b.y = c.y`.

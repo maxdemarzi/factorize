@@ -44,6 +44,23 @@ bool TryIntegerKeyType(const LogicalType &type, factorize::ValueType &result) {
 	}
 }
 
+bool TrySummableType(const LogicalType &type, factorize::ValueType &result) {
+	if (type.id() == LogicalTypeId::DECIMAL) {
+		switch (type.InternalType()) {
+		case PhysicalType::INT16:
+		case PhysicalType::INT32:
+			result = factorize::ValueType::INT32;
+			return true;
+		case PhysicalType::INT64:
+			result = factorize::ValueType::INT64;
+			return true;
+		default:
+			return false;
+		}
+	}
+	return TryIntegerKeyType(type, result);
+}
+
 //! EXPLAIN is where a takeover is either visible or invisible, and an operator
 //! that silently replaced half the plan had better say what it replaced it with
 //! (plan item 3.6).
@@ -99,6 +116,24 @@ static void AppendTyped(const UnifiedVectorFormat &format, const vector<idx_t> &
 
 static void AppendColumn(const LogicalType &type, const UnifiedVectorFormat &format, const vector<idx_t> &kept,
                          std::vector<int64_t> &out) {
+	if (type.id() == LogicalTypeId::DECIMAL) {
+		// A DECIMAL is an integer and a scale, and the integer is what is
+		// stored. Summing those integers is exact and the scale never moves --
+		// it is reapplied once, to the total. Which width the integer has
+		// depends on the precision, so the physical type decides, not the
+		// logical one.
+		switch (type.InternalType()) {
+		case PhysicalType::INT16:
+			return AppendTyped<int16_t>(format, kept, out);
+		case PhysicalType::INT32:
+			return AppendTyped<int32_t>(format, kept, out);
+		case PhysicalType::INT64:
+			return AppendTyped<int64_t>(format, kept, out);
+		default:
+			// INT128, for precisions past 18. The fold is over int64.
+			throw InternalException("factorize: %s is too wide to fold", type.ToString());
+		}
+	}
 	switch (type.id()) {
 	case LogicalTypeId::TINYINT:
 		return AppendTyped<int8_t>(format, kept, out);

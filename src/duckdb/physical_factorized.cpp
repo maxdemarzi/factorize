@@ -100,6 +100,18 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / slices));
 }
 
+//! The fold's int64 total, in the type the aggregate was bound to.
+//!
+//! For a DECIMAL the total is already in units of the scale -- the stored
+//! integers were summed and the scale never moved -- so it is reapplied here,
+//! once, by constructing the value rather than by dividing.
+static Value FoldedValue(int64_t total, const LogicalType &type) {
+	if (type.id() == LogicalTypeId::DECIMAL) {
+		return Value::DECIMAL(hugeint_t(total), DecimalType::GetWidth(type), DecimalType::GetScale(type));
+	}
+	return Value::HUGEINT(hugeint_t(total)).DefaultCastAs(type);
+}
+
 //! One row per group, computed once and handed out a vector at a time.
 SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataChunk &chunk,
                                                 FactorizedGlobalSourceState &gstate) const {
@@ -130,7 +142,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		chunk.SetValue(0, produced, Value::Numeric(group_type, groups[gstate.handed_out].first));
 		chunk.SetValue(1, produced,
 		               aggregate == factorize::Aggregate::SUM
-		                   ? Value::HUGEINT(hugeint_t(groups[gstate.handed_out].second)).DefaultCastAs(sum_type)
+		                   ? FoldedValue(groups[gstate.handed_out].second, sum_type)
 		                   : Value::BIGINT(groups[gstate.handed_out].second));
 		gstate.handed_out++;
 		produced++;
@@ -207,9 +219,8 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 			throw InvalidInputException("factorize: %s", gstate.error);
 		}
 		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, aggregate == factorize::Aggregate::SUM
-		                         ? Value::HUGEINT(hugeint_t(gstate.total)).DefaultCastAs(sum_type)
-		                         : Value::BIGINT(gstate.total));
+		chunk.SetValue(0, 0, aggregate == factorize::Aggregate::SUM ? FoldedValue(gstate.total, sum_type)
+		                                                           : Value::BIGINT(gstate.total));
 	}
 	// Not FINISHED: that would tell DuckDB this thread is done with the operator
 	// entirely, and with fewer threads scheduled than there are buckets the rest

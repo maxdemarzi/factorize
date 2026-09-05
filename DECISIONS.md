@@ -704,3 +704,44 @@ All four are table functions rather than optimizer rules. The rule matches
 `count(*)` and nothing else, so `SELECT ... LIMIT 100` over a join is still
 answered by DuckDB unless the user calls `factorized_tuples` by name. Wiring
 these into the matcher is the obvious next step and is not done.
+
+## D24 — A `git checkout` under a running build produces a binary of no particular version
+
+Two sessions were working in this repository at once, in one working tree
+rather than two clones. The other session needed to put its work on a branch,
+so it ran `git checkout -b`, committed, pushed, and switched back — ninety
+seconds, and it verified afterwards that none of this session's files had been
+disturbed. They had not been.
+
+The damage was to a build that was running at the time. `git checkout` rewrites
+the working tree; a compiler reading that tree does not stop. Object files
+produced before the switch were compiled against one version of
+`src/core/join.cpp` and those produced after against another. The link then
+succeeds, because the two versions differ in ways that do not change any symbol
+the linker checks, and the result is a binary that corresponds to no commit,
+no branch, and no state the source was ever in. Nothing warns.
+
+This is DECISIONS D17's torn read -- a background compile reading a file
+mid-edit -- one level up: there the inconsistency was within a file, here it is
+across the tree. The lesson generalises the same way. **An artifact built while
+its inputs were changing is not evidence, whatever it reports.** The build was
+discarded and re-run over a stable tree, at a cost of twenty minutes, which is
+the whole price of noticing.
+
+Both sessions now hold to: announce before any git command that rewrites the
+working tree (`checkout`, `switch`, `restore`, `reset`, `merge`, `rebase`,
+`stash`) and wait, rather than checking for signs of a build and guessing --
+"is anyone building right now" is not answerable by looking. Read-only commands
+and `add <path>` / `commit` / `push`, which do not move the tree, need no
+announcement.
+
+The better answer, and what to reach for next time, is not to move the shared
+tree at all:
+
+    git worktree add ../factorize-branch -b <branch> <base>
+    # commit and push from there
+    git worktree remove ../factorize-branch
+
+A second checkout backed by the same `.git`. The shared tree's HEAD never
+moves, so nothing anyone is reading or compiling changes, and the branch still
+reaches the remote.

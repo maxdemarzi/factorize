@@ -630,13 +630,14 @@ static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relation
 			return Decline(region, "summed column is generated");
 		}
 		factorize::ValueType value_type;
-		if (!TryIntegerKeyType(definition.Type(), value_type)) {
-			// DECIMAL would work in principle -- its storage is an integer and a
-			// scale, and summing the integers then applying the scale is exact --
-			// but the result type widens to DECIMAL(38, s) and this engine folds
-			// in int64. Declining is the honest version of that.
+		if (!TrySummableType(definition.Type(), value_type)) {
+			// Floating point is excluded on purpose rather than for want of a
+			// fold: reassociation makes a sum depend on the order it was taken
+			// in, and this rule's whole contract is that 'auto' and 'off' agree
+			// (DECISIONS D10). A DECIMAL past precision 18 is int128-backed and
+			// simply wider than the fold.
 			return Decline(region, "summed column " + definition.Name() + " is " + definition.Type().ToString() +
-			                           ", and the fold is over integers");
+			                           ", which the fold cannot carry");
 		}
 		auto &bound = relations[found->second];
 		const auto physical = static_cast<idx_t>(definition.Physical().index);
