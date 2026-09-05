@@ -60,6 +60,26 @@ the scans. Everything else — outer joins, `GROUP BY`, non-integer keys, cyclic
 join graphs, computed join keys — is declined silently and answered by the
 stock plan. `SET factorize_explain = true` says which, and why.
 
+### Beyond counting
+
+Four things the representation can answer that an aggregate cannot, each an
+explicit table function rather than something the optimizer rule fires on:
+
+```sql
+-- Does this join have any tuple? Stops at the first one it finds.
+SELECT * FROM factorized_exists(['a', 'b'], ['a.x = b.x']);
+
+-- The join itself. The third argument is a limit, and it is the interesting
+-- part: a hundred rows out of a join with a trillion, without building the
+-- trillion. Stock DuckDB materialises the hash-join intermediates regardless
+-- of the LIMIT.
+SELECT * FROM factorized_tuples(['a', 'b'], ['a.x = b.x'], 100);
+
+-- One row per group, counted without enumerating the tuples in it. Works when
+-- the grouping key is at the top of the f-tree, and declines when it is not.
+SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
+```
+
 ### Limitations worth knowing before you switch it on
 
 - **No spilling.** A representation too large for the memory budget is
