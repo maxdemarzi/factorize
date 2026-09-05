@@ -13,23 +13,39 @@ LogicalFactorized::LogicalFactorized(idx_t table_index_p, vector<BoundRelation> 
 }
 
 void LogicalFactorized::ResolveTypes() {
-	// The sealed island emits exactly one scalar (plan §1.1). Widening this to
-	// the semiring's other aggregates (§4.5) is a later step; it never becomes a
-	// tuple stream.
-	types = {LogicalType::BIGINT};
+	// The sealed island emits one scalar, or -- when the query groups -- one
+	// group key beside it. It never becomes a tuple stream.
+	//
+	// The group key keeps the type the aggregate gave it rather than the int64
+	// the engine works in: operators above were bound against that type, and
+	// handing them a wider one is a plan that type-checks and then misbehaves.
+	if (grouped) {
+		types = {group_type, LogicalType::BIGINT};
+	} else {
+		types = {LogicalType::BIGINT};
+	}
 }
 
 vector<ColumnBinding> LogicalFactorized::GetColumnBindings() {
+	if (grouped) {
+		// DuckDB gives an aggregate two table indexes, and the operators above
+		// reference both. Groups come first, matching LogicalAggregate's own
+		// order.
+		return {ColumnBinding(group_index, 0), ColumnBinding(table_index, 0)};
+	}
 	return {ColumnBinding(table_index, 0)};
 }
 
 void LogicalFactorized::ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) {
 	// The factorized region consumes its children's bindings entirely and exposes
-	// only its own aggregate column, so the resolver must not descend into them.
+	// only its own, so the resolver must not descend into them.
 	bindings = GetColumnBindings();
 }
 
 vector<idx_t> LogicalFactorized::GetTableIndex() const {
+	if (grouped) {
+		return {group_index, table_index};
+	}
 	return {table_index};
 }
 
@@ -42,6 +58,9 @@ InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 	result["Relations"] = DescribeRelations(relations);
 	result["Predicates"] = DescribePredicates(relations, graph);
 	result["Join Order"] = DescribeJoinOrder(relations, plan);
+	if (grouped) {
+		result["Group"] = relations[group_relation].alias + "." + relations[group_relation].column_names[group_column];
+	}
 	return result;
 }
 
@@ -54,7 +73,13 @@ void LogicalFactorized::Serialize(Serializer &serializer) const {
 PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	// A pure source: it has no children to plan, because it reads the tables in
 	// `relations` itself rather than being fed by them.
-	return planner.Make<PhysicalFactorized>(types, relations, graph, plan, estimated_cardinality);
+	auto &physical = planner.Make<PhysicalFactorized>(types, relations, graph, plan, estimated_cardinality);
+	auto &factorized = physical.Cast<PhysicalFactorized>();
+	factorized.grouped = grouped;
+	factorized.group_type = group_type;
+	factorized.group_relation = group_relation;
+	factorized.group_column = group_column;
+	return physical;
 }
 
 } // namespace duckdb

@@ -704,3 +704,94 @@ RESET threads;
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# GROUP BY. The grouping key sits at the top of the f-tree, so each root record
+# is a group and the tuples under it are a number the representation already
+# knows -- no tuple is enumerated to count them (plan §10.1).
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE g_left AS SELECT * FROM (VALUES (1), (1), (2), (3)) t(k);
+
+statement ok
+CREATE TABLE g_right AS SELECT * FROM (VALUES (1), (2), (2), (4)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+# k=1: 2x1, k=2: 1x2. k=3 and k=4 join with nothing and are not groups.
+query II
+SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP BY g_left.k ORDER BY 1;
+----
+1	2
+2	2
+
+statement ok
+SET factorize_mode = 'force';
+
+# DuckDB narrows the group key before the aggregate and widens it after, and
+# reproducing that transformation here would tie this rule to an internal
+# function. With that pass disabled the rule takes the query over.
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+query II
+SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP BY g_left.k ORDER BY 1;
+----
+1	2
+2	2
+
+query II
+EXPLAIN SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP BY g_left.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# The groups have to sum to the ungrouped count, or one of the two is wrong.
+query I
+SELECT sum(c) FROM (SELECT g_left.k, count(*) AS c FROM g_left, g_right
+                     WHERE g_left.k = g_right.k GROUP BY g_left.k) t;
+----
+4
+
+# Grouping on the other side of the equality names the same groups, because an
+# equi-join's keys are equal by definition.
+query II
+SELECT g_right.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP BY g_right.k ORDER BY 1;
+----
+1	2
+2	2
+
+# A grouping column that is not a join column was never scanned, so it is
+# declined -- and the stock plan answers.
+statement ok
+CREATE TABLE g_wide AS SELECT * FROM (VALUES (1, 7), (2, 8)) t(k, other);
+
+query II
+SELECT g_wide.other, count(*) FROM g_wide, g_right WHERE g_wide.k = g_right.k GROUP BY g_wide.other ORDER BY 1;
+----
+7	1
+8	2
+
+# Two grouping keys need the cross product of independent branches, which is a
+# different algorithm: declined, and still answered.
+query III
+SELECT g_left.k, g_right.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k
+ GROUP BY g_left.k, g_right.k ORDER BY 1;
+----
+1	1	2
+2	2	2
+
+statement ok
+RESET disabled_optimizers;
+
+# With the compression pass back on the rule declines rather than guessing, and
+# the answer is unchanged.
+query II
+SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP BY g_left.k ORDER BY 1;
+----
+1	2
+2	2
+
+statement ok
+SET factorize_mode = 'off';

@@ -12,6 +12,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
@@ -93,6 +94,13 @@ struct FactorizedRegion {
 	//! fails at execution with "Failed to bind column reference". The
 	//! replacement has to inherit the binding it is replacing.
 	idx_t aggregate_index = 0;
+	//! Set for `GROUP BY g, count(*)`. The grouped answer has two columns and
+	//! they live under two different table indexes: DuckDB gives an aggregate
+	//! one for its groups and another for its aggregates.
+	bool grouped = false;
+	idx_t group_index = 0;
+	ColumnBinding group_binding;
+	LogicalType group_type;
 };
 
 //! Records why a subtree was turned down and declines it. Always returns false,
@@ -202,9 +210,24 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 	}
 	auto &proj = op.Cast<LogicalProjection>();
 	for (auto &expr : proj.expressions) {
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			// A constant per row changes no row's existence, so it changes no
+			// count. DuckDB plants one of these under the aggregate it rewrites
+			// EXISTS into.
+			continue;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+		    StringUtil::StartsWith(expr->Cast<BoundFunctionExpression>().function.name, "__internal_compress")) {
+			// DuckDB's compressed-materialization pass narrows the group key
+			// before an aggregate and widens it again afterwards. Reproducing
+			// that transformation here would tie this rule to the semantics of
+			// an internal function; declining says so, and names the way out.
+			return Decline(region, "compressed materialization is in the way; "
+			                       "SET disabled_optimizers='compressed_materialization' to factorize this");
+		}
 		if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			// Any computed expression would have to be evaluated on flattened
-			// tuples, which the sealed island does not produce.
+			// Any other computed expression would have to be evaluated on
+			// flattened tuples, which the sealed island does not produce.
 			return Decline(region, "projection computes an expression");
 		}
 	}
@@ -221,9 +244,26 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		return false;
 	}
 	auto &aggr = op.Cast<LogicalAggregate>();
-	if (!aggr.groups.empty() || !aggr.grouping_sets.empty() || !aggr.grouping_functions.empty()) {
-		// GROUP BY is a v2 item (plan §10.1), not a v1 shape.
-		return Decline(region, "aggregate is grouped");
+	if (!aggr.grouping_functions.empty() || aggr.grouping_sets.size() > 1) {
+		// GROUPING SETS / ROLLUP ask for several groupings at once.
+		return Decline(region, "aggregate has grouping sets");
+	}
+	if (aggr.groups.size() > 1) {
+		// Several keys need the cross product of independent branches when they
+		// are scattered, which is a different algorithm (plan §10.1).
+		return Decline(region, "aggregate groups on more than one column");
+	}
+	if (aggr.groups.size() == 1) {
+		// One grouping key is the case the representation answers directly: it
+		// sits at the top of the f-tree, so each root record is a group and the
+		// tuples under it are a number already memoized.
+		if (aggr.groups[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return Decline(region, "aggregate groups on a computed expression");
+		}
+		region.grouped = true;
+		region.group_index = aggr.group_index;
+		region.group_binding = aggr.groups[0]->Cast<BoundColumnRefExpression>().binding;
+		region.group_type = aggr.groups[0]->return_type;
 	}
 	if (aggr.expressions.size() != 1) {
 		return Decline(region, "aggregate computes more than one value");
@@ -384,7 +424,8 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 }
 
 //! False if any part of the region cannot be expressed, which is a decline.
-static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relations, factorize::QueryGraph &graph) {
+static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relations, factorize::QueryGraph &graph,
+                       size_t &group_relation, size_t &group_column) {
 	std::map<idx_t, size_t> relation_of_table_index;
 	for (size_t i = 0; i < region.relations.size(); i++) {
 		auto &get = region.relations[i].get();
@@ -548,6 +589,34 @@ static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relation
 		}
 	}
 
+	if (region.grouped) {
+		// The grouping key has to be a column the region reads, and it only
+		// reads join columns: anything else was never scanned, because it cannot
+		// change a count. That is also exactly the condition ExecuteGroupCount
+		// needs -- a key that is not a join key is not at the top of the f-tree.
+		auto found = relation_of_table_index.find(region.group_binding.table_index);
+		if (found == relation_of_table_index.end()) {
+			return Decline(region, "grouping column belongs to no relation of the region");
+		}
+		auto &get = region.relations[found->second].get();
+		auto &column_ids = get.GetColumnIds();
+		if (region.group_binding.column_index >= column_ids.size()) {
+			return Decline(region, "grouping column is not among the scanned columns");
+		}
+		auto &column_index = column_ids[region.group_binding.column_index];
+		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
+			return Decline(region, "grouping column is not a stored scalar column");
+		}
+		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+		const auto physical = static_cast<idx_t>(definition.Physical().index);
+		const auto local = relations[found->second].LocalIndex(physical);
+		if (local < 0) {
+			return Decline(region, "grouping column " + definition.Name() + " is not a join column of this query");
+		}
+		group_relation = found->second;
+		group_column = static_cast<size_t>(local);
+	}
+
 	for (auto &relation : relations) {
 		graph.column_counts.push_back(relation.columns.size());
 		graph.column_types.push_back(relation.column_types);
@@ -667,7 +736,9 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && MatchAggregate(*op, region)) {
 		vector<BoundRelation> relations;
 		factorize::QueryGraph graph;
-		if (BindRegion(region, relations, graph)) {
+		size_t group_relation = 0;
+		size_t group_column = 0;
+		if (BindRegion(region, relations, graph, group_relation, group_column)) {
 			// The join order is decided here rather than at execution: a graph
 			// the planner cannot order (a disconnected one, most of all) has to
 			// be a decline, not a query that fails halfway through running.
@@ -690,6 +761,11 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					}
 					auto replacement = make_uniq<LogicalFactorized>(region.aggregate_index, std::move(relations),
 					                                               std::move(graph), std::move(plan));
+					replacement->grouped = region.grouped;
+					replacement->group_index = region.group_index;
+					replacement->group_type = region.group_type;
+					replacement->group_relation = group_relation;
+					replacement->group_column = group_column;
 					replacement->estimated_cardinality = 1;
 					replacement->ResolveOperatorTypes();
 					op = std::move(replacement);

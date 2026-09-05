@@ -55,6 +55,10 @@ public:
 	//! thread arrives first, because reading them is not free and there is no
 	//! point doing it before knowing the operator will run.
 	unique_ptr<SharedRelations> inputs;
+	//! For a grouped query: the groups, and how many have been handed out. There
+	//! can be more of them than fit one vector.
+	unique_ptr<vector<std::pair<int64_t, int64_t>>> groups;
+	idx_t handed_out = 0;
 };
 
 unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientContext &context) const {
@@ -77,12 +81,56 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	if (slices < 1) {
 		slices = 1;
 	}
+	if (grouped) {
+		// Grouping runs on one thread. Partitioning by the join key would put
+		// each group wholly inside one bucket *only* when the partitioned key is
+		// the grouping key, and ChooseSliceColumns picks whichever key reaches
+		// the most relations. Merging partial groups across buckets is the
+		// correct general answer and is not written; one thread is.
+		slices = 1;
+	}
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / slices));
+}
+
+//! One row per group, computed once and handed out a vector at a time.
+SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataChunk &chunk,
+                                                FactorizedGlobalSourceState &gstate) const {
+	auto &client = context.client;
+	{
+		lock_guard<mutex> guard(gstate.lock);
+		if (!gstate.groups) {
+			factorize::SetGlobalMemoryLimit(gstate.memory_per_slice);
+			SharedRelations source(client, relations);
+			auto result = factorize::ExecuteGroupCount(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+			                                           group_relation, group_column);
+			if (!result.ok) {
+				throw InvalidInputException("factorize: %s", result.error);
+			}
+			gstate.groups = make_uniq<vector<std::pair<int64_t, int64_t>>>(std::move(result.groups));
+		}
+	}
+
+	auto &groups = *gstate.groups;
+	idx_t produced = 0;
+	lock_guard<mutex> guard(gstate.lock);
+	while (gstate.handed_out < groups.size() && produced < STANDARD_VECTOR_SIZE) {
+		// The key goes back out in the type the aggregate gave it, not the int64
+		// the engine counted in.
+		chunk.SetValue(0, produced, Value::Numeric(group_type, groups[gstate.handed_out].first));
+		chunk.SetValue(1, produced, Value::BIGINT(groups[gstate.handed_out].second));
+		gstate.handed_out++;
+		produced++;
+	}
+	chunk.SetCardinality(produced);
+	return produced == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
 SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                      OperatorSourceInput &input) const {
 	auto &gstate = input.global_state.Cast<FactorizedGlobalSourceState>();
+	if (grouped) {
+		return EmitGroups(context, chunk, gstate);
+	}
 	const idx_t slice = gstate.next_slice.fetch_add(1);
 	if (slice >= gstate.slices) {
 		// Every bucket is claimed; this thread has nothing left to do.

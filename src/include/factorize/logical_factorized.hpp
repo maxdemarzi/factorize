@@ -30,8 +30,18 @@ public:
 	LogicalFactorized(idx_t table_index, vector<BoundRelation> relations, factorize::QueryGraph graph,
 	                  factorize::Plan plan);
 
-	//! Table index owning this operator's single output column.
+	//! Table index owning this operator's aggregate column.
 	idx_t table_index;
+	//! Set for `GROUP BY g, count(*)`, which answers with two columns rather
+	//! than one. DuckDB gives an aggregate two table indexes -- one for its
+	//! groups, one for its aggregates -- and operators above reference both, so
+	//! the replacement has to expose both.
+	bool grouped = false;
+	idx_t group_index = 0;
+	LogicalType group_type = LogicalType::BIGINT;
+	//! Which of the region's columns the grouping key is.
+	size_t group_relation = 0;
+	size_t group_column = 0;
 	//! The tables to scan, and the columns of each that a predicate touches.
 	vector<BoundRelation> relations;
 	//! The join graph, indexed by position in `relations`.

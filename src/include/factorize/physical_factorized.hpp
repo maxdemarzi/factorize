@@ -34,6 +34,11 @@ public:
 	vector<BoundRelation> relations;
 	factorize::QueryGraph graph;
 	factorize::Plan plan;
+	//! Set for `GROUP BY g, count(*)`: one row per group rather than one row.
+	bool grouped = false;
+	LogicalType group_type = LogicalType::BIGINT;
+	size_t group_relation = 0;
+	size_t group_column = 0;
 
 public:
 	string GetName() const override;
@@ -72,6 +77,10 @@ public:
 protected:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
+
+private:
+	SourceResultType EmitGroups(ExecutionContext &context, DataChunk &chunk,
+	                            class FactorizedGlobalSourceState &gstate) const;
 };
 
 } // namespace duckdb
