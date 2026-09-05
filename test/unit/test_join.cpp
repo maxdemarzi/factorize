@@ -744,6 +744,72 @@ static void TestMemoryLimitCoversBuildSide() {
 	Report("memory limit covers the hash table and top-insert snapshot arena, not only the output");
 }
 
+//! The exact composite-key width the packing accepts.
+//!
+//! The 64-bit cap is what makes KeyReader's INT64 case correct, not merely what
+//! limits it: it is the reason a 64-bit column is alone in the word and so at
+//! offset zero. That makes the boundary worth pinning, because the failure mode
+//! of moving it is not a throw -- it is multi-column keys colliding into one
+//! hash key and counts coming out silently wrong.
+//!
+//! The rule is the SUM of the column widths, so the only composite key that
+//! fits is exactly two INT32s. A mixed INT32+INT64 pair is 96 bits and is
+//! refused just as two INT64s are -- worth a case of its own, because "not two
+//! INT64s" is the plausible wrong reading, and that pairing (a small
+//! discriminator beside a bigint id) is the common composite key in real
+//! schemas.
+static void TestCompositeKeyWidth() {
+	struct Case {
+		ValueType first;
+		ValueType second;
+		bool composite;
+		bool supported;
+		const char *what;
+	};
+	const Case cases[] = {
+	    {ValueType::INT32, ValueType::INT32, false, true, "one INT32 column"},
+	    {ValueType::INT64, ValueType::INT64, false, true, "one INT64 column, exactly 64 bits"},
+	    {ValueType::INT32, ValueType::INT32, true, true, "two INT32 columns, exactly 64 bits"},
+	    {ValueType::INT32, ValueType::INT64, true, false, "INT32 + INT64 is 96 bits"},
+	    {ValueType::INT64, ValueType::INT32, true, false, "INT64 + INT32 is 96 bits"},
+	    {ValueType::INT64, ValueType::INT64, true, false, "INT64 + INT64 is 128 bits"},
+	};
+	for (const auto &c : cases) {
+		const AttributeTypes build_types {{0, c.first}, {1, c.second}};
+		const AttributeTypes probe_types {{10, c.first}, {11, c.second}};
+		// One pair agrees on both columns; another agrees on the first only, so
+		// a composite key that silently dropped its second column would count 2
+		// where the answer is 1 and the test would catch it.
+		const auto build = MakeScan({0, 1}, build_types, {{1, 1, 2}, {5, 6, 7}});
+		const auto probe = MakeScan({10, 11}, probe_types, {{1, 1, 2}, {5, 9, 7}});
+		JoinKeys keys;
+		if (c.composite) {
+			keys.build = {0, 1};
+			keys.probe = {10, 11};
+		} else {
+			keys.build = {0};
+			keys.probe = {10};
+		}
+		int64_t count = -1;
+		bool threw = false;
+		try {
+			count = FactorizedCountJoin(build, probe, keys, JoinMode::BOTTOM_INSERT);
+		} catch (const std::exception &) {
+			threw = true;
+		}
+		Expect(threw != c.supported, std::string(c.what) + (c.supported ? " is supported" : " is refused"));
+		if (c.supported && !threw) {
+			// Single key: rows 1,1 on the build match 1,1 on the probe (4), plus
+			// 2 against 2 (1). Composite: only the (1,1) and (2,7) pairs agree
+			// on both columns.
+			const int64_t expected = c.composite ? 2 : 5;
+			Expect(count == expected, std::string(c.what) + " counts " + std::to_string(expected) + ", got " +
+			                              std::to_string(count));
+		}
+	}
+	Report("composite key width: the cap is the sum of the columns, and it is what keeps the packing correct");
+}
+
 int main() {
 	std::printf("factorize core: joins\n\n");
 	TestDifferential();
@@ -761,6 +827,8 @@ int main() {
 	TestFusedCount();
 	std::printf("\n");
 	TestMemoryLimitCoversBuildSide();
+	std::printf("\n");
+	TestCompositeKeyWidth();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }
