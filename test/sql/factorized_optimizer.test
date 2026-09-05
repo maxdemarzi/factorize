@@ -1654,8 +1654,11 @@ physical_plan	<REGEX>:.*FACTORIZED.*
 statement ok
 SET factorize_debug_fail = false;
 
-# And with the injection off, the same queries take the factorized path again --
-# so the tests above are exercising the fallback rather than a disabled rule.
+# And with the injection off the same query still answers. What rules out the
+# tests above having exercised a disabled rule is the EXPLAIN above this one,
+# not this count: the plan says FACTORIZED while the injection is on, so the
+# operator was in the plan and fell back while running. This count is 20000
+# either way and can only ever agree.
 query I
 SELECT count(*) FROM fb_h, fb_a, fb_b WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
 ----
@@ -1760,8 +1763,38 @@ SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k1 = ck_wide_b.k1 AND 
 # Two BIGINT key columns are 128 bits and refused the same way -- and a single
 # BIGINT key is exactly 64 and still fires, so the cap is on the sum rather than
 # on the presence of a wide column.
+#
+# Both halves are now asserted on the plan. They used to sit over this row
+# count alone, which is 5000 whether the rule fires or not, so a regression
+# narrowing the cap to "no BIGINT anywhere" would have passed -- and that is the
+# plausible wrong rule, because it is what the refusal looks like from outside.
+query II
+EXPLAIN SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k2 = ck_wide_b.k2;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
 query I
 SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k2 = ck_wide_b.k2;
+----
+5000
+
+# The 128-bit half needs two BIGINT columns to be about anything: ck_wide's k1
+# is an INTEGER, so a join on both of its columns tests 96 and not 128.
+statement ok
+CREATE TABLE ck_two_a AS SELECT i AS k1, i * 2 AS k2 FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE ck_two_b AS SELECT i AS k1, i * 2 AS k2 FROM range(5000) t(i);
+
+query II
+EXPLAIN SELECT count(*) FROM ck_two_a, ck_two_b
+ WHERE ck_two_a.k1 = ck_two_b.k1 AND ck_two_a.k2 = ck_two_b.k2;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM ck_two_a, ck_two_b
+ WHERE ck_two_a.k1 = ck_two_b.k1 AND ck_two_a.k2 = ck_two_b.k2;
 ----
 5000
 

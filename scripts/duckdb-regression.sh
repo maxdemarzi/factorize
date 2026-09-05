@@ -30,7 +30,16 @@ fi
 status=0
 for suite in "${SUITES[@]}"; do
     echo "== $suite =="
-    if ! "$UNITTEST" --test-dir duckdb "$suite" 2>&1 | tail -3; then
+    # The binary exits 0 when a filter matches nothing, so a suite path DuckDB
+    # has since moved would report success having run no tests at all. That is
+    # the one result this script must never produce: its whole claim is that
+    # the engine still passes with the extension loaded, and a run of zero
+    # tests supports that claim exactly as well as a run that failed. Ran
+    # nothing is a failure here, not a pass.
+    out="$("$UNITTEST" --test-dir duckdb "$suite" 2>&1)" || status=1
+    echo "$out" | tail -3
+    if echo "$out" | grep -q 'No tests ran'; then
+        echo "   ^^ matched no tests: the suite path is stale" >&2
         status=1
     fi
 done

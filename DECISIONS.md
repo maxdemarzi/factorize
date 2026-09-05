@@ -1307,3 +1307,28 @@ belongs among the instances above rather than beside them as a slip, because the
 question that catches it is the one this whole entry is about. Not *did the check
 pass* but *could this check have failed?* A pipeline that takes its exit status
 from its last stage answers no before it is ever run.
+
+**The same question asked of the other harnesses, which found two more.**
+`factorized_optimizer.test` documented the key-width cap as a sum -- *two BIGINT
+columns are 128 bits and refused, a single one is exactly 64 and still fires* --
+over a row count that is 5000 either way. A regression narrowing the cap to "no
+BIGINT anywhere" would have passed it, and that is the plausible wrong rule,
+since it is what the refusal looks like from outside; the 128-bit half had no
+query at all. Both halves are now asserted on the plan, and both new assertions
+were inverted once and watched to fail, because an assertion nobody has seen
+fail is not yet a check. The implementation turned out to be right -- the point
+is that the suite could not have told us either way.
+
+`duckdb-regression.sh` took the unittest binary's exit status, which is **0 when
+a filter matches no test**. Its default suites are DuckDB's own paths, so a
+version bump moving one of them would have turned the engine-regression run --
+the script whose entire claim is that DuckDB still passes with the extension
+loaded -- into a green run of nothing. A run of zero tests supports that claim
+exactly as well as a run that failed, so "No tests ran" is now a failure.
+
+And one that came back clean, which is worth recording at the same weight: the
+same script's `"$UNITTEST" ... | tail -3` looks exactly like the mistake I had
+just made in my own invocation, and is not one, because `set -o pipefail` at the
+top of the file means the pipeline keeps the binary's status. Verified with a
+two-line experiment rather than reasoned about, since the reasoning is what had
+just been wrong.
