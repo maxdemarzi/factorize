@@ -105,6 +105,16 @@ namespace {
 //! `if (tuple.key != cur.key) continue;` of the paper's generated code. Wider
 //! composite keys would need the values stored alongside for verification; the
 //! join rejects them rather than risking a false match.
+//!
+//! That 64-bit cap is a CORRECTNESS guarantee for the packing below, not only a
+//! limit on what is supported. An INT64 column consumes the whole word, so the
+//! cap is what makes it necessarily the only column and therefore necessarily
+//! at offset zero -- which is why the INT64 case can write the value straight
+//! in. Widen the cap without giving that case a real bit offset and every
+//! multi-column key containing an INT64 collides into one hash key: wrong
+//! counts, silently, with no throw anywhere. Adding a `<< bit` there is not the
+//! fix either, since shifting a 64-bit value by 32 discards half of it; a wider
+//! key needs the values stored for verification, as above.
 struct KeyReader {
 	struct Column {
 		uint32_t source_index;
@@ -125,7 +135,11 @@ struct KeyReader {
 				          << bit;
 				bit += 32;
 			} else {
-				packed |= static_cast<uint64_t>(input.GetInt64(record, column.payload_index));
+				// Necessarily the only column, so necessarily at offset zero:
+				// MakeKeyReader has already refused anything that would put a
+				// 64-bit column beside another. Assigned rather than or-ed to
+				// say so at the point it is relied on.
+				packed = static_cast<uint64_t>(input.GetInt64(record, column.payload_index));
 				bit += 64;
 			}
 		}
@@ -168,6 +182,9 @@ KeyReader MakeKeyReader(const MaterializePlan &plan, const Layout &input_layout,
 			throw std::runtime_error("join: key attribute " + std::to_string(key) + " not present in input");
 		}
 	}
+	// Also what keeps KeyReader::Read's packing correct: rejecting anything over
+	// 64 bits is what leaves a 64-bit column alone in the word. See the comment
+	// on KeyReader before relaxing this.
 	if (bits > 64) {
 		throw std::runtime_error("join: composite key wider than 64 bits is not supported");
 	}
