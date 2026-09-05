@@ -56,6 +56,15 @@ public:
 	vector<BoundRelation> relations;
 	//! The join graph, indexed by position in `relations`.
 	factorize::QueryGraph graph;
+	//! The plan this operator replaced, kept rather than dropped.
+	//!
+	//! Plan §7.5 asks that an internal error in the factorized path fall back to
+	//! the unmodified plan rather than surface as a failure, and a plan that has
+	//! been discarded cannot be fallen back to. So the subtree is carried here,
+	//! planned into a physical operator, and built into a pipeline that the
+	//! executor deliberately does not schedule -- it costs nothing unless the
+	//! factorized path throws, and then it is already there to run.
+	unique_ptr<LogicalOperator> fallback;
 	//! The join order, decided when the region was matched. Ordering at match
 	//! time is what lets an unorderable graph be a decline instead of a query
 	//! that fails partway through executing.

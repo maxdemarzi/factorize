@@ -1,7 +1,14 @@
 #include "factorize/physical_factorized.hpp"
+#include <atomic>
 
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parallel/event.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 
 namespace duckdb {
@@ -59,7 +66,69 @@ public:
 	//! can be more of them than fit one vector.
 	unique_ptr<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>> groups;
 	idx_t handed_out = 0;
+	//! Set once the factorized path has failed and the plan it replaced is
+	//! answering instead (§7.5). Under `lock`, because several threads can be
+	//! inside the operator when one of them throws and only one plan may run.
+	bool fell_back = false;
+	//! Scan position in the fallback's collected rows, set once it has run.
+	unique_ptr<ColumnDataScanState> fallback_scan;
+
 };
+
+//! Set while this thread is inside the fallback's own pipeline execution, so a
+//! task that re-enters GetData on the same thread can turn back rather than
+//! block on a lock that thread already holds.
+static thread_local bool fallback_running = false;
+
+//! Where the fallback plan's rows land. This operator is the sink of the
+//! pipeline it drives, the same arrangement PhysicalRecursiveCTE uses.
+class FactorizedGlobalSinkState : public GlobalSinkState {
+public:
+	FactorizedGlobalSinkState(ClientContext &context, const vector<LogicalType> &types)
+	    : collected(context, types) {
+	}
+	mutex lock;
+	ColumnDataCollection collected;
+};
+
+unique_ptr<GlobalSinkState> PhysicalFactorized::GetGlobalSinkState(ClientContext &context) const {
+	return make_uniq<FactorizedGlobalSinkState>(context, types);
+}
+
+SinkResultType PhysicalFactorized::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
+	// Only ever reached from the fallback pipeline: in the surrounding plan this
+	// operator is a source and nothing feeds it.
+	auto &gstate = input.global_state.Cast<FactorizedGlobalSinkState>();
+	lock_guard<mutex> guard(gstate.lock);
+	gstate.collected.Append(chunk);
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
+vector<const_reference<PhysicalOperator>> PhysicalFactorized::GetSources() const {
+	// Just this one. The child is the replaced plan, not an input, and reporting
+	// it as a source would put it in the surrounding pipeline and run it.
+	return {*this};
+}
+
+void PhysicalFactorized::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	op_state.reset();
+	sink_state.reset();
+	fallback_meta_pipeline.reset();
+
+	auto &state = meta_pipeline.GetState();
+	state.SetPipelineSource(current, *this);
+	if (children.empty()) {
+		return;
+	}
+	// Constructed standalone rather than through CreateChildMetaPipeline: a
+	// child meta pipeline is registered with its parent and therefore scheduled,
+	// and scheduling the plan we replaced would mean running both engines on
+	// every query. Built here, held, and executed only if asked -- the same
+	// arrangement PhysicalRecursiveCTE uses to drive its recursive side by hand.
+	auto &executor = meta_pipeline.GetExecutor();
+	fallback_meta_pipeline = make_shared_ptr<MetaPipeline>(executor, state, this);
+	fallback_meta_pipeline->Build(children[0]);
+}
 
 unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientContext &context) const {
 	// Bound to DuckDB's own memory_limit. Without this the engine allocates until
@@ -171,9 +240,160 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 	return produced == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
+//! Runs the plan this operator replaced, and hands back its rows (plan §7.5).
+//!
+//! The pipeline was built at plan time and deliberately not scheduled, so this
+//! is the first time it costs anything. Driven the way PhysicalRecursiveCTE
+//! drives its recursive side: reset the pipelines, reschedule them onto the
+//! executor, and work until the events report finished.
+SourceResultType PhysicalFactorized::EmitFallback(ExecutionContext &context, DataChunk &chunk,
+                                                  FactorizedGlobalSourceState &gstate) const {
+	// Re-entry, not contention, is the hazard here, and the two want opposite
+	// treatment. WorkOnTasks below runs arbitrary tasks from the executor's
+	// queue, and this operator is a parallel source, so one of those tasks can
+	// be another call into GetData on this operator on THIS thread -- which a
+	// held mutex would deadlock against itself. PhysicalRecursiveCTE never has
+	// to think about it: it is a serial source, so a second task for its
+	// pipeline cannot exist.
+	//
+	// So a re-entrant call is turned away before any lock is taken, while
+	// another *thread* simply waits on the lock and finds the rows ready. An
+	// earlier version turned both away with an atomic and livelocked: threads
+	// that should have waited kept returning with nothing to do while the owner
+	// span in WorkOnTasks.
+	if (fallback_running) {
+		return SourceResultType::FINISHED;
+	}
+	{
+		lock_guard<mutex> guard(gstate.lock);
+		if (!gstate.fallback_scan) {
+			// Cleared on every exit including the throwing one, or a failed
+			// fallback would leave this thread unable to try again.
+			struct Running {
+				Running() {
+					fallback_running = true;
+				}
+				~Running() {
+					fallback_running = false;
+				}
+			} running;
+			// Readied here rather than at build time, because nothing else will:
+			// Executor readies standalone meta pipelines only for recursive
+			// CTEs, by a hard-coded Cast<PhysicalRecursiveCTE> over a list this
+			// operator cannot join. An unreadied pipeline reschedules and then
+			// fails inside a worker thread, which is how this was found.
+			fallback_meta_pipeline->Ready();
+
+			vector<shared_ptr<Pipeline>> pipelines;
+			fallback_meta_pipeline->GetPipelines(pipelines, true);
+			for (auto &pipeline : pipelines) {
+				auto pipeline_sink = pipeline->GetSink();
+				if (pipeline_sink.get() != this) {
+					pipeline_sink->sink_state.reset();
+				}
+				for (auto &op_ref : pipeline->GetOperators()) {
+					op_ref.get().op_state.reset();
+				}
+				pipeline->ClearSource();
+			}
+
+			vector<shared_ptr<MetaPipeline>> meta_pipelines;
+			fallback_meta_pipeline->GetMetaPipelines(meta_pipelines, true, false);
+			auto &executor = fallback_meta_pipeline->GetExecutor();
+			vector<shared_ptr<Event>> events;
+			executor.ReschedulePipelines(meta_pipelines, events);
+			while (true) {
+				executor.WorkOnTasks();
+				if (executor.HasError()) {
+					executor.ThrowException();
+				}
+				bool finished = true;
+				for (auto &event : events) {
+					if (!event->IsFinished()) {
+						finished = false;
+						break;
+					}
+				}
+				if (finished) {
+					break;
+				}
+			}
+			// Only now: sink_state is created by Pipeline::ResetSink during the
+			// reschedule above, so this operator has none until its fallback
+			// pipeline has been readied. Reading it any earlier dereferences a
+			// null unique_ptr, which is a crash rather than a wrong answer but
+			// is still not the fallback working.
+			gstate.fallback_scan = make_uniq<ColumnDataScanState>();
+			sink_state->Cast<FactorizedGlobalSinkState>().collected.InitializeScan(*gstate.fallback_scan);
+		}
+	}
+	return ScanFallback(chunk, gstate);
+}
+
+//! Hands out the fallback's collected rows, a chunk at a time.
+SourceResultType PhysicalFactorized::ScanFallback(DataChunk &chunk, FactorizedGlobalSourceState &gstate) const {
+	lock_guard<mutex> guard(gstate.lock);
+	sink_state->Cast<FactorizedGlobalSinkState>().collected.Scan(*gstate.fallback_scan, chunk);
+	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+}
+
 SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                      OperatorSourceInput &input) const {
 	auto &gstate = input.global_state.Cast<FactorizedGlobalSourceState>();
+	bool fell_back;
+	{
+		// A thread that arrives after another has already fallen back must not
+		// start the factorized path again: the answer is coming from the plan we
+		// replaced now, and running both would double it.
+		lock_guard<mutex> guard(gstate.lock);
+		fell_back = gstate.fell_back;
+	}
+	try {
+		if (!fell_back) {
+			return Factorized(context, chunk, input, gstate);
+		}
+	} catch (const std::exception &error) {
+		ErrorData data(error);
+		// Two kinds must not be recovered from, and everything else is exactly
+		// what §7.5 means by "any internal error".
+		//
+		// FATAL leaves the database unusable, so there is nothing to fall back
+		// *to*. INTERRUPT is the user cancelling, and answering anyway by
+		// quietly running a second plan is the opposite of what they asked for.
+		//
+		// Deliberately NOT Exception::InvalidatesTransaction: it returns true by
+		// default for nearly every type, INVALID_INPUT included, so testing it
+		// here rethrows everything and the fallback never runs -- which is what
+		// the first version of this did. That predicate describes what a
+		// connection does once an error has propagated; catching it here means
+		// it has not propagated and no transaction has been marked.
+		if (children.empty() || data.Type() == ExceptionType::FATAL ||
+		    data.Type() == ExceptionType::INTERRUPT) {
+			throw;
+		}
+		lock_guard<mutex> guard(gstate.lock);
+		if (!gstate.fell_back) {
+			gstate.fell_back = true;
+			// Said out loud rather than swallowed. A query that silently takes
+			// twice as long because half of it failed is a bug report nobody
+			// can write, and the whole point of the fallback is that the answer
+			// stays right while the reason is still discoverable.
+			Printer::Print("[factorize] fell back to the stock plan: " + data.RawMessage());
+		}
+	}
+	chunk.Reset();
+	return EmitFallback(context, chunk, gstate);
+}
+
+//! The factorized path proper. Split out so the caller can catch it whole.
+SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataChunk &chunk,
+                                                OperatorSourceInput &input,
+                                                FactorizedGlobalSourceState &gstate) const {
+	Value fail;
+	if (context.client.TryGetCurrentSetting("factorize_debug_fail", fail) && !fail.IsNull() &&
+	    BooleanValue::Get(fail)) {
+		throw InvalidInputException("factorize: factorize_debug_fail is set");
+	}
 	if (!IsPlainCount()) {
 		// Everything except one ungrouped count(*) goes through the fold, which
 		// handles no grouping columns as a single group over the whole join.

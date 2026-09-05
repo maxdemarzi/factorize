@@ -988,3 +988,102 @@ was trusted -- `-c` does not interpret dot commands, so `.timer on` silently
 produced no timings; and `SET` emits its own ~0ms `Run Time` line, so taking a
 minimum reported 1.0ms for both modes on a query that takes 94ms and 3.5ms.
 Both would have fitted coefficients confidently on garbage.
+
+## D27 — `PhysicalRecursiveCTE` is not a template, and the fallback costs parallelism
+
+Plan §7.5 asks that an internal error in the factorized path fall back to the
+unmodified plan rather than surface. The plan the operator replaces was being
+dropped, so there was nothing to fall back *to*; it is now carried, planned, and
+built into a pipeline the executor is deliberately not given.
+
+It works. The scan guard of D25 -- a NULL the statistics could not see, because
+`DataTable::GetStatistics` reads committed row groups while the scan also reads
+the current transaction's -- used to fail the query. It now falls back and
+answers correctly, NULL group included.
+
+**The mechanism, and why it looked easy.** `PhysicalRecursiveCTE` builds a
+`MetaPipeline` for its recursive side that is constructed *standalone* rather
+than registered with its parent, so the executor never schedules it, and drives
+it by hand from `GetData` with `ReschedulePipelines` + `WorkOnTasks`. That is
+exactly the shape a fallback needs: free until used.
+
+**Three ways the precedent does not transfer**, each discovered by a failure far
+from its cause.
+
+1. *It is never readied.* `Executor::ScheduleEventsInternal` readies standalone
+   meta pipelines only through a hard-coded `Cast<PhysicalRecursiveCTE>` over a
+   list an extension cannot join -- `AddRecursiveCTE` takes a `PhysicalOperator&`
+   and the loop casts. An extension must call `MetaPipeline::Ready()` itself.
+   The symptom otherwise is `"Attempted to access index 1 within vector of size
+   1"` from inside a worker thread.
+2. *It never re-enters.* `WorkOnTasks` runs arbitrary queued tasks, and one can
+   be another `GetData` on this operator **on this thread**, which a held mutex
+   deadlocks against. A recursive CTE is a serial source, so a second task for
+   its pipeline cannot exist and the question never arises.
+3. *It never parks a worker.* Same reason, and this is the one that decided the
+   design. With a parallel source, several tasks arrive in `GetData` and block
+   on the state lock while the owner drives the fallback -- and a parked worker
+   is one the executor cannot use to run the pipeline the owner is waiting for.
+
+        threads=1   40 fallbacks, 40/40, 4s
+        threads=2   40/40, 4s
+        threads=4   hung after 24
+        threads=8   hung after 3
+
+   `gdb` on the hung process: six worker threads blocked on the same futex
+   inside `GetDataInternal`/`EmitFallback`, one idle in
+   `TaskScheduler::ExecuteForever`.
+
+**So the fallback and parallel counting cannot both be had**, and the trade is
+priced rather than assumed: a serial source gives up D20's slicing, measured at
+7ms against 2-4ms at eight threads on the 27M star. `factorize_fallback`
+defaults to **true**, because on that star the engine is 32x faster than stock
+and serialising leaves about 11x -- trading 32x for 11x to make failure
+impossible is a good trade, and taking it silently would not have been.
+
+**A predicate that reads like the question you are asking.**
+`Exception::InvalidatesTransaction` returns `true` by *default* for nearly every
+type, `INVALID_INPUT` included. It describes what a connection must do once an
+error has *propagated*; using it to ask whether a caught, unpropagated error is
+recoverable rethrows everything, the fallback never runs, and the test written
+to prove it passes. Only `FATAL` (nothing left to fall back to) and `INTERRUPT`
+(the user asked for it to stop) are rethrown.
+
+**Fault injection, deliberately.** `factorize_debug_fail` makes the factorized
+path throw. The only natural trigger needs a grouped query, an open transaction
+and a statistics miss at once, so without it four of the five aggregate shapes
+would have shipped with a recovery path nobody had run -- which is the failure
+this project has now catalogued eight times.
+
+**And the one lesson that is about changes rather than measurements.** The
+livelock was introduced *by a fix*. Holding a lock across `WorkOnTasks` was a
+real hazard, reasoned about correctly and never observed; replacing the lock
+with an atomic and returning early broke the case that had already been measured
+working. Of the eight, this is the only one where the fix was the defect.
+
+> **Re-run the case that already worked before believing the fix.**
+
+Every other instance was something that never ran. This was something that ran,
+and was wrong, because a hazard was reasoned about instead of reproduced. It has
+since happened a second time, in the other session: a validation added for an
+ambiguity that had been reasoned about, which broke every existing caller and
+was caught by `test_outer` aborting under the sanitizers.
+
+Both were caught by a test written for something else. A test written *for* a
+change tests that change's intent, and in both cases the defect was collateral:
+
+> **The tests worth having are the ones covering what already works, not only
+> what just changed.**
+
+That is a reason to keep old tests rather than fold them into new ones, which is
+the opposite of what a tidy suite looks like.
+
+The narrower form, from the same pair of bugs, is about the shape that invites
+them. `preserve` and `kind` could both say "this is an outer join"; my two
+candidate exception predicates could both claim to answer "is this
+recoverable". Redundancy kept consistent by discipline rather than by
+construction:
+
+> **Two fields that must agree are two fields that can disagree.**
+
+The fix in both cases was to delete the redundancy, not to reconcile it.

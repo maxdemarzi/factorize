@@ -1082,15 +1082,19 @@ statement ok
 BEGIN;
 
 # Uncommitted, so the statistics still say the column has no NULLs and the rule
-# still takes over. The scan is what notices, and it must refuse rather than
-# answer with the NULL group missing.
+# still takes over. The scan is what notices -- and since §7.5's fallback, what
+# happens next is not an error but the plan this operator replaced, run in its
+# place. The user sees the right answer, NULL group included, and the only trace
+# is a line saying the fallback happened.
 statement ok
 INSERT INTO guard_t VALUES (1, NULL);
 
-statement error
-SELECT guard_t.g, count(*) FROM guard_t, guard_u WHERE guard_t.k = guard_u.k GROUP BY guard_t.g;
+query II
+SELECT guard_t.g, count(*) FROM guard_t, guard_u WHERE guard_t.k = guard_u.k GROUP BY guard_t.g ORDER BY 1;
 ----
-contains NULL
+10	1
+20	1
+NULL	1
 
 statement ok
 ROLLBACK;
@@ -1578,6 +1582,87 @@ query I
 SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
 ----
 50000000
+
+statement ok
+SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# The fallback (plan §7.5). An internal error in the factorized path runs the
+# plan this operator replaced instead of surfacing, so a failure costs time and
+# never an answer.
+#
+# Exercised through fault injection rather than through a real failure, because
+# the only natural trigger is a NULL the statistics did not predict -- which
+# needs a grouped query and an open transaction, and would leave four of the
+# five aggregate shapes untested. An error path that cannot be reached on demand
+# is one nobody has run (D25, D26).
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE fb_h AS SELECT i AS k FROM range(200) t(i);
+
+statement ok
+CREATE TABLE fb_a AS SELECT i % 200 AS k, i AS v FROM range(2000) t(i);
+
+statement ok
+CREATE TABLE fb_b AS SELECT i % 200 AS k, i AS v FROM range(2000) t(i);
+
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+statement ok
+SET factorize_mode = 'force';
+
+statement ok
+SET factorize_debug_fail = true;
+
+# Every shape the operator can take, and each has to come back with the stock
+# plan's answer rather than an error.
+query I
+SELECT count(*) FROM fb_h, fb_a, fb_b WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
+----
+20000
+
+query I
+SELECT sum(fb_a.v) FROM fb_h, fb_a, fb_b WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
+----
+19990000
+
+query III
+SELECT count(*), sum(fb_a.v), sum(fb_b.v) FROM fb_h, fb_a, fb_b
+ WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
+----
+20000	19990000	19990000
+
+query III
+SELECT fb_h.k, count(*), sum(fb_a.v) FROM fb_h, fb_a, fb_b
+ WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k GROUP BY 1 ORDER BY 1 LIMIT 3;
+----
+0	100	90000
+1	100	90100
+2	100	90200
+
+# The plan still says FACTORIZED: the operator is there, it tried, and it fell
+# back at run time. A fallback that changed the plan would be a different
+# feature -- this one cannot, because the failure is only discoverable by
+# running.
+query II
+EXPLAIN SELECT count(*) FROM fb_h, fb_a, fb_b WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_debug_fail = false;
+
+# And with the injection off, the same queries take the factorized path again --
+# so the tests above are exercising the fallback rather than a disabled rule.
+query I
+SELECT count(*) FROM fb_h, fb_a, fb_b WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
+----
+20000
+
+statement ok
+RESET disabled_optimizers;
 
 statement ok
 SET factorize_mode = 'off';

@@ -39,8 +39,13 @@ vector<ColumnBinding> LogicalFactorized::GetColumnBindings() {
 }
 
 void LogicalFactorized::ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) {
-	// The factorized region consumes its children's bindings entirely and exposes
-	// only its own, so the resolver must not descend into them.
+	// The fallback is a whole plan of its own and has to be resolved as one, or
+	// it would be unrunnable on the day it is needed -- which is the day nothing
+	// else is working either. Its bindings are then discarded rather than
+	// returned: the factorized region exposes only its own.
+	if (fallback) {
+		res.VisitOperator(*fallback);
+	}
 	bindings = GetColumnBindings();
 }
 
@@ -91,6 +96,11 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	// `relations` itself rather than being fed by them.
 	auto &physical = planner.Make<PhysicalFactorized>(types, relations, graph, plan, estimated_cardinality);
 	auto &factorized = physical.Cast<PhysicalFactorized>();
+	if (fallback) {
+		// Planned, but PhysicalFactorized::BuildPipelines keeps it out of the
+		// executor's schedule, so nothing here runs unless it is asked to.
+		factorized.children.push_back(planner.CreatePlan(*fallback));
+	}
 	factorized.grouped = grouped;
 	factorized.group_types = group_types;
 	factorized.group_keys = group_keys;

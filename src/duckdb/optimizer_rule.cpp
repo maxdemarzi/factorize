@@ -47,10 +47,10 @@ FactorizeMode GetFactorizeMode(ClientContext &context) {
 	return FactorizeMode::OFF;
 }
 
-static bool BooleanSetting(ClientContext &context, const char *name) {
+static bool BooleanSetting(ClientContext &context, const char *name, bool missing = false) {
 	Value v;
 	if (!context.TryGetCurrentSetting(name, v) || v.IsNull()) {
-		return false;
+		return missing;
 	}
 	return BooleanValue::Get(v);
 }
@@ -950,6 +950,21 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					}
 					replacement->estimated_cardinality = 1;
 					replacement->ResolveOperatorTypes();
+					// The plan being replaced is carried, not dropped: §7.5 wants
+					// an internal error to fall back to it rather than surface,
+					// and it cannot be recovered later -- this is the only moment
+					// it exists.
+					//
+					// Optional, because carrying it costs parallelism rather than
+					// nothing: an operator that may have to drive the fallback's
+					// pipeline cannot be a parallel source (see ParallelSource),
+					// which gives up D20's slicing. Correctness by default,
+					// since a failed query is worse than a slower one -- but the
+					// trade is a setting rather than a decision taken silently on
+					// the user's behalf.
+					if (BooleanSetting(context, "factorize_fallback", true)) {
+						replacement->fallback = std::move(op);
+					}
 					op = std::move(replacement);
 					return;
 				}
@@ -1010,6 +1025,20 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          LogicalType::DOUBLE, Value::DOUBLE(10.0));
 	config.AddExtensionOption("factorize_explain",
 	                          "Print, per aggregate, whether the factorize rule took the plan over and why not",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	// Fault injection, and it earns its place rather than being a convenience.
+	// The fallback of plan §7.5 is an error path, and an error path that cannot
+	// be reached on demand cannot be tested -- which is how a scan guard shipped
+	// in this project having never once fired (DECISIONS D25, D26). The only
+	// natural trigger is a NULL the statistics did not predict, which needs a
+	// grouped query and an open transaction, so without this the fallback would
+	// be exercised for exactly one shape out of five.
+	config.AddExtensionOption("factorize_fallback",
+	                          "Run the replaced plan when the factorized path fails, instead of failing the query; "
+	                          "costs the parallelism of the factorized count (plan section 7.5)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("factorize_debug_fail",
+	                          "Make the factorized path throw, to exercise the fallback to the stock plan",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("factorize_debug_print_plan",
 	                          "Print the post-optimizer logical plan seen by the factorize rule", LogicalType::BOOLEAN,
