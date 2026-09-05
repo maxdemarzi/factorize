@@ -824,36 +824,49 @@ struct GroupSite {
 //! asked for -- not the size of the join.
 class GroupFold {
 public:
-	//! What a set of tuples contributes: how many there are, and what they sum
-	//! to. Both folds are carried together because the sum needs the count.
+	//! What a set of tuples contributes: how many there are, and what each
+	//! summed column sums to over them. The counts and the sums are carried
+	//! together because every sum needs the count.
 	//!
 	//! Independent sets combine by the semiring product, not by multiplying
 	//! twice: (c1,s1) x (c2,s2) = (c1*c2, s1*c2 + c1*s2). Each side's values
 	//! appear once per tuple of the other, which is why a sum cannot be carried
 	//! as a scalar weight -- propagating only the counts loses every value in
 	//! every branch but the last.
+	//!
+	//! Several sums ride along in one walk. The product above is per column and
+	//! the columns do not interact, so `sums[i]` needs no more than the shared
+	//! counts to be exact. A fixed array rather than a vector: one of these is
+	//! made per record visited, and an allocation there would cost more than the
+	//! fold it belongs to.
 	struct Fold {
 		int64_t count = 1;
-		int64_t sum = 0;
+		int64_t sums[kMaxAggregates] = {};
 	};
 
-	static Fold Combine(const Fold &a, const Fold &b) {
+	Fold Combine(const Fold &a, const Fold &b) const {
 		Fold result;
 		result.count = CheckedCardinalityMul(a.count, b.count);
-		result.sum = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum, b.count), CheckedCardinalityMul(a.count, b.sum));
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			result.sums[i] = CheckedCardinalityAdd(CheckedCardinalityMul(a.sums[i], b.count),
+			                                       CheckedCardinalityMul(a.count, b.sums[i]));
+		}
 		return result;
 	}
 
-	static Fold Alternatives(const Fold &a, const Fold &b) {
+	Fold Alternatives(const Fold &a, const Fold &b) const {
 		Fold result;
 		result.count = CheckedCardinalityAdd(a.count, b.count);
-		result.sum = CheckedCardinalityAdd(a.sum, b.sum);
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			result.sums[i] = CheckedCardinalityAdd(a.sums[i], b.sums[i]);
+		}
 		return result;
 	}
 
-	GroupFold(const FRepresentation &rep, std::vector<GroupSite> sites, size_t width, Aggregate aggregate,
-	          AttributeId sum_attribute)
-	    : rep(rep), sites(std::move(sites)), width(width), aggregate(aggregate), sum_attribute(sum_attribute) {
+	GroupFold(const FRepresentation &rep, std::vector<GroupSite> sites, size_t width,
+	          std::vector<GroupAggregate> aggregates, std::vector<AttributeId> sum_attributes)
+	    : rep(rep), sites(std::move(sites)), width(width), aggregates(std::move(aggregates)),
+	      sum_attributes(std::move(sum_attributes)) {
 		// Which levels have a key at or below them, so a slot leading nowhere
 		// useful can be collapsed into a multiplier instead of walked.
 		const auto &layout = rep.GetLayout();
@@ -887,7 +900,11 @@ private:
 		rep.ForEachChild(record, slot_index, [&](Record child) {
 			Fold child_fold;
 			child_fold.count = rep.SubtreeSize(child);
-			child_fold.sum = aggregate == Aggregate::SUM ? rep.SubtreeSum(child, sum_attribute) : 0;
+			for (size_t i = 0; i < aggregates.size(); i++) {
+				if (aggregates[i].kind == Aggregate::SUM) {
+					child_fold.sums[i] = rep.SubtreeSum(child, sum_attributes[i]);
+				}
+			}
 			total = Alternatives(total, child_fold);
 		});
 		return total;
@@ -897,14 +914,16 @@ private:
 	//! so far, carrying its own value if the summed column lives here.
 	Fold Own(Record record) const {
 		Fold fold;
-		if (aggregate != Aggregate::SUM) {
-			return fold;
-		}
 		const auto &level = rep.GetLayout().Level(record.Level());
-		for (const auto &entry : level.payload) {
-			if (entry.attribute == sum_attribute) {
-				fold.sum = rep.GetValue(record, sum_attribute);
-				break;
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			if (aggregates[i].kind != Aggregate::SUM) {
+				continue;
+			}
+			for (const auto &entry : level.payload) {
+				if (entry.attribute == sum_attributes[i]) {
+					fold.sums[i] = rep.GetValue(record, sum_attributes[i]);
+					break;
+				}
 			}
 		}
 		return fold;
@@ -947,7 +966,9 @@ private:
 			// add a tuple to every group that nothing counted.
 			auto found = out.find(row);
 			if (found == out.end()) {
-				found = out.emplace(row, Fold {0, 0}).first;
+				Fold empty;
+				empty.count = 0;
+				found = out.emplace(row, empty).first;
 			}
 			found->second = Alternatives(found->second, here);
 			return;
@@ -988,27 +1009,34 @@ private:
 	const FRepresentation &rep;
 	std::vector<GroupSite> sites;
 	size_t width;
-	Aggregate aggregate;
-	AttributeId sum_attribute;
+	std::vector<GroupAggregate> aggregates;
+	//! Parallel to `aggregates`; meaningful only where the kind is SUM.
+	std::vector<AttributeId> sum_attributes;
 	std::vector<bool> carries;
 };
 
 GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                         const std::vector<GroupKey> &keys, Aggregate aggregate, size_t sum_relation,
-                         size_t sum_column, PathStrategy strategy) {
+                         const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
+                         PathStrategy strategy) {
 	GroupCountResult result;
 	if (!plan.complete) {
 		result.error = plan.reason.empty() ? "no plan" : plan.reason;
 		return result;
 	}
-	if (keys.empty()) {
-		result.error = "no grouping column";
+	if (aggregates.empty()) {
+		result.error = "no aggregate to compute";
 		return result;
 	}
-	if (aggregate == Aggregate::SUM &&
-	    (sum_relation >= graph.RelationCount() || sum_column >= graph.column_counts[sum_relation])) {
-		result.error = "summed column is not a column of the query";
+	if (aggregates.size() > kMaxAggregates) {
+		result.error = "more than " + std::to_string(kMaxAggregates) + " aggregates in one query";
 		return result;
+	}
+	for (const auto &aggregate : aggregates) {
+		if (aggregate.kind == Aggregate::SUM && (aggregate.relation >= graph.RelationCount() ||
+		                                         aggregate.column >= graph.column_counts[aggregate.relation])) {
+			result.error = "summed column is not a column of the query";
+			return result;
+		}
 	}
 	for (const auto &key : keys) {
 		if (key.relation >= graph.RelationCount() || key.column >= graph.column_counts[key.relation]) {
@@ -1049,9 +1077,13 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 			}
 		}
 
-		const auto sum_attribute =
-		    aggregate == Aggregate::SUM ? AttributeOf(graph, sum_relation, sum_column) : AttributeId(0);
-		GroupFold fold(accumulated.Rep(), std::move(sites), keys.size(), aggregate, sum_attribute);
+		std::vector<AttributeId> sum_attributes(aggregates.size(), AttributeId(0));
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			if (aggregates[i].kind == Aggregate::SUM) {
+				sum_attributes[i] = AttributeOf(graph, aggregates[i].relation, aggregates[i].column);
+			}
+		}
+		GroupFold fold(accumulated.Rep(), std::move(sites), keys.size(), aggregates, std::move(sum_attributes));
 		std::map<std::vector<int64_t>, GroupFold::Fold> totals;
 		fold.Run(totals);
 
@@ -1059,10 +1091,15 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 			// A combination no tuple satisfies is not a group. Emptiness is
 			// judged by the count even when the answer is a sum, or a group
 			// whose values happen to total zero would vanish.
-			if (entry.second.count > 0) {
-				result.groups.emplace_back(entry.first,
-				                           aggregate == Aggregate::SUM ? entry.second.sum : entry.second.count);
+			if (entry.second.count <= 0) {
+				continue;
 			}
+			std::vector<int64_t> values;
+			values.reserve(aggregates.size());
+			for (size_t i = 0; i < aggregates.size(); i++) {
+				values.push_back(aggregates[i].kind == Aggregate::SUM ? entry.second.sums[i] : entry.second.count);
+			}
+			result.groups.emplace_back(entry.first, std::move(values));
 		}
 		result.records = accumulated.Rep().RecordCount();
 		result.bytes = accumulated.Rep().BytesAllocated();
@@ -1078,16 +1115,24 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 
 } // namespace
 
+GroupCountResult ExecuteGroupBy(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                               const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
+                               PathStrategy strategy) {
+	return GroupBy(graph, plan, source, mode, keys, aggregates, strategy);
+}
+
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                    const std::vector<GroupKey> &keys, PathStrategy strategy) {
-	return GroupBy(graph, plan, source, mode, keys, Aggregate::COUNT, 0, 0, strategy);
+	return GroupBy(graph, plan, source, mode, keys, {GroupAggregate {Aggregate::COUNT, 0, 0}}, strategy);
 }
 
 GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                  const std::vector<GroupKey> &keys, size_t sum_relation, size_t sum_column,
                                  PathStrategy strategy) {
-	return GroupBy(graph, plan, source, mode, keys, Aggregate::SUM, sum_relation, sum_column, strategy);
+	return GroupBy(graph, plan, source, mode, keys, {GroupAggregate {Aggregate::SUM, sum_relation, sum_column}},
+	               strategy);
 }
+
 ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                             PathStrategy strategy) {
 	// Enough buckets that finding a witness early is worth something, few enough

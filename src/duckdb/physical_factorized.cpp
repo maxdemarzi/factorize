@@ -49,9 +49,6 @@ public:
 	//! beside the cost of counting one.
 	mutex lock;
 	int64_t total = 0;
-	//! How many tuples went into `total`, for a sum. SQL's sum over no rows is
-	//! NULL and not zero, and a total of zero cannot tell those apart.
-	int64_t tuples = 0;
 	idx_t completed = 0;
 	string error;
 	//! The inputs, read once and shared. Built lazily under `lock` by whichever
@@ -60,7 +57,7 @@ public:
 	unique_ptr<SharedRelations> inputs;
 	//! For a grouped query: the groups, and how many have been handed out. There
 	//! can be more of them than fit one vector.
-	unique_ptr<std::vector<std::pair<std::vector<int64_t>, int64_t>>> groups;
+	unique_ptr<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>> groups;
 	idx_t handed_out = 0;
 };
 
@@ -84,20 +81,20 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	if (slices < 1) {
 		slices = 1;
 	}
-	if (grouped) {
-		// Grouping runs on one thread. Partitioning by the join key would put
-		// each group wholly inside one bucket *only* when the partitioned key is
-		// the grouping key, and ChooseSliceColumns picks whichever key reaches
-		// the most relations. Merging partial groups across buckets is the
-		// correct general answer and is not written; one thread is.
-		slices = 1;
-	}
-	if (aggregate == factorize::Aggregate::SUM) {
-		// So does summing, and for a sharper reason: ExecuteSum takes the whole
-		// source, not a bucket of it. Left parallel, every thread would sum the
-		// entire join and the totals would be added together -- an answer N
-		// times too large, on N threads, silently. Slicing the sum is the same
-		// partition argument as for counting and is simply not written yet.
+	if (!IsPlainCount()) {
+		// Everything but a single ungrouped count(*) runs on one thread.
+		//
+		// Grouping, because partitioning by the join key puts each group wholly
+		// inside one bucket *only* when the partitioned key is the grouping key,
+		// and ChooseSliceColumns picks whichever key reaches the most relations.
+		// Merging partial groups across buckets is the correct general answer
+		// and is not written; one thread is.
+		//
+		// Summing, for a sharper reason: the fold takes the whole source, not a
+		// bucket of it. Left parallel, every thread would fold the entire join
+		// and the totals would be added -- an answer N times too large, on N
+		// threads, silently. Slicing it is the same partition argument as for
+		// counting and is simply not written yet.
 		slices = 1;
 	}
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / slices));
@@ -124,21 +121,36 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		if (!gstate.groups) {
 			factorize::SetGlobalMemoryLimit(gstate.memory_per_slice);
 			SharedRelations source(client, relations);
-			auto result = aggregate == factorize::Aggregate::SUM
-			                  ? factorize::ExecuteGroupSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-			                                               group_keys, sum_relation, sum_column)
-			                  : factorize::ExecuteGroupCount(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-			                                                 group_keys);
+			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+			                                        group_keys, aggregates);
 			if (!result.ok) {
 				throw InvalidInputException("factorize: %s", result.error);
 			}
-			gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, int64_t>>>(std::move(result.groups));
+			gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
 		}
 	}
 
 	auto &groups = *gstate.groups;
 	idx_t produced = 0;
 	lock_guard<mutex> guard(gstate.lock);
+	if (!grouped && groups.empty() && gstate.handed_out == 0) {
+		// An ungrouped aggregate answers one row even over no rows at all:
+		// count(*) is 0 and every sum is NULL. The fold produces no groups for
+		// an empty join -- a group is a combination some tuple satisfies -- so
+		// this row is made rather than found.
+		//
+		// It is also how an all-NULL sum comes out right. Rows holding a NULL in
+		// the summed column are dropped, so if they were all there was, the join
+		// is empty here and the answer is NULL, which is what SQL says.
+		for (idx_t i = 0; i < aggregates.size(); i++) {
+			chunk.SetValue(i, 0,
+			               aggregates[i].kind == factorize::Aggregate::SUM ? Value(aggregate_types[i])
+			                                                              : Value::BIGINT(0));
+		}
+		chunk.SetCardinality(1);
+		gstate.handed_out = 1;
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
 	while (gstate.handed_out < groups.size() && produced < STANDARD_VECTOR_SIZE) {
 		const auto &group = groups[gstate.handed_out];
 		// Each key goes back out in the type the aggregate gave it, not the
@@ -146,9 +158,12 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		for (idx_t key = 0; key < group_types.size(); key++) {
 			chunk.SetValue(key, produced, Value::Numeric(group_types[key], group.first[key]));
 		}
-		chunk.SetValue(group_types.size(), produced,
-		               aggregate == factorize::Aggregate::SUM ? FoldedValue(group.second, sum_type)
-		                                                      : Value::BIGINT(group.second));
+		for (idx_t i = 0; i < aggregates.size(); i++) {
+			chunk.SetValue(group_types.size() + i, produced,
+			               aggregates[i].kind == factorize::Aggregate::SUM
+			                   ? FoldedValue(group.second[i], aggregate_types[i])
+			                   : Value::BIGINT(group.second[i]));
+		}
 		gstate.handed_out++;
 		produced++;
 	}
@@ -159,7 +174,9 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                      OperatorSourceInput &input) const {
 	auto &gstate = input.global_state.Cast<FactorizedGlobalSourceState>();
-	if (grouped) {
+	if (!IsPlainCount()) {
+		// Everything except one ungrouped count(*) goes through the fold, which
+		// handles no grouping columns as a single group over the whole join.
 		return EmitGroups(context, chunk, gstate);
 	}
 	const idx_t slice = gstate.next_slice.fetch_add(1);
@@ -192,14 +209,9 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 	// Within memory, not merely up to it: a bucket that does not fit is
 	// subdivided rather than abandoned. The rule replaced a plan DuckDB could
 	// have run, so failing here would turn a slow query into no query at all.
-	// Summing partitions the same way counting does -- the buckets are disjoint
-	// sets of tuples, so their sums add -- but it cannot use the sliced count
-	// path, which fuses the last join and never builds the values.
-	const auto result =
-	    aggregate == factorize::Aggregate::SUM
-	        ? factorize::ExecuteSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, sum_relation, sum_column)
-	        : factorize::ExecuteCountSliceWithinMemory(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, slice,
-	                                                  gstate.slices);
+	const auto result = factorize::ExecuteCountSliceWithinMemory(graph, plan, source,
+	                                                             factorize::JoinMode::BOTTOM_INSERT, slice,
+	                                                             gstate.slices);
 
 	idx_t completed;
 	{
@@ -210,7 +222,6 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 			}
 		} else if (gstate.error.empty()) {
 			gstate.total = factorize::CheckedCardinalityAdd(gstate.total, result.count);
-			gstate.tuples = factorize::CheckedCardinalityAdd(gstate.tuples, result.tuples);
 		}
 		completed = ++gstate.completed;
 	}
@@ -225,16 +236,7 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 			throw InvalidInputException("factorize: %s", gstate.error);
 		}
 		chunk.SetCardinality(1);
-		if (aggregate == factorize::Aggregate::SUM) {
-			// Nothing summed is NULL, not zero. The fold has no way to say so --
-			// an empty join and a join of zeroes both total zero -- so the tuple
-			// count decides it. Rows dropped for a NULL value are the same case:
-			// they contribute nothing, and if they were all there was, SQL's
-			// answer is NULL.
-			chunk.SetValue(0, 0, gstate.tuples == 0 ? Value(sum_type) : FoldedValue(gstate.total, sum_type));
-		} else {
-			chunk.SetValue(0, 0, Value::BIGINT(gstate.total));
-		}
+		chunk.SetValue(0, 0, Value::BIGINT(gstate.total));
 	}
 	// Not FINISHED: that would tell DuckDB this thread is done with the operator
 	// entirely, and with fewer threads scheduled than there are buckets the rest

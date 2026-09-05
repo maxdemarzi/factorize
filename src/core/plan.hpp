@@ -223,9 +223,10 @@ struct GroupCountResult {
 	bool ok = false;
 	std::string error;
 	bool out_of_memory = false;
-	//! One entry per distinct combination of the grouping columns: the values,
-	//! in the order the caller listed them, and the aggregate over that group.
-	std::vector<std::pair<std::vector<int64_t>, int64_t>> groups;
+	//! One entry per distinct combination of the grouping columns: the key
+	//! values, in the order the caller listed them, then one value per
+	//! aggregate, in the order the caller listed those.
+	std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>> groups;
 	size_t records = 0;
 	size_t bytes = 0;
 };
@@ -235,6 +236,24 @@ struct GroupKey {
 	size_t relation = 0;
 	size_t column = 0;
 };
+
+//! One aggregate the caller wants computed per group.
+struct GroupAggregate {
+	Aggregate kind = Aggregate::COUNT;
+	//! Which column carries the values, when the kind is SUM.
+	size_t relation = 0;
+	size_t column = 0;
+};
+
+//! How many aggregates one query may ask for.
+//!
+//! They are folded together in a single walk, so each one costs a slot in every
+//! partial result the walk carries. A fixed bound keeps that a plain array
+//! rather than an allocation per combine -- the walk creates one of these per
+//! record it visits, and a vector there would dominate the fold it is part of.
+//! Eight is past anything TPC-DS asks for; more is a decline, not a wrong
+//! answer.
+constexpr size_t kMaxAggregates = 8;
 
 //! `SELECT g..., count(*) ... GROUP BY g...`, without materializing the join.
 //!
@@ -250,6 +269,14 @@ struct GroupKey {
 //! are grouped per branch and combined by the cross product of the branches.
 //! Sibling independence is the property the representation is built on, so the
 //! combination is exact rather than an approximation of one.
+//! Several aggregates cost one walk between them, not one walk each: they are
+//! folded side by side, because they are folds over the same tuples and differ
+//! only in what each carries. `keys` may be empty, which asks for the whole
+//! join as a single group -- the ungrouped answer, in the grouped machinery.
+GroupCountResult ExecuteGroupBy(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
+                                PathStrategy strategy = PathStrategy::LEVELWISE);
+
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                    const std::vector<GroupKey> &keys,
                                    PathStrategy strategy = PathStrategy::LEVELWISE);

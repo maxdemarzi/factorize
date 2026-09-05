@@ -39,11 +39,15 @@ public:
 	//! One per key, in the aggregate's order, which is the answer's order.
 	vector<LogicalType> group_types;
 	vector<factorize::GroupKey> group_keys;
-	//! Which fold to run, and for sum, which column and result type.
-	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
-	size_t sum_relation = 0;
-	size_t sum_column = 0;
-	LogicalType sum_type = LogicalType::HUGEINT;
+	//! One per aggregate, in the query's order, folded side by side in a single
+	//! walk, with the type each has to come back as.
+	vector<factorize::GroupAggregate> aggregates;
+	vector<LogicalType> aggregate_types;
+	//! True when the whole answer is one count(*) over the whole join, which is
+	//! the only shape with a fused, sliced, parallel path behind it.
+	bool IsPlainCount() const {
+		return !grouped && aggregates.size() == 1 && aggregates[0].kind == factorize::Aggregate::COUNT;
+	}
 
 public:
 	string GetName() const override;

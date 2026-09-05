@@ -1310,3 +1310,165 @@ SELECT sum(s_arm.v * 2) FROM s_hub, s_arm WHERE s_hub.k = s_arm.k;
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# Several aggregates at once. They are folds over the same tuples and differ
+# only in what each carries, so they ride in one walk of the representation
+# rather than one walk each -- and the semiring product is per column, so no
+# aggregate's arithmetic is touched by another's.
+#
+# Measured against TPC-DS this was the largest remaining restriction: 36 of 99
+# queries were declined for it alone, once multi-column grouping stopped hiding
+# them behind an earlier refusal.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+statement ok
+SET factorize_mode = 'off';
+
+# count(*) and a sum together, ungrouped. The ungrouped answer now comes from
+# the same fold, with no grouping columns meaning one group over the whole join.
+query II
+SELECT count(*), sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
+----
+4	900
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT count(*), sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
+----
+4	900
+
+query II
+EXPLAIN SELECT count(*), sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Two sums over columns in *different* branches, which is where sharing the walk
+# would break if it were wrong: each is weighted by how many tuples the other
+# branches make, and those weights differ per aggregate.
+statement ok
+SET factorize_mode = 'off';
+
+query III
+SELECT count(*), sum(x_arm1.p), sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
+----
+4	900	31
+
+statement ok
+SET factorize_mode = 'force';
+
+query III
+SELECT count(*), sum(x_arm1.p), sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
+----
+4	900	31
+
+# The same three, grouped -- so the keys and the aggregates are both plural.
+statement ok
+SET factorize_mode = 'off';
+
+query IIII
+SELECT x_hub.k, count(*), sum(x_arm1.p), sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1 ORDER BY 1;
+----
+1	2	300	14
+2	2	600	17
+
+statement ok
+SET factorize_mode = 'force';
+
+query IIII
+SELECT x_hub.k, count(*), sum(x_arm1.p), sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1 ORDER BY 1;
+----
+1	2	300	14
+2	2	600	17
+
+query II
+EXPLAIN SELECT x_hub.k, count(*), sum(x_arm1.p), sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Each aggregate asked for on its own has to agree with it asked for in company,
+# or sharing the walk changed an answer.
+query I
+SELECT sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2 WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
+----
+31
+
+# An ungrouped aggregate answers one row over an empty join: count(*) is 0 and
+# every sum is NULL. The fold finds no groups there, so that row is made rather
+# than found -- and the ranges overlap so DuckDB cannot prove the join empty and
+# plant an EMPTY_RESULT, which would decline and test nothing.
+statement ok
+SET factorize_mode = 'off';
+
+query II
+SELECT count(*), sum(n_m.v) FROM n_m, n_n WHERE n_m.k = n_n.k;
+----
+0	NULL
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT count(*), sum(n_m.v) FROM n_m, n_n WHERE n_m.k = n_n.k;
+----
+0	NULL
+
+# Past the fixed width of the fold's carrier it declines rather than allocating
+# per record. Nine columns, because DuckDB deduplicates identical aggregate
+# expressions -- nine sums over five distinct columns is five aggregates, and a
+# test written that way passes while proving nothing.
+statement ok
+CREATE TABLE w_wide AS SELECT * FROM
+ (VALUES (1,1,2,3,4,5,6,7,8,9), (2,10,20,30,40,50,60,70,80,90)) t(k,c1,c2,c3,c4,c5,c6,c7,c8,c9);
+
+# Eight is the width, and eight is taken.
+query II
+EXPLAIN SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4),
+               sum(w_wide.c5), sum(w_wide.c6), sum(w_wide.c7), sum(w_wide.c8)
+          FROM x_hub, w_wide WHERE x_hub.k = w_wide.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query IIIIIIII
+SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4),
+       sum(w_wide.c5), sum(w_wide.c6), sum(w_wide.c7), sum(w_wide.c8)
+  FROM x_hub, w_wide WHERE x_hub.k = w_wide.k;
+----
+11	22	33	44	55	66	77	88
+
+# Nine is one too many, and the stock plan answers it. Asserted by what the plan
+# *is* rather than by what it is not: the regex engine here has no negative
+# lookahead, and a pattern that silently fails to match nothing is worse than no
+# assertion at all.
+query II
+EXPLAIN SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4), sum(w_wide.c5),
+               sum(w_wide.c6), sum(w_wide.c7), sum(w_wide.c8), sum(w_wide.c9)
+          FROM x_hub, w_wide WHERE x_hub.k = w_wide.k;
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query IIIIIIIII
+SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4), sum(w_wide.c5),
+       sum(w_wide.c6), sum(w_wide.c7), sum(w_wide.c8), sum(w_wide.c9)
+  FROM x_hub, w_wide WHERE x_hub.k = w_wide.k;
+----
+11	22	33	44	55	66	77	88	99
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+SET factorize_mode = 'off';

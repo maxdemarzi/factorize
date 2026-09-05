@@ -19,9 +19,10 @@ void LogicalFactorized::ResolveTypes() {
 	// The group key keeps the type the aggregate gave it rather than the int64
 	// the engine works in: operators above were bound against that type, and
 	// handing them a wider one is a plan that type-checks and then misbehaves.
-	const auto answer = aggregate == factorize::Aggregate::SUM ? sum_type : LogicalType::BIGINT;
 	types = group_types;
-	types.push_back(answer);
+	for (const auto &type : aggregate_types) {
+		types.push_back(type);
+	}
 }
 
 vector<ColumnBinding> LogicalFactorized::GetColumnBindings() {
@@ -31,7 +32,9 @@ vector<ColumnBinding> LogicalFactorized::GetColumnBindings() {
 	for (idx_t i = 0; i < group_types.size(); i++) {
 		bindings.emplace_back(group_index, i);
 	}
-	bindings.emplace_back(table_index, 0);
+	for (idx_t i = 0; i < aggregate_types.size(); i++) {
+		bindings.emplace_back(table_index, i);
+	}
 	return bindings;
 }
 
@@ -65,10 +68,15 @@ InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 		}
 		result["Group"] = keys;
 	}
-	result["Aggregate"] = aggregate == factorize::Aggregate::SUM
-	                          ? "sum(" + relations[sum_relation].alias + "." +
-	                                relations[sum_relation].column_names[sum_column] + ")"
-	                          : "count(*)";
+	string folds;
+	for (const auto &entry : aggregates) {
+		folds += (folds.empty() ? "" : ", ");
+		folds += entry.kind == factorize::Aggregate::SUM
+		             ? "sum(" + relations[entry.relation].alias + "." +
+		                   relations[entry.relation].column_names[entry.column] + ")"
+		             : "count(*)";
+	}
+	result["Aggregate"] = folds;
 	return result;
 }
 
@@ -86,10 +94,8 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	factorized.grouped = grouped;
 	factorized.group_types = group_types;
 	factorized.group_keys = group_keys;
-	factorized.aggregate = aggregate;
-	factorized.sum_relation = sum_relation;
-	factorized.sum_column = sum_column;
-	factorized.sum_type = sum_type;
+	factorized.aggregates = aggregates;
+	factorized.aggregate_types = aggregate_types;
 	return physical;
 }
 

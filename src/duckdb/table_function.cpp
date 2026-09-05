@@ -202,7 +202,7 @@ struct FactorizedCountGlobalState : public GlobalTableFunctionState {
 	bool emitted = false;
 	//! Grouping produces a row per distinct value, which can outrun one vector,
 	//! so the groups are computed once and handed out across calls.
-	unique_ptr<std::vector<std::pair<std::vector<int64_t>, int64_t>>> groups;
+	unique_ptr<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>> groups;
 	idx_t offset = 0;
 };
 
@@ -384,7 +384,7 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 		if (!result.ok) {
 			throw InvalidInputException("factorized_group_count: %s", result.error);
 		}
-		state.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, int64_t>>>(std::move(result.groups));
+		state.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
 	}
 
 	// Groups can outnumber a vector, so this one hands them out a chunk at a
@@ -396,7 +396,7 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 		for (idx_t key = 0; key < group.first.size(); key++) {
 			output.SetValue(key, produced, Value::BIGINT(group.first[key]));
 		}
-		output.SetValue(group.first.size(), produced, Value::BIGINT(group.second));
+		output.SetValue(group.first.size(), produced, Value::BIGINT(group.second[0]));
 		state.offset++;
 		produced++;
 	}

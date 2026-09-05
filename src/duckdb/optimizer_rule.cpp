@@ -71,6 +71,15 @@ static bool ExplainRequested(ClientContext &context) {
 //===--------------------------------------------------------------------===//
 
 //! The set of relations and equality edges the factorized region will execute.
+//! One aggregate of the region: which fold, and for a sum, which column and
+//! what type the answer has to come back as. DuckDB widens sum to HUGEINT even
+//! over narrow integers, and the operators above were bound against that.
+struct RegionAggregate {
+	factorize::Aggregate kind = factorize::Aggregate::COUNT;
+	ColumnBinding sum_binding;
+	LogicalType type;
+};
+
 struct FactorizedRegion {
 	//! Why this subtree was turned down, for factorize_explain.
 	//!
@@ -102,10 +111,9 @@ struct FactorizedRegion {
 	idx_t group_index = 0;
 	vector<ColumnBinding> group_bindings;
 	vector<LogicalType> group_types;
-	//! Which fold the aggregate asks for, and for sum, which column.
-	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
-	ColumnBinding sum_binding;
-	LogicalType sum_type;
+	//! One per aggregate the query computes, in its own order, which is the
+	//! order the answer's columns come back in.
+	vector<RegionAggregate> aggregates;
 };
 
 //! Records why a subtree was turned down and declines it. Always returns false,
@@ -273,34 +281,48 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			region.group_types.push_back(group->return_type);
 		}
 	}
-	if (aggr.expressions.size() != 1) {
-		return Decline(region, "aggregate computes more than one value");
+	if (aggr.expressions.empty()) {
+		return Decline(region, "aggregate computes nothing");
 	}
-	auto &expr = *aggr.expressions[0];
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
-		return Decline(region, "aggregate expression is not an aggregate");
+	if (aggr.expressions.size() > factorize::kMaxAggregates) {
+		return Decline(region, "aggregate computes more than " + std::to_string(factorize::kMaxAggregates) +
+		                           " values");
 	}
 	region.aggregate_index = aggr.aggregate_index;
-	auto &bound = expr.Cast<BoundAggregateExpression>();
-	if (bound.IsDistinct() || bound.filter || bound.order_bys) {
-		return Decline(region, "aggregate is DISTINCT, FILTERed or ORDERed");
-	}
-	auto name = StringUtil::Lower(bound.function.name);
-	if (name == "sum") {
-		// Summing is the semiring generalisation the plan always had as the
-		// widening step (§4.5), and on TPC-DS it is the aggregate that actually
-		// appears: 193 occurrences over inner-only join graphs against 24 for
-		// count(*). The column has to be a plain column of the region, since it
-		// is folded through the representation rather than evaluated.
-		if (bound.children.size() != 1 ||
-		    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			return Decline(region, "sum() of a computed expression");
+	// Several aggregates are folded side by side in one walk of the
+	// representation, because they are folds over the same tuples and differ
+	// only in what each carries. This used to stop at one, and measured against
+	// TPC-DS it was the largest remaining restriction by some way: 36 of 99
+	// queries were declined for it alone, once multi-column grouping stopped
+	// hiding them behind an earlier refusal.
+	for (auto &expression : aggr.expressions) {
+		if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			return Decline(region, "aggregate expression is not an aggregate");
 		}
-		region.aggregate = factorize::Aggregate::SUM;
-		region.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
-		region.sum_type = expr.return_type;
-	} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
-		return Decline(region, "aggregate is " + name + "(), not count(*) or sum()");
+		auto &bound = expression->Cast<BoundAggregateExpression>();
+		if (bound.IsDistinct() || bound.filter || bound.order_bys) {
+			return Decline(region, "aggregate is DISTINCT, FILTERed or ORDERed");
+		}
+		RegionAggregate entry;
+		entry.type = expression->return_type;
+		auto name = StringUtil::Lower(bound.function.name);
+		if (name == "sum") {
+			// Summing is the semiring generalisation the plan always had as the
+			// widening step (§4.5), and on TPC-DS it is the aggregate that
+			// actually appears: 193 occurrences over inner-only join graphs
+			// against 24 for count(*). The column has to be a plain column of
+			// the region, since it is folded through the representation rather
+			// than evaluated.
+			if (bound.children.size() != 1 ||
+			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return Decline(region, "sum() of a computed expression");
+			}
+			entry.kind = factorize::Aggregate::SUM;
+			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+		} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
+			return Decline(region, "aggregate is " + name + "(), not count(*) or sum()");
+		}
+		region.aggregates.push_back(std::move(entry));
 	}
 	if (aggr.children.size() != 1) {
 		return Decline(region, "aggregate has no single child");
@@ -446,8 +468,8 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 
 //! False if any part of the region cannot be expressed, which is a decline.
 static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<BoundRelation> &relations,
-                       factorize::QueryGraph &graph, vector<factorize::GroupKey> &group_keys, size_t &sum_relation,
-                       size_t &sum_column) {
+                       factorize::QueryGraph &graph, vector<factorize::GroupKey> &group_keys,
+                       vector<factorize::GroupAggregate> &aggregates) {
 	std::map<idx_t, size_t> relation_of_table_index;
 	for (size_t i = 0; i < region.relations.size(); i++) {
 		auto &get = region.relations[i].get();
@@ -542,23 +564,29 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 		join_columns.push_back(relation.columns.size());
 	}
 
-	if (region.aggregate == factorize::Aggregate::SUM) {
-		// The summed column is the first thing the region reads that is not a
-		// join key, so unlike a join key it is *added* to the scan rather than
-		// required to be there already. Appended, never inserted: the join
-		// predicates above hold local column indices, and inserting would move
-		// the ground under them. (Filters are re-keyed below, after every
-		// append, for the same reason from the other direction.)
-		auto found = relation_of_table_index.find(region.sum_binding.table_index);
+	for (const auto &aggregate : region.aggregates) {
+		if (aggregate.kind != factorize::Aggregate::SUM) {
+			// count(*) reads nothing: the representation knows how many tuples
+			// a subtree denotes without looking at any column of them.
+			aggregates.push_back(factorize::GroupAggregate {factorize::Aggregate::COUNT, 0, 0});
+			continue;
+		}
+		// A summed column is not a join key, so unlike a join key it is *added*
+		// to the scan rather than required to be there already. Appended, never
+		// inserted: the join predicates above hold local column indices, and
+		// inserting would move the ground under them. (Filters are re-keyed
+		// below, after every append, for the same reason from the other
+		// direction.)
+		auto found = relation_of_table_index.find(aggregate.sum_binding.table_index);
 		if (found == relation_of_table_index.end()) {
 			return Decline(region, "summed column belongs to no relation of the region");
 		}
 		auto &get = region.relations[found->second].get();
 		auto &column_ids = get.GetColumnIds();
-		if (region.sum_binding.column_index >= column_ids.size()) {
+		if (aggregate.sum_binding.column_index >= column_ids.size()) {
 			return Decline(region, "summed column is not among the scanned columns");
 		}
-		auto &column_index = column_ids[region.sum_binding.column_index];
+		auto &column_index = column_ids[aggregate.sum_binding.column_index];
 		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
 			return Decline(region, "summed column is not a stored scalar column");
 		}
@@ -583,9 +611,8 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			bound.column_names.push_back(definition.Name());
 			bound.column_types.push_back(value_type);
 		}
-		sum_relation = found->second;
-		sum_column = static_cast<size_t>(bound.LocalIndex(physical));
-		if (region.grouped && sum_column >= join_columns[found->second]) {
+		const auto local = static_cast<size_t>(bound.LocalIndex(physical));
+		if (region.grouped && local >= join_columns[found->second]) {
 			// Ungrouped, a row whose summed value is NULL can be dropped: it
 			// contributes NULL to the sum either way. Grouped, it cannot -- a
 			// group whose every row is NULL here is still a row of the answer,
@@ -599,8 +626,9 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 				return Decline(region, "grouped sum over " + definition.Name() +
 				                           ", which may contain NULL and would drop a group entirely");
 			}
-			bound.no_null_columns.push_back(static_cast<idx_t>(sum_column));
+			bound.no_null_columns.push_back(static_cast<idx_t>(local));
 		}
+		aggregates.push_back(factorize::GroupAggregate {factorize::Aggregate::SUM, found->second, local});
 	}
 
 	for (const auto &binding : region.group_bindings) {
@@ -885,9 +913,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 		vector<BoundRelation> relations;
 		factorize::QueryGraph graph;
 		vector<factorize::GroupKey> group_keys;
-		size_t sum_relation = 0;
-		size_t sum_column = 0;
-		if (BindRegion(context, region, relations, graph, group_keys, sum_relation, sum_column)) {
+		vector<factorize::GroupAggregate> aggregates;
+		if (BindRegion(context, region, relations, graph, group_keys, aggregates)) {
 			// The join order is decided here rather than at execution: a graph
 			// the planner cannot order (a disconnected one, most of all) has to
 			// be a decline, not a query that fails halfway through running.
@@ -914,10 +941,13 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					replacement->group_index = region.group_index;
 					replacement->group_types = region.group_types;
 					replacement->group_keys = std::move(group_keys);
-					replacement->aggregate = region.aggregate;
-					replacement->sum_relation = sum_relation;
-					replacement->sum_column = sum_column;
-					replacement->sum_type = region.sum_type.id() == LogicalTypeId::INVALID ? LogicalType::HUGEINT : region.sum_type;
+					replacement->aggregates = std::move(aggregates);
+					for (const auto &entry : region.aggregates) {
+						// count(*) is BIGINT; a sum keeps the type DuckDB gave
+						// it, because the operators above were bound to that.
+						replacement->aggregate_types.push_back(
+						    entry.kind == factorize::Aggregate::SUM ? entry.type : LogicalType::BIGINT);
+					}
 					replacement->estimated_cardinality = 1;
 					replacement->ResolveOperatorTypes();
 					op = std::move(replacement);

@@ -196,7 +196,7 @@ static void TestGroupCountMatchesEnumeration() {
 
 	std::map<int64_t, int64_t> got;
 	for (const auto &entry : grouped.groups) {
-		got[entry.first[0]] = entry.second;
+		got[entry.first[0]] = entry.second[0];
 	}
 	Expect(got.size() == 2, "group: two keys join, got " + std::to_string(got.size()) + " groups");
 	Expect(got[1] == 6, "group: key 1 has 6 tuples, got " + std::to_string(got[1]));
@@ -207,7 +207,7 @@ static void TestGroupCountMatchesEnumeration() {
 	// is wrong.
 	int64_t summed = 0;
 	for (const auto &entry : grouped.groups) {
-		summed += entry.second;
+		summed += entry.second[0];
 	}
 	const auto counted = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(counted.ok && summed == counted.count, "group: the groups sum to " + std::to_string(summed) +
@@ -250,8 +250,8 @@ static void TestGroupOnDeepKey() {
 			Expect(false, "deep key: fold invented group " + std::to_string(entry.first[0]));
 			continue;
 		}
-		Expect(entry.second == found->second, "deep key: group " + std::to_string(entry.first[0]) + " counts " +
-		                                          std::to_string(entry.second) + ", enumeration says " +
+		Expect(entry.second[0] == found->second, "deep key: group " + std::to_string(entry.first[0]) + " counts " +
+		                                             std::to_string(entry.second[0]) + ", enumeration says " +
 		                                          std::to_string(found->second));
 	}
 	Report("a grouping key below the root is descended to, not declined");
@@ -325,8 +325,8 @@ static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
 	Expect(grouped.groups.size() == 1, "sum: a group whose values are all zero is still a group, got " +
 	                                       std::to_string(grouped.groups.size()));
 	if (!grouped.groups.empty()) {
-		Expect(grouped.groups[0].second == 0, "sum: that group's sum is 0, got " +
-		                                          std::to_string(grouped.groups[0].second));
+		Expect(grouped.groups[0].second[0] == 0, "sum: that group's sum is 0, got " +
+		                                             std::to_string(grouped.groups[0].second[0]));
 	}
 	Report("unmatched rows contribute nothing, and a group summing to zero is still a group");
 }
@@ -378,9 +378,9 @@ static void TestGroupOnSiblingBranches() {
 			                  std::to_string(key.second) + ")");
 			continue;
 		}
-		Expect(entry.second == found->second, "sibling groups: (" + std::to_string(key.first) + "," +
-		                                          std::to_string(key.second) + ") counts " +
-		                                          std::to_string(entry.second) + ", enumeration says " +
+		Expect(entry.second[0] == found->second, "sibling groups: (" + std::to_string(key.first) + "," +
+		                                             std::to_string(key.second) + ") counts " +
+		                                             std::to_string(entry.second[0]) + ", enumeration says " +
 		                                          std::to_string(found->second));
 	}
 	Report("grouping across independent sibling branches matches enumeration");
@@ -422,11 +422,134 @@ static void TestGroupSumOnSiblingBranches() {
 			Expect(false, "sibling sums: fold invented group " + std::to_string(entry.first[0]));
 			continue;
 		}
-		Expect(entry.second == found->second, "sibling sums: group " + std::to_string(entry.first[0]) + " sums to " +
-		                                          std::to_string(entry.second) + ", enumeration says " +
+		Expect(entry.second[0] == found->second, "sibling sums: group " + std::to_string(entry.first[0]) + " sums to " +
+		                                             std::to_string(entry.second[0]) + ", enumeration says " +
 		                                          std::to_string(found->second));
 	}
 	Report("summing a column from one branch while grouping on another matches enumeration");
+}
+
+//! Several aggregates in one walk. The point of doing them together is that
+//! they are folds over the same tuples, so the walk is shared -- but sharing it
+//! is only sound if each aggregate's arithmetic is untouched by the others'.
+//! Two sums over columns in *different* branches is where that would break:
+//! each is weighted by how many tuples the other branches make, and those
+//! weights differ per aggregate.
+static void TestSeveralAggregatesInOneWalk() {
+	MemorySource source;
+	source.Add({{1, 1, 2}});
+	source.Add({{1, 1, 2}, {7, 8, 9}});
+	source.Add({{1, 2, 2}, {70, 80, 90}});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "several: materialize succeeds (" + materialized.error + ")");
+
+	// Group by the hub key, and ask for count(*), sum(arm1.b) and sum(arm2.b)
+	// at once -- one aggregate over each branch, plus one over neither.
+	std::map<int64_t, std::vector<int64_t>> by_hand;
+	for (const auto &tuple : materialized.tuples) {
+		auto &row = by_hand[tuple[0]];
+		if (row.empty()) {
+			row.assign(3, 0);
+		}
+		row[0] += 1;
+		row[1] += tuple[2];
+		row[2] += tuple[4];
+	}
+
+	const std::vector<GroupAggregate> aggregates = {GroupAggregate {Aggregate::COUNT, 0, 0},
+	                                                GroupAggregate {Aggregate::SUM, 1, 1},
+	                                                GroupAggregate {Aggregate::SUM, 2, 1}};
+	auto grouped = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}}, aggregates);
+	Expect(grouped.ok, "several: fold succeeds (" + grouped.error + ")");
+	Expect(grouped.groups.size() == by_hand.size(), "several: " + std::to_string(grouped.groups.size()) +
+	                                                    " groups against " + std::to_string(by_hand.size()));
+	for (const auto &entry : grouped.groups) {
+		const auto found = by_hand.find(entry.first[0]);
+		if (found == by_hand.end()) {
+			Expect(false, "several: fold invented group " + std::to_string(entry.first[0]));
+			continue;
+		}
+		Expect(entry.second.size() == 3, "several: three values per group, got " +
+		                                     std::to_string(entry.second.size()));
+		for (size_t i = 0; i < found->second.size() && i < entry.second.size(); i++) {
+			Expect(entry.second[i] == found->second[i],
+			       "several: group " + std::to_string(entry.first[0]) + " aggregate " + std::to_string(i) +
+			           " gives " + std::to_string(entry.second[i]) + ", enumeration says " +
+			           std::to_string(found->second[i]));
+		}
+	}
+
+	// The same aggregates asked for one at a time have to agree with the shared
+	// walk, or sharing it changed an answer.
+	for (size_t i = 0; i < aggregates.size(); i++) {
+		auto alone = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}},
+		                            {aggregates[i]});
+		Expect(alone.ok && alone.groups.size() == grouped.groups.size(),
+		       "several: aggregate " + std::to_string(i) + " alone gives the same groups");
+		for (size_t g = 0; g < alone.groups.size() && g < grouped.groups.size(); g++) {
+			Expect(alone.groups[g].first == grouped.groups[g].first && alone.groups[g].second.size() == 1 &&
+			           alone.groups[g].second[0] == grouped.groups[g].second[i],
+			       "several: aggregate " + std::to_string(i) + " alone agrees with it in company");
+		}
+	}
+	Report("several aggregates folded in one walk agree with each folded alone");
+}
+
+//! No grouping columns at all: the whole join is one group, which is how the
+//! ungrouped answer is computed once several aggregates are asked for.
+static void TestSeveralAggregatesUngrouped() {
+	MemorySource source;
+	source.Add({{1, 1, 2}});
+	source.Add({{1, 1, 2}, {7, 8, 9}});
+	source.Add({{1, 2, 2}, {70, 80, 90}});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "ungrouped: materialize succeeds (" + materialized.error + ")");
+	int64_t tuples = 0;
+	int64_t first = 0;
+	int64_t second = 0;
+	for (const auto &tuple : materialized.tuples) {
+		tuples += 1;
+		first += tuple[2];
+		second += tuple[4];
+	}
+
+	auto grouped = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {},
+	                              {GroupAggregate {Aggregate::COUNT, 0, 0}, GroupAggregate {Aggregate::SUM, 1, 1},
+	                               GroupAggregate {Aggregate::SUM, 2, 1}});
+	Expect(grouped.ok, "ungrouped: fold succeeds (" + grouped.error + ")");
+	Expect(grouped.groups.size() == 1, "ungrouped: the whole join is one group, got " +
+	                                       std::to_string(grouped.groups.size()));
+	if (!grouped.groups.empty()) {
+		Expect(grouped.groups[0].first.empty(), "ungrouped: that group has no key values");
+		Expect(grouped.groups[0].second[0] == tuples, "ungrouped: count is " +
+		                                                  std::to_string(grouped.groups[0].second[0]) +
+		                                                  ", enumeration says " + std::to_string(tuples));
+		Expect(grouped.groups[0].second[1] == first, "ungrouped: first sum is " +
+		                                                 std::to_string(grouped.groups[0].second[1]) +
+		                                                 ", enumeration says " + std::to_string(first));
+		Expect(grouped.groups[0].second[2] == second, "ungrouped: second sum is " +
+		                                                  std::to_string(grouped.groups[0].second[2]) +
+		                                                  ", enumeration says " + std::to_string(second));
+	}
+	Report("with no grouping columns the whole join is a single group");
 }
 
 int main() {
@@ -448,6 +571,8 @@ int main() {
 	TestGroupOnSiblingBranches();
 	std::printf("\n");
 	TestGroupSumOnSiblingBranches();
+	TestSeveralAggregatesInOneWalk();
+	TestSeveralAggregatesUngrouped();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

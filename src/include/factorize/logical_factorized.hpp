@@ -45,13 +45,13 @@ public:
 	vector<LogicalType> group_types;
 	//! Which of the region's columns each grouping key is, same order.
 	vector<factorize::GroupKey> group_keys;
-	//! Which fold to run, and for sum, which column carries the values and what
-	//! type the answer has to come back as. DuckDB widens sum to HUGEINT even
-	//! over narrow integers, and the operators above were bound against that.
-	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
-	size_t sum_relation = 0;
-	size_t sum_column = 0;
-	LogicalType sum_type = LogicalType::HUGEINT;
+	//! One per aggregate, in the query's own order, which is the order the
+	//! answer's columns come back in. They are folded side by side in a single
+	//! walk of the representation rather than one walk each.
+	vector<factorize::GroupAggregate> aggregates;
+	//! What each has to come back as. count(*) is BIGINT; DuckDB widens sum to
+	//! HUGEINT even over narrow integers, and operators above were bound to it.
+	vector<LogicalType> aggregate_types;
 	//! The tables to scan, and the columns of each that a predicate touches.
 	vector<BoundRelation> relations;
 	//! The join graph, indexed by position in `relations`.

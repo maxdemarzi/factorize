@@ -126,19 +126,40 @@ def make_query(rng, tables):
             key = f"{alias}.{rng.choice(cols)}"
             if key not in keys:
                 keys.append(key)
-        if rng.random() < 0.4:
-            alias, _, cols = rng.choice(aliases)
-            aggregate = f"sum({alias}.{rng.choice(cols)})"
-        else:
-            aggregate = "count(*)"
+        selected = ", ".join(keys)
+        aggregates = make_aggregates(rng, aliases)
         # Ordered by every column, so two runs that agree as sets also agree as
         # text -- and so a duplicated group cannot hide behind a reordering.
-        ordering = ", ".join(str(i + 1) for i in range(len(keys) + 1))
+        ordering = ", ".join(str(i + 1) for i in range(len(keys) + len(aggregates)))
         return (
-            f"SELECT {', '.join(keys)}, {aggregate} FROM {froms} WHERE {where} "
-            f"GROUP BY {', '.join(keys)} ORDER BY {ordering};"
+            f"SELECT {selected}, {', '.join(aggregates)} FROM {froms} WHERE {where} "
+            f"GROUP BY {selected} ORDER BY {ordering};"
         )
-    return f"SELECT count(*) FROM {froms} WHERE {where};"
+    return f"SELECT {', '.join(make_aggregates(rng, aliases))} FROM {froms} WHERE {where};"
+
+
+def make_aggregates(rng, aliases):
+    """One to three aggregates, since several ride in one walk of the tree.
+
+    DuckDB deduplicates identical aggregate expressions, so asking for the same
+    sum twice is one aggregate and not two -- distinct ones are what exercise
+    the shared walk, and the sums are drawn without replacement for that reason.
+    """
+    wanted = rng.choice([1, 1, 2, 3])
+    chosen = []
+    seen = set()
+    for _ in range(wanted):
+        if rng.random() < 0.4:
+            if "count(*)" not in seen:
+                seen.add("count(*)")
+                chosen.append("count(*)")
+            continue
+        alias, _, cols = rng.choice(aliases)
+        term = f"sum({alias}.{rng.choice(cols)})"
+        if term not in seen:
+            seen.add(term)
+            chosen.append(term)
+    return chosen or ["count(*)"]
 
 
 #: Printed between modes so a grouped answer of many rows can still be split up.
