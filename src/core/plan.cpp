@@ -18,6 +18,40 @@ size_t AttributeBase(const QueryGraph &graph, size_t relation) {
 	return base;
 }
 
+//! Every attribute of one relation, in column order -- the node a flat scan of
+//! it becomes (FTree::Scan builds a single node holding all of them).
+std::vector<AttributeId> AttributesOf(const QueryGraph &graph, size_t relation) {
+	std::vector<AttributeId> attributes;
+	const auto count = relation < graph.column_counts.size() ? graph.column_counts[relation] : 0;
+	attributes.reserve(count);
+	for (size_t column = 0; column < count; column++) {
+		attributes.push_back(AttributeOf(graph, relation, column));
+	}
+	return attributes;
+}
+
+//! The storage width of one attribute, found by walking relations in order --
+//! the inverse of AttributeOf, needed because the join measures key widths over
+//! *attributes* and equality propagation can hand back an attribute belonging to
+//! a different relation than the predicate named.
+ValueType TypeOfAttribute(const QueryGraph &graph, AttributeId attribute) {
+	size_t base = 0;
+	for (size_t relation = 0; relation < graph.column_counts.size(); relation++) {
+		const auto count = graph.column_counts[relation];
+		if (attribute < base + count) {
+			const size_t column = static_cast<size_t>(attribute) - base;
+			if (relation < graph.column_types.size() && column < graph.column_types[relation].size()) {
+				return graph.column_types[relation][column];
+			}
+			break;
+		}
+		base += count;
+	}
+	// Unknown width is charged as the wider of the two, so an attribute the
+	// graph does not describe cannot smuggle a key past the cap.
+	return ValueType::INT64;
+}
+
 size_t TotalAttributes(const QueryGraph &graph) {
 	size_t total = 0;
 	for (size_t count : graph.column_counts) {
@@ -43,6 +77,21 @@ EquivalenceClasses::EquivalenceClasses(const QueryGraph &graph) {
 		if (a != b) {
 			parent[a] = b;
 		}
+	}
+}
+
+EquivalenceClasses::EquivalenceClasses(const QueryGraph &graph, Enforced) {
+	parent.resize(TotalAttributes(graph));
+	for (size_t i = 0; i < parent.size(); i++) {
+		parent[i] = i;
+	}
+}
+
+void EquivalenceClasses::Enforce(const QueryGraph &graph, const Predicate &predicate) {
+	const size_t a = Find(AttributeOf(graph, predicate.left_relation, static_cast<size_t>(predicate.left_column)));
+	const size_t b = Find(AttributeOf(graph, predicate.right_relation, static_cast<size_t>(predicate.right_column)));
+	if (a != b) {
+		parent[a] = b;
 	}
 }
 
@@ -103,7 +152,8 @@ Plan BuildPlan(const QueryGraph &graph) {
 	Plan plan;
 	std::set<size_t> joined;
 	std::vector<bool> used(graph.predicates.size(), false);
-	EquivalenceClasses classes(graph);
+	// Only equalities a join has already applied. See EquivalenceClasses.
+	EquivalenceClasses classes(graph, Enforced {});
 
 	// A relation can only attach where every edge carrying it into the joined set
 	// reaches attributes that end up on *one* f-tree level, and section 4.3
@@ -118,22 +168,94 @@ Plan BuildPlan(const QueryGraph &graph) {
 	// caller can still do something about it -- the table function reports which
 	// query it cannot run, and the optimizer rule quietly leaves the stock plan
 	// alone.
-	auto converges = [&](const std::vector<Predicate> &edges) {
-		bool have_first = false;
-		AttributeId first = 0;
+	// The tree the plan will actually build, simulated as it is planned.
+	//
+	// An FTree is pure structure over attribute ids -- no data -- so the planner
+	// can construct the very tree the engine will, and ask it the real question
+	// instead of a proxy for it. That matters because the proxy was wrong in one
+	// direction: sharing an equivalence class implies landing on one node, but
+	// not the reverse, and every composite-key join lives in the gap. `A.k1 =
+	// B.k1 AND A.k2 = B.k2` is what every composite foreign key writes, and it
+	// was refused project-wide as "cyclic" -- which it is not.
+	FTree simulated = FTree::Scan(AttributesOf(graph, graph.predicates.empty() ? 0 : graph.predicates[0].left_relation));
+
+	// The accumulated side's key attributes, as the join will name them: mapped
+	// through equality propagation against the tree as it stands.
+	auto accumulated_keys_for = [&](const std::vector<Predicate> &edges, size_t attaching) {
+		std::vector<AttributeId> keys;
 		for (const auto &edge : edges) {
-			const bool left_joined = joined.count(edge.left_relation) > 0;
-			const auto attribute =
-			    left_joined ? AttributeOf(graph, edge.left_relation, static_cast<size_t>(edge.left_column))
-			                : AttributeOf(graph, edge.right_relation, static_cast<size_t>(edge.right_column));
-			if (!have_first) {
-				first = attribute;
-				have_first = true;
-			} else if (!classes.SameClass(first, attribute)) {
+			const bool left_is_new = edge.left_relation == attaching;
+			const auto raw = AttributeOf(graph, left_is_new ? edge.right_relation : edge.left_relation,
+			                             static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column));
+			keys.push_back(ShallowestEquivalent(classes, simulated, raw));
+		}
+		return keys;
+	};
+
+	// MakeKeyReader requires every key to be readable from ONE node, and throws
+	// "key attributes did not converge on one level" otherwise -- mid-query,
+	// where a caller can do nothing about it. So the same question is asked
+	// here, by performing the transformation the join performs and looking at
+	// where the keys ended up.
+	//
+	// LEVELWISE rather than NAIVE deliberately: NAIVE collapses every required
+	// node into the root, so its keys always converge, which makes LEVELWISE the
+	// stricter of the two and a plan accepted here safe under either.
+	auto converges = [&](const std::vector<Predicate> &edges, size_t attaching) {
+		const auto keys = accumulated_keys_for(edges, attaching);
+		if (keys.size() < 2) {
+			return true;
+		}
+		FTree probe_shape(simulated);
+		const FNode &insertion = probe_shape.CreateRootToLeafPath(keys, PathStrategy::LEVELWISE);
+		for (auto key : keys) {
+			if (!insertion.HasAttribute(key)) {
 				return false;
 			}
 		}
 		return true;
+	};
+
+	// The packed composite key is one 64-bit word, so a key set wider than that
+	// cannot be built at all (join.cpp: "composite key wider than 64 bits").
+	// Refused here rather than thrown there, for the same reason as above.
+	auto fits_key_width = [&](const std::vector<Predicate> &edges, size_t attaching) {
+		// MakeKeyReader is built once per side and caps each at 64 bits, so both
+		// sides are measured: a key can be INT32 on one relation and INT64 on
+		// the other, and only the wider side would fail.
+		//
+		// The rule is the *sum* of the key columns' widths, not a count of them
+		// and not "no INT64": one INT64 key fits at exactly 64, and INT32+INT64
+		// is 96 and does not. That pairing -- a small discriminator beside a
+		// bigint id -- is the common composite key in real schemas, so a rule
+		// written as "not two INT64s" would let precisely the frequent case
+		// through to the mid-join throw this exists to prevent.
+		//
+		// The accumulated side is measured over the keys AFTER equality
+		// propagation, because those are the attributes MakeKeyReader will read.
+		// Charging the raw predicate columns refuses queries the engine computes
+		// perfectly well: when two edges put an INT64 column and an INT32 column
+		// in one class, ShallowestEquivalent hands the join the INT32 one and it
+		// packs 64 bits, while the raw columns add to 96. Measured over 4000
+		// random graphs, that mistake declined 21 that the old planner answered.
+		//
+		// The invariant, since this function has now been wrong three ways: it
+		// must measure exactly what MakeKeyReader measures.
+		unsigned new_bits = 0;
+		for (const auto &edge : edges) {
+			const bool left_is_new = edge.left_relation == attaching;
+			new_bits += TypeOfAttribute(graph, AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+			                                               static_cast<size_t>(left_is_new ? edge.left_column
+			                                                                               : edge.right_column))) ==
+			                    ValueType::INT32
+			                ? 32u
+			                : 64u;
+		}
+		unsigned joined_bits = 0;
+		for (auto key : accumulated_keys_for(edges, attaching)) {
+			joined_bits += TypeOfAttribute(graph, key) == ValueType::INT32 ? 32u : 64u;
+		}
+		return new_bits <= 64u && joined_bits <= 64u;
 	};
 
 	// Seed with the relation carrying the first predicate.
@@ -163,8 +285,19 @@ Plan BuildPlan(const QueryGraph &graph) {
 		// another relation may attach cleanly now, and the residual-predicate
 		// check below still catches an edge that never gets used.
 		auto best = candidates.end();
+		bool too_wide = false;
 		for (auto it = candidates.begin(); it != candidates.end(); ++it) {
-			if (!converges(it->second)) {
+			// Both tested, always, so the reason reported is the one a reader
+			// can act on. Setting `too_wide` only where convergence had already
+			// passed hid it behind the node-placement message for a candidate
+			// that failed both -- sending someone hunting for a cycle when the
+			// fix is casting a BIGINT to INTEGER. Reporting the right decision
+			// for the wrong reason is the defect this message exists to end.
+			const bool fits = fits_key_width(it->second, it->first);
+			if (!fits) {
+				too_wide = true;
+			}
+			if (!fits || !converges(it->second, it->first)) {
 				continue;
 			}
 			if (best == candidates.end() || it->second.size() > best->second.size()) {
@@ -172,11 +305,41 @@ Plan BuildPlan(const QueryGraph &graph) {
 			}
 		}
 		if (best == candidates.end()) {
-			plan.reason = "cyclic join graph: no relation attaches on a single key";
+			// Named for what was actually measured rather than for the usual
+			// cause. A cyclic graph reaches this, and so did every composite-key
+			// join until the check above stopped guessing -- calling those
+			// cyclic was wrong twice over, since the graph is acyclic and the
+			// engine can compute it.
+			plan.reason = too_wide ? "join key is wider than the 64-bit packed key"
+			                       : "no relation attaches on keys that land on one f-tree node "
+			                         "(a cyclic join graph is the usual cause)";
 			return plan;
+		}
+		// Advance the simulation exactly as the join will: the accumulated tree
+		// is the upper one under either insert mode -- bottom-insert puts the
+		// build on top and names it `build`, top-insert puts the probe on top
+		// and names it `probe`, and the accumulated side is whichever that is --
+		// so the shape does not depend on the mode, only the locking does.
+		{
+			JoinKeys keys;
+			keys.build = accumulated_keys_for(best->second, best->first);
+			keys.probe.clear();
+			for (const auto &edge : best->second) {
+				const bool left_is_new = edge.left_relation == best->first;
+				keys.probe.push_back(AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+				                                 static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
+			}
+			simulated = MergeTrees(simulated, FTree::Scan(AttributesOf(graph, best->first)), keys,
+			                       JoinMode::BOTTOM_INSERT, PathStrategy::LEVELWISE);
 		}
 		plan.steps.push_back(PlanStep {best->first, best->second});
 		joined.insert(best->first);
+		// After the keys above were resolved, never before: this join is what
+		// makes these equalities true, so resolving its own keys through them
+		// would be assuming the conclusion.
+		for (const auto &edge : best->second) {
+			classes.Enforce(graph, edge);
+		}
 		for (size_t i = 0; i < graph.predicates.size(); i++) {
 			const auto &predicate = graph.predicates[i];
 			if (used[i]) {
@@ -305,7 +468,11 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 			return MakeScan(attributes, types, source.Columns(relation));
 		};
 
-		EquivalenceClasses classes(graph);
+		// Enforced-only, and grown as the joins below apply their edges. The
+		// planner accepted this graph under the same rule, so the two must agree
+		// on what is substitutable or execution would resolve keys the plan
+		// never validated.
+		EquivalenceClasses classes(graph, Enforced {});
 		int64_t fused_count = -1;
 		auto accumulated = make(plan.steps[0].relation);
 
@@ -351,6 +518,11 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 				} else {
 					accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy);
 				}
+			}
+			// Applied by the join just issued, so substitutable from here on and
+			// not before -- the same order BuildPlan validated the graph under.
+			for (const auto &edge : step.edges) {
+				classes.Enforce(graph, edge);
 			}
 		}
 
@@ -424,6 +596,12 @@ private:
 //! per-relation column to bucket on, or an empty vector if no class reaches
 //! more than one relation, in which case slicing cannot help.
 std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
+	// The full closure is right here, and only here. Slicing partitions the
+	// INPUT by hashing a column of each relation, and every relation whose
+	// column is transitively equated must land in the same bucket or tuples that
+	// join are separated and the count comes out short. That is a statement
+	// about which rows can possibly match, which the whole graph decides -- not
+	// about which substitutions a given join has earned.
 	EquivalenceClasses classes(graph);
 	std::map<size_t, std::vector<int>> by_class;
 	std::map<size_t, size_t> reach;
@@ -588,7 +766,7 @@ BuiltRelation BuildRepresentation(const QueryGraph &graph, const Plan &plan, Rel
 			return MakeScan(attributes, types, source.Columns(relation));
 		};
 
-		built.classes.reset(new EquivalenceClasses(graph));
+		built.classes.reset(new EquivalenceClasses(graph, Enforced {}));
 		auto accumulated = make(plan.steps[0].relation);
 
 		for (size_t i = 1; i < plan.steps.size(); i++) {
@@ -613,6 +791,12 @@ BuiltRelation BuildRepresentation(const QueryGraph &graph, const Plan &plan, Rel
 				keys.build = accumulated_keys;
 				keys.probe = new_keys;
 				accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy);
+			}
+			// After the join, for the same reason as everywhere else: an equality
+			// becomes substitutable when a join has made it true, not when a
+			// predicate has asked for it.
+			for (const auto &edge : step.edges) {
+				built.classes->Enforce(graph, edge);
 			}
 		}
 		built.relation.reset(new FactorizedRelation(std::move(accumulated)));

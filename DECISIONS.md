@@ -1087,3 +1087,151 @@ construction:
 > **Two fields that must agree are two fields that can disagree.**
 
 The fix in both cases was to delete the redundancy, not to reconcile it.
+
+## D28 — Composite-key joins were refused as "cyclic", and the check was a proxy
+
+`A.k1 = B.k1 AND A.k2 = B.k2` is what every composite foreign key writes, and
+`BuildPlan` refused it project-wide with `"cyclic join graph: no relation
+attaches on a single key"`. The graph is acyclic and the engine computes it
+correctly, so the message was wrong twice over. Verified reachable from SQL --
+the matcher does not decline it earlier, which was the question that would have
+made it moot:
+
+    same tables, single-column key   takes over
+    two relations, composite key     declined "cyclic join graph"
+    three relations, one composite   declined "cyclic join graph"
+
+**The check was a proxy for the real constraint.** `MakeKeyReader` reads every
+key attribute from *one output level* and throws `"key attributes did not
+converge on one level"` otherwise -- mid-query, where a caller can do nothing
+about it. The planner approximated that by requiring the joined-side keys to
+share an *equivalence class*. Class-equality implies same-node; same-node does
+not imply class-equality; and every composite key is in the gap.
+
+**The proxy could not be tightened, so it was replaced by the thing itself.** An
+`FTree` is pure structure over attribute ids -- no data -- so the planner can
+construct the tree the engine will build and ask where the keys land:
+
+    FTree probe_shape(simulated);
+    const FNode &insertion = probe_shape.CreateRootToLeafPath(keys, LEVELWISE);
+    every key must satisfy insertion.HasAttribute(key)
+
+and then advance `simulated` through `MergeTrees` exactly as execution will.
+This is not a better approximation, it is the same computation, so it cannot
+drift from the engine's behaviour the way a proxy does.
+
+Three details that had to be right:
+
+- **The accumulated side is the upper tree under either insert mode.**
+  Bottom-insert puts the build on top and calls it `build`; top-insert puts the
+  probe on top and calls it `probe`; the accumulated side is whichever that is.
+  So the tree *shape* is mode-independent and only the locking differs -- which
+  is what lets one simulation stand for both.
+- **LEVELWISE, not NAIVE.** `MergeNaive` collapses every required node into the
+  root, so its keys always converge; LEVELWISE builds a path and is the stricter
+  of the two. A plan accepted under LEVELWISE is safe under either.
+- **Equality propagation belongs in the simulation.** The join maps each
+  accumulated-side key through `ShallowestEquivalent` against the live tree, so
+  the planner must too, or it would be testing different attributes than the
+  ones the join will read.
+
+**The 64-bit cap is load-bearing, and the rule is not the obvious one.** The
+packed key is a single word: the constraint is the *sum* of the key columns'
+widths, 32 per INT32 and 64 per INT64. So one INT64 key fits at exactly 64,
+INT32+INT32 fits at 64, and **INT32+INT64 does not** -- a small discriminator
+beside a bigint id, which is the ordinary composite key in a real schema. A rule
+written as "not two INT64s" would have let precisely the common case through to
+the mid-join exception this exists to prevent. Both sides are measured, since a
+key can be INT32 on one relation and INT64 on the other.
+
+It is also load-bearing for *correctness* rather than only for support: the
+INT64 arm of `KeyReader::Read` omits the `<< bit` shift its INT32 sibling has.
+That is unreachable today, because any key with an INT64 beside another column
+is over 64 bits and refused before `Read` runs. Widening the cap without fixing
+that shift would make every multi-column key containing an INT64 collide into
+one hash key -- wrong counts, no throw. Recorded here so the cap does not look
+like a limitation that can be relaxed for free.
+
+One consequence worth stating plainly: because `range()` and most integer
+expressions yield BIGINT, a composite key written over BIGINT columns is still
+refused. Composite keys work where the columns are `INTEGER` or narrower, which
+is the common case in real schemas and not in ad-hoc test data -- the first
+end-to-end probe of this fix declined for exactly that reason, correctly, and
+looked like a failure.
+
+## D29 — Equality propagation substituted equalities no join had enforced
+
+`factorized_count` returned **5** where the answer is **3**:
+
+    q0(c0) = 1,2,3   q1(c0,c1) = (1,1),(2,2),(2,3)   q2(c0) = 1,2,2
+    q0.c0 = q1.c0  AND  q1.c1 = q2.c0  AND  q2.c0 = q0.c0
+
+Silently, through a documented table function, and present since long before the
+composite-key work -- the planner at `f2f769a` gives 5 too. Found by writing a
+regression test for something else.
+
+**The cause.** `EquivalenceClasses` merged every predicate of the graph before
+any join ran, so `ShallowestEquivalent` could resolve a key through an equality
+that was only *implied* by predicates not yet applied. Here the two edges
+attaching `q2` together imply `q1.c1 = q0.c0`; both accumulated keys collapse
+onto one attribute; the join enforces `q2.c0 = X` twice instead of two different
+constraints; and the implied equality is never checked. The class said they were
+equal. Nothing made them equal.
+
+**The fix** is an ordering, not an algorithm: propagate only over equalities a
+join has *already enforced*, accumulated per step. Resolve this join's keys,
+then enforce its edges -- using them first assumes the conclusion.
+
+**Measured over 3000 random graphs**, counting every accepted graph twice, once
+by the engine and once by brute force over the full cross product:
+
+                              accepted   silently wrong
+    old planner (f2f769a)         2245              129
+    composite fix, unsound        2599              132
+    both fixes                    2470                0
+
+Tree-shaped graphs were always sound (1000 accepted, 0 wrong, unchanged), and
+the fixed planner accepts **225 more** graphs than the old one, so composite
+keys survive the soundness fix rather than being paid for with it.
+
+**Two scoping corrections, both of which changed the code and not just its
+description.** The obvious readings of the example are wrong:
+
+- *Not only cyclic graphs.* 25 of the 132 are acyclic -- a doubled edge between
+  one pair of relations, which is the composite-key shape.
+- *Not only a self-equality within one relation.* 54 imply no equality between
+  two columns of one relation at all; and 482 graphs that DO imply one answer
+  correctly, so it is neither necessary nor sufficient.
+
+A fix framed around either reading leaves wrong answers behind. The causal
+statement -- *substituting an equality no join has enforced* -- covers all of
+them, and is the same defect as the null-extension case in the §10.5 notes,
+where propagation crosses a boundary that does not establish the equality.
+
+**One site keeps the full closure, deliberately.** `ChooseSliceColumns`
+partitions the *input* by hashing a column of each relation, and every relation
+whose column is transitively equated must land in the same bucket or tuples that
+would have joined are separated and the count comes out short. That is a
+question about which rows can possibly match, which the whole graph decides --
+not about which substitutions a join has earned. Measured rather than argued:
+the same corpus through `ExecuteCountSliced` at 2, 3, 5 and 8 slices, 0 wrong at
+every modulus. `BuildCostSteps` also keeps it, where a wrong class costs a gate
+decision and never a count.
+
+**The regression test asserted the bug.** It was written to check that the bad
+graph computes 3. Under the fix it *declines* -- propagation no longer narrows
+the key, so the width cap catches it first -- and that looks exactly like a
+break unless you already know the premise was wrong. The test now asserts the
+property instead: **declined or correct, never wrong.** Declining is always
+safe; answering wrongly never is.
+
+> A test written from the example encodes the example. A test written from the
+> property survives the fix.
+
+**And a tenth instance of the session's pattern, in the harness itself.**
+`Report()` printed `ok` unconditionally, so a group whose checks had failed
+printed its FAIL lines and then said ok. Totals and exit code were right, so CI
+caught it -- but a human reads the last line of a group, and that line was a
+lie. Fixed in all seven files that define it, and mutation-tested: a deliberately
+broken check now turns its group's line to FAIL while untouched groups still say
+ok.

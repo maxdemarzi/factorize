@@ -25,13 +25,13 @@ run() {
 }
 
 if [ "$MODE" = "asan" ] || [ "$MODE" = "both" ]; then
-    for t in test_ftree test_frep test_join test_cost test_plan test_enumerate test_outer test_rangejoin test_semi; do
+    for t in test_ftree test_frep test_join test_cost test_plan test_enumerate test_outer test_rangejoin test_semi test_composite; do
         ${CXX:-g++} $FLAGS -O1 -fsanitize=address,undefined -o "$OUT/$t.asan" "test/unit/$t.cpp" $CORE
         run "$t (asan+ubsan)" "$OUT/$t.asan"
     done
 fi
 if [ "$MODE" = "opt" ] || [ "$MODE" = "both" ]; then
-    for t in test_ftree test_frep test_join test_cost test_plan test_enumerate test_outer test_rangejoin test_semi; do
+    for t in test_ftree test_frep test_join test_cost test_plan test_enumerate test_outer test_rangejoin test_semi test_composite; do
         ${CXX:-g++} $FLAGS -O2 -o "$OUT/$t" "test/unit/$t.cpp" $CORE
         run "$t (-O2)" "$OUT/$t"
     done

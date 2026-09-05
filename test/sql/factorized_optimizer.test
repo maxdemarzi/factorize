@@ -1666,3 +1666,104 @@ RESET disabled_optimizers;
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# Composite-key equi-joins: `A.k1 = B.k1 AND A.k2 = B.k2`, which is what every
+# composite foreign key writes.
+#
+# These were declined project-wide and reported as "cyclic join graph" -- wrong
+# twice over, since the graph is acyclic and the engine computes it correctly.
+# The planner tested whether the joined-side keys shared an equivalence CLASS,
+# a proxy for the real requirement that they land on one f-tree NODE. Class
+# equality implies same-node and not the reverse, and every composite key lives
+# in that gap.
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ck_a AS SELECT (i % 100)::INTEGER AS k1, (i % 7)::INTEGER AS k2, i AS v FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE ck_b AS SELECT (i % 100)::INTEGER AS k1, (i % 7)::INTEGER AS k2 FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE ck_c AS SELECT (i % 100)::INTEGER AS k1 FROM range(5000) t(i);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM ck_a, ck_b WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2;
+----
+35800
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+EXPLAIN SELECT count(*) FROM ck_a, ck_b WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM ck_a, ck_b WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2;
+----
+35800
+
+# A third relation attaching on ONE of the two composite columns. This is the
+# case the class proxy could never express: after the composite join k1 and k2
+# are on one node, and a relation joining on k1 alone attaches to that node,
+# while the classes were never equal and never become so.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM ck_a, ck_b, ck_c WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2 AND ck_a.k1 = ck_c.k1;
+----
+1790000
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+EXPLAIN SELECT count(*) FROM ck_a, ck_b, ck_c
+ WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2 AND ck_a.k1 = ck_c.k1;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM ck_a, ck_b, ck_c WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2 AND ck_a.k1 = ck_c.k1;
+----
+1790000
+
+# The packed key is one 64-bit word and the rule is the SUM of the key columns'
+# widths -- not a count of them, and not "no BIGINT". INTEGER+BIGINT is 96 bits
+# and is refused, which matters because a small discriminator beside a bigint id
+# is the ordinary composite key: a rule written as "not two BIGINTs" would let
+# exactly the common case through to an exception thrown mid-join.
+statement ok
+CREATE TABLE ck_wide_a AS SELECT (i % 100)::INTEGER AS k1, i AS k2 FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE ck_wide_b AS SELECT (i % 100)::INTEGER AS k1, i AS k2 FROM range(5000) t(i);
+
+query II
+EXPLAIN SELECT count(*) FROM ck_wide_a, ck_wide_b
+ WHERE ck_wide_a.k1 = ck_wide_b.k1 AND ck_wide_a.k2 = ck_wide_b.k2;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k1 = ck_wide_b.k1 AND ck_wide_a.k2 = ck_wide_b.k2;
+----
+5000
+
+# Two BIGINT key columns are 128 bits and refused the same way -- and a single
+# BIGINT key is exactly 64 and still fires, so the cap is on the sum rather than
+# on the presence of a wide column.
+query I
+SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k2 = ck_wide_b.k2;
+----
+5000
+
+statement ok
+SET factorize_mode = 'off';

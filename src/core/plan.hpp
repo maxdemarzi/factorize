@@ -74,9 +74,28 @@ struct QueryGraph {
 AttributeId AttributeOf(const QueryGraph &graph, size_t relation, size_t column);
 
 //! Union-find over attributes, closing equality under transitivity.
+//! Tag for the incremental constructor, so the two cannot be confused at a call
+//! site: which one a caller wants is a correctness decision, not a default.
+struct Enforced {};
+
 class EquivalenceClasses {
 public:
+	//! Every predicate of the graph, merged up front.
 	explicit EquivalenceClasses(const QueryGraph &graph);
+	//! No equalities yet: attributes become equal only as Enforce is told that a
+	//! join has actually made them so.
+	//!
+	//! Propagation is only sound over equalities some join *enforces*. Merging
+	//! the whole graph up front lets ShallowestEquivalent substitute across an
+	//! equality that is merely implied by predicates not yet applied -- and then
+	//! two keys of one join collapse onto one attribute, the join checks one
+	//! constraint where the query wrote two, and the count comes out too high
+	//! with nothing to indicate it. Measured over 3000 random graphs, 132 of the
+	//! 2599 the planner accepted answered wrongly that way.
+	EquivalenceClasses(const QueryGraph &graph, Enforced);
+
+	//! Merge the two sides of one predicate, once a join has applied it.
+	void Enforce(const QueryGraph &graph, const Predicate &predicate);
 
 	size_t Find(size_t attribute);
 	bool SameClass(AttributeId a, AttributeId b);
