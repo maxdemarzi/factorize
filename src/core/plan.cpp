@@ -636,6 +636,77 @@ std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
 
 } // namespace
 
+ExecuteResult ExecuteCountNotEqual(const QueryGraph &graph, const NotEqualPredicate &neq, RelationSource &source,
+                                   JoinMode mode, PathStrategy strategy) {
+	ExecuteResult result;
+	const auto relations = graph.RelationCount();
+	if (neq.left_relation >= relations || neq.right_relation >= relations) {
+		result.error = "not-equal: relation out of range";
+		return result;
+	}
+	if (neq.left_relation == neq.right_relation) {
+		// `A.x <> A.y` is a filter on one relation, not a join between two, and
+		// its complement `A.x = A.y` is a filter too. Neither is an edge, so
+		// neither term is expressible as a join graph -- and answering it would
+		// mean silently ignoring the predicate.
+		result.error = "not-equal: both columns are on one relation, which is a filter rather than a join";
+		return result;
+	}
+	if (neq.left_column < 0 || neq.right_column < 0 ||
+	    static_cast<size_t>(neq.left_column) >= graph.column_counts[neq.left_relation] ||
+	    static_cast<size_t>(neq.right_column) >= graph.column_counts[neq.right_relation]) {
+		result.error = "not-equal: column out of range";
+		return result;
+	}
+
+	// Term one: the equalities alone.
+	const auto all_plan = BuildPlan(graph);
+	if (!all_plan.complete) {
+		result.error = "not-equal: the equality-only term does not plan: " + all_plan.reason;
+		return result;
+	}
+	const auto all = ExecuteCount(graph, all_plan, source, mode, strategy);
+	if (!all.ok) {
+		result.error = "not-equal: the equality-only term failed: " + all.error;
+		result.out_of_memory = all.out_of_memory;
+		return result;
+	}
+
+	// Term two: the same graph with `<>` promoted to `=`. This is the term that
+	// needs composite keys, since it adds a second edge between a pair the graph
+	// may already join.
+	QueryGraph equal_graph = graph;
+	equal_graph.predicates.push_back(
+	    Predicate {neq.left_relation, neq.left_column, neq.right_relation, neq.right_column});
+	const auto equal_plan = BuildPlan(equal_graph);
+	if (!equal_plan.complete) {
+		result.error = "not-equal: the equality term does not plan: " + equal_plan.reason;
+		return result;
+	}
+	const auto equal = ExecuteCount(equal_graph, equal_plan, source, mode, strategy);
+	if (!equal.ok) {
+		result.error = "not-equal: the equality term failed: " + equal.error;
+		result.out_of_memory = equal.out_of_memory;
+		return result;
+	}
+
+	// The equality term counts a subset of the equality-only term, so the
+	// difference cannot be negative and cannot overflow. If it ever is negative
+	// the two terms disagreed about something and the answer is worthless, so
+	// say so rather than return it.
+	if (equal.count > all.count) {
+		result.error = "not-equal: the equality term counted more than the equality-only term (" +
+		               std::to_string(equal.count) + " > " + std::to_string(all.count) + ")";
+		return result;
+	}
+	result.count = all.count - equal.count;
+	result.tuples = result.count;
+	result.records = all.records + equal.records;
+	result.bytes = all.bytes + equal.bytes;
+	result.ok = true;
+	return result;
+}
+
 ExecuteResult ExecuteCountSlice(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                 size_t slice, size_t slices, PathStrategy strategy) {
 	if (slices <= 1) {
