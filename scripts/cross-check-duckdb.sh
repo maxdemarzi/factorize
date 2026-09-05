@@ -21,6 +21,7 @@ TIMEOUT="${TIMEOUT:-120}"
 
 echo "query,expected,factorized,duckdb,status"
 checked=0
+mismatched=0
 while IFS='|' read -r name expected sql; do
     [ -n "$name" ] || continue
     [ "$expected" -le "$MAX_EXPECTED" ] 2>/dev/null || continue
@@ -45,9 +46,19 @@ PY
         status=ok
     else
         status=MISMATCH
+        mismatched=$((mismatched + 1))
     fi
     printf '%s,%s,%s,%s,%s\n' "$name" "$expected" "$fact" "$duck" "$status"
     checked=$((checked + 1))
 done < tmp/ce_runnable.psv
 
-echo "-- cross-checked $checked queries" >&2
+echo "-- cross-checked $checked queries, $mismatched wrong" >&2
+
+# The sibling script ends on its mismatch count; this one ended on an echo, so
+# a disagreement -- the only thing this script exists to find -- was a word in a
+# CSV row and an exit status of 0. A run that compared nothing at all said the
+# same thing just as quietly: every query can be skipped, for being larger than
+# MAX_EXPECTED or for timing out on either side, without that being visible in
+# the status. Both are failures of this script's one job.
+[ "$checked" -gt 0 ] || { echo "   ^^ nothing was cross-checked" >&2; exit 1; }
+[ "$mismatched" -eq 0 ]

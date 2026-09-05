@@ -1332,3 +1332,34 @@ just made in my own invocation, and is not one, because `set -o pipefail` at the
 top of the file means the pipeline keeps the binary's status. Verified with a
 two-line experiment rather than reasoned about, since the reasoning is what had
 just been wrong.
+
+**And the one that had already been learned, in the very function that had it.**
+`fuzz-modes-agree.py` runs a random query under `off`, `force` and `auto` and
+compares the three answers. `make_table` chose its column type per TABLE from
+four types, so a join between an INTEGER table and a BIGINT one takes a cast,
+the rule declines it as a computed key, and the three modes then agree
+trivially -- fifteen queries in sixteen at three tables. Measured by adding a
+counter of how many queries the rule actually took over:
+
+    fixed fuzzer            exit=3   8 random queries, 0 disagreements, 0 taken over
+    same, rule ripped out   exit=3   8 random queries, 0 disagreements, 0 taken over
+
+Indistinguishable. Before the counter both printed `8 random queries, 0
+disagreements` and exited 0, which is the strongest result this file can report.
+
+The part worth keeping is the comment already sitting inside `make_table`, from
+an earlier fix to it:
+
+> Name the VALUES columns rather than relying on the generated names, which
+> differ between DuckDB versions and silently made an earlier version of this
+> script generate tables that never got created -- *a fuzzer that tests nothing
+> reports no failures, which reads exactly like success.*
+
+Someone hit this condition, understood it exactly, wrote that sentence, fixed
+the cause, and the tool walked back into the identical condition by a different
+road. That is a better argument for guarding the condition than either instance
+above, because it is the careful version failing: knowing the shape did not
+prevent reproducing it. The type is now chosen once per query, and a run that
+took nothing over exits 3 rather than reporting success -- the same twelve
+queries now fire on five, and the counter passes as well as fails, which a
+control has to do to be one.

@@ -270,8 +270,18 @@ def main():
     if args.json:
         Path(args.json).write_text(json.dumps(samples, indent=2))
 
-    if not args.fit or len(samples) < 8:
+    if not args.fit:
         return 0
+
+    # Not asking for a fit and asking for one that could not be made are
+    # different outcomes and used to share an exit status of 0. A caller that
+    # refits in a script would have kept the coefficients it already had while
+    # being told the refit succeeded, which is the failure this whole file
+    # exists to avoid making by hand.
+    if len(samples) < 8:
+        print(f"only {len(samples)} of {len(SHAPES)} shapes measured: too few to fit, "
+              f"and a fit from this many is worse than none", file=sys.stderr)
+        return 2
 
     # Half the shapes fit, half held out, split by index so both halves span the
     # grid rather than one getting all the stars. A fit that is only checked on

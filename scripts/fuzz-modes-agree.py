@@ -37,14 +37,13 @@ else:
 TYPES = ["INTEGER", "BIGINT", "SMALLINT", "TINYINT"]
 
 
-def make_table(rng, name):
+def make_table(rng, name, column_type):
     """A table of one or two integer columns, sometimes empty, sometimes NULL-ridden."""
     rows = rng.choice([0, 1, 2, 3, 5, 8, 13])
     columns = rng.choice([1, 2])
     # A narrow domain makes joins actually match, and makes duplicates common,
     # which is where multiplicity bugs live.
     domain = rng.choice([1, 2, 3, 5])
-    column_type = rng.choice(TYPES)
     names = ["c0", "c1"][:columns]
     if rows == 0:
         return f"CREATE TABLE {name} ({', '.join(f'{c} {column_type}' for c in names)});", names
@@ -188,12 +187,21 @@ def main():
         return 2
 
     failures = 0
+    fired = 0
     for iteration in range(iterations):
         setup = []
         tables = []
+        # One type per QUERY, not per table. Chosen per table, a join between an
+        # INTEGER table and a BIGINT one gets a cast, the rule declines it as a
+        # computed key, and all three modes then agree trivially. With four types
+        # and three tables that was fifteen queries in sixteen, so the fuzzer was
+        # comparing stock DuckDB against itself and reporting no disagreements --
+        # which is this file's strongest green. Mixed-type joins are a decline
+        # path and are covered in test/sql, where a decline can be asserted.
+        column_type = rng.choice(TYPES)
         for t in range(rng.randrange(2, 5)):
             name = f"f{t}"
-            ddl, cols = make_table(rng, name)
+            ddl, cols = make_table(rng, name, column_type)
             setup.append(ddl)
             tables.append((name, cols))
         query = make_query(rng, tables)
@@ -209,20 +217,37 @@ def main():
                 script += f"SELECT '{SEPARATOR}';\n"
             script += f"SET factorize_mode='{mode}';\n{query}\n"
 
+        # A fourth block that is not an answer but a plan. Three equal answers are
+        # also exactly what a rule taking nothing over produces, so without this the
+        # strongest result the fuzzer can report -- no disagreements at all -- is
+        # indistinguishable from a matcher that silently stopped matching. The note
+        # above about comparing stock DuckDB against itself would then be true of
+        # every iteration rather than of the grouped ones.
+        script += f"SELECT '{SEPARATOR}';\nSET factorize_mode='force';\nEXPLAIN {query}\n"
+
         blocks, error = run(script)
-        if len(blocks) != 3:
+        if len(blocks) != 4:
             failures += 1
-            print(f"-- iteration {iteration}: expected three answers, got {blocks} {error}")
+            print(f"-- iteration {iteration}: expected three answers and a plan, got {blocks} {error}")
             print(script)
             continue
-        off, force, auto = blocks
+        off, force, auto, plan = blocks
+        if any("FACTORIZED" in line for line in plan):
+            fired += 1
         if off != force or off != auto:
             failures += 1
             print(f"-- iteration {iteration}: off={off} force={force} auto={auto}")
             print(script)
 
-    print(f"{iterations} random queries, {failures} disagreements", file=sys.stderr)
-    return 1 if failures else 0
+    print(f"{iterations} random queries, {failures} disagreements, {fired} taken over",
+          file=sys.stderr)
+    if failures:
+        return 1
+    if not fired:
+        print("no query was taken over by the rule: this run compared stock DuckDB "
+              "against itself and shows nothing", file=sys.stderr)
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
