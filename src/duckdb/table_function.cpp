@@ -266,6 +266,61 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 	}
 }
 
+//! `factorized_stats(tables, joins)`: the count, and what it cost to get -- the
+//! records the f-representation held, the bytes they occupied, and the slices
+//! the answer was assembled from.
+//!
+//! This exists so the gate's estimates can be checked against what actually
+//! happened. The gate decides by predicting two sizes and two times, and until
+//! now none of the four was observable from SQL: a decline could be wrong
+//! because it misjudged the join, or because a fitted coefficient does not
+//! describe the query, and nothing distinguished them. Refitting the model
+//! needs the same numbers, which is why the two calibration scripts both
+//! required a corpus nobody has downloaded.
+void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+	auto &bind_data = data.bind_data->Cast<FactorizedCountBindData>();
+
+	const auto &config = DBConfig::GetConfig(context);
+	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
+	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
+	                            : config.options.maximum_memory;
+	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+
+	const auto plan = factorize::BuildPlan(bind_data.graph);
+	if (!plan.complete) {
+		throw InvalidInputException("factorized_stats: %s", plan.reason);
+	}
+	StorageSource source(context, bind_data.relations);
+	const auto result =
+	    factorize::ExecuteCountWithinMemory(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
+	if (!result.ok) {
+		throw InvalidInputException("factorized_stats: %s", result.error);
+	}
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(result.count));
+	output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(result.records)));
+	output.SetValue(2, 0, Value::BIGINT(static_cast<int64_t>(result.bytes)));
+	output.SetValue(3, 0, Value::BIGINT(static_cast<int64_t>(result.slices)));
+}
+
+unique_ptr<FunctionData> BindStats(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = Bind(context, input, return_types, names);
+	return_types.clear();
+	names.clear();
+	for (const char *name : {"count", "records", "bytes", "slices"}) {
+		return_types.emplace_back(LogicalType::BIGINT);
+		names.emplace_back(name);
+	}
+	return result;
+}
+
 unique_ptr<FunctionData> BindExists(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = Bind(context, input, return_types, names);
@@ -478,6 +533,13 @@ void RegisterFactorizedCount(ExtensionLoader &loader) {
 	    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
 	    ExecuteGroupCount, BindGroupCount, InitGlobal);
 	loader.RegisterFunction(group_count);
+
+	// The count beside what it cost, so the gate's predictions can be compared
+	// against the sizes that actually occurred rather than trusted.
+	TableFunction stats("factorized_stats",
+	                    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
+	                    ExecuteStats, BindStats, InitGlobal);
+	loader.RegisterFunction(stats);
 
 	TableFunction function("factorized_count",
 	                       {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},

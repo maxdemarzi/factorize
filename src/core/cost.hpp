@@ -132,26 +132,42 @@ struct CostThresholds {
 	//! pessimistic about the engine it is choosing and optimistic about the one
 	//! it is rejecting, or its errors all point at regressions.
 	//!
-	//! The per-input-row term is re-fitted (scripts/refit-cost.py) against the
-	//! extension actually running inside DuckDB, which made it 5.5x more
-	//! expensive than the harness measurement it replaces: 2.214e-4 was fitted
-	//! on the standalone benchmark, and the engine in situ is slower than the
-	//! engine on a bench. The per-record term is inherited, because these
-	//! measurements cannot separate it.
-	EngineCost ours {0.0, 1.225e-3, 1.694e-4};
+	//! Re-fitted a second time (scripts/calibrate-synthetic.py), and the change
+	//! is structural rather than a nudge. The previous value pinned startup_ms
+	//! to 0, so the per-input-row slope had to carry the fixed cost as well --
+	//! and a slope carrying an intercept over-charges by that intercept times
+	//! every row. On a 91,000-row star it predicted 123ms for a query that runs
+	//! in 3.5ms, a 35x error, and the gate declined a 27x win because of it.
+	//!
+	//! A free intercept is the difference between a model that is imprecise and
+	//! one that cannot express the shape at all. Held out on half the grid, this
+	//! predicts 1.63x of actual at the median (pessimistic, as it must be) with
+	//! a worst case of 7.5x on a chain whose records the model over-charges.
+	EngineCost ours {0.108542, 2.445e-5, 3.961e-5};
 	//! DuckDB's cost, fitted to sit below 25% of observed runs.
 	//!
-	//! Also re-fitted, and this is where the gate was going wrong. The old
-	//! per-result-tuple charge of 3.946e-5 ms/tuple is 45x DuckDB's measured
-	//! cost, because for a `count(*)` DuckDB carries no payload columns through
-	//! the join -- the tuples flowing through its pipeline are empty, and it
-	//! counts them at a rate the old constant did not imagine. Over-charging
-	//! DuckDB per tuple is precisely the error that makes a gate fire on queries
-	//! DuckDB was about to win, and it fired on seven of them.
+	//! Re-fitted twice, and it has now been wrong in both directions. The
+	//! original 3.946e-5 ms/tuple over-charged DuckDB and made the gate fire on
+	//! seven queries DuckDB was about to win. The correction to 8.788e-7 went
+	//! too far the other way: measured on a release build, DuckDB does 27M
+	//! tuples in 94ms, which is 3.5e-6 ms/tuple, so it under-charged by 4x.
 	//!
-	//! These are this machine's numbers. That is not a disclaimer to be
-	//! apologised for -- it is why the fitting script is checked in.
-	EngineCost duckdb {9.799, 1.105e-6, 8.788e-7};
+	//! Under-charging looks like the safe direction and is not, because of the
+	//! floor below. With DuckDB predicted at 0.88ns/tuple its *work* never
+	//! reaches min_duckdb_work_ms on anything short of a 10^10-tuple join, so
+	//! the floor declined every query regardless of what our side cost. Measured
+	//! across 15 synthetic shapes the old pair fired on none of them, including
+	//! ones the engine wins by 8.8x.
+	//!
+	//! This value is 10x *below* the 3.946e-5 that caused the seven regressions,
+	//! which bounds the risk of having moved back toward it.
+	//!
+	//! These are this machine's numbers, fitted on synthetic uniform data. That
+	//! is not a disclaimer to be apologised for -- it is why the fitting script
+	//! is checked in, and why calibrate-synthetic.py needs no corpus: the two
+	//! scripts that came before it required a 5.3GB download, so in practice the
+	//! coefficients could not be re-fitted at all, only inherited.
+	EngineCost duckdb {0.0, 2.324e-5, 3.981e-6};
 	//! Fire only when we are predicted to beat DuckDB by this factor.
 	double margin = 1.5;
 	//! Bytes an f-representation record occupies: a fixed header plus a slot

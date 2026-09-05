@@ -1472,3 +1472,112 @@ RESET disabled_optimizers;
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# Shapes the engine LOSES on, which the gate has to decline.
+#
+# These are here because the calibration grid that fitted the current
+# coefficients was made entirely of fan-out shapes -- stars and chains where
+# factorization has something to exploit. A grid like that is one the engine was
+# always going to win, so every error that makes the gate fire too eagerly is
+# invisible in it. Measured under 'force' on this machine, both of these are
+# slower than stock, and the gate declining them is the whole product.
+#-----------------------------------------------------------------------------
+
+# A join on a unique key: no fan-out anywhere, so the f-representation is the
+# same size as the flat result and pays for structure it never uses. The
+# estimator sees this correctly -- it predicts compression of 0.6x, i.e. a
+# representation *larger* than the tuples it stands for. Measured: 4ms stock,
+# 16ms forced, so firing here would be a 4x regression.
+statement ok
+CREATE TABLE nofan_a AS SELECT i AS k, i AS v FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE nofan_b AS SELECT i AS k, i AS v FROM range(200000) t(i);
+
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT count(*) FROM nofan_a, nofan_b WHERE nofan_a.k = nofan_b.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM nofan_a, nofan_b WHERE nofan_a.k = nofan_b.k;
+----
+200000
+
+# Forced, the answer is still right -- the gate decides speed, never meaning.
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM nofan_a, nofan_b WHERE nofan_a.k = nofan_b.k;
+----
+200000
+
+# A star too small to be worth anything: DuckDB finishes in under a millisecond,
+# so there is nothing to win and our fixed costs are the entire runtime. Caught
+# by the floor rather than the margin, which is a different decline for a
+# different reason and worth exercising separately.
+statement ok
+CREATE TABLE tiny_h AS SELECT i AS k FROM range(100) t(i);
+
+statement ok
+CREATE TABLE tiny_a AS SELECT i % 100 AS k FROM range(500) t(i);
+
+statement ok
+CREATE TABLE tiny_b AS SELECT i % 100 AS k FROM range(500) t(i);
+
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT count(*) FROM tiny_h, tiny_a, tiny_b
+ WHERE tiny_h.k = tiny_a.k AND tiny_h.k = tiny_b.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM tiny_h, tiny_a, tiny_b WHERE tiny_h.k = tiny_a.k AND tiny_h.k = tiny_b.k;
+----
+2500
+
+# And the converse, so this section is not only about refusing: a chain of three
+# is the shape the folklore calls hopeless -- nothing is independent, so the
+# representation is the same order as the flat result -- and it still wins,
+# because the win here is not compression but that the join is never
+# materialised. Measured 148ms stock against 6ms, and the gate takes it.
+statement ok
+CREATE TABLE ch_p AS SELECT i % 50 AS s, (i * 7) % 50 AS d FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE ch_q AS SELECT i % 50 AS s, (i * 7) % 50 AS d FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE ch_r AS SELECT i % 50 AS s, (i * 7) % 50 AS d FROM range(5000) t(i);
+
+query II
+EXPLAIN SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
+----
+50000000
+
+statement ok
+SET factorize_mode = 'auto';
+
+query I
+SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
+----
+50000000
+
+statement ok
+SET factorize_mode = 'off';

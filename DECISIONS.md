@@ -879,3 +879,112 @@ breadth and corpus size are different quantities, and this project has size.**
 The 99.3% acyclic coverage figure measured against CE is a statement about one
 query shape, and reporting it without that qualification would turn a
 matcher-coverage number into an implied claim about SQL in general.
+
+## D26 — The gate declined everything, and a threshold is why
+
+Measured on a synthetic star -- 1000 keys, three arms of 30000 rows, a 27
+million tuple join -- the engine is **32x faster** than stock DuckDB and
+`factorize_mode='auto'` **declined it**. So did every other aggregate shape over
+the same join, with an identical prediction: 123ms for us against 21ms for
+DuckDB. On a release build the truth is 3ms against 96ms.
+
+That is not a coverage problem. Multi-column `GROUP BY`, `sum`, and
+multi-expression aggregates all landed in the preceding commits, and on this
+shape, in the mode a user actually gets, none of them did anything.
+
+**Two errors, and they interact through a threshold rather than multiplying.**
+
+    ours    123ms predicted,   3.5ms actual    35x pessimistic
+    duckdb   21ms predicted,    94ms actual    4.5x optimistic
+
+The obvious move -- fix our own side, the larger error, and leave DuckDB
+under-charged because that is the conservative direction -- **fires on nothing**.
+Measured across 15 shapes it changed no decision at all. `min_duckdb_work_ms`
+compares against `duckdb_ms - startup_ms`, and with DuckDB charged 0.88ns per
+tuple its predicted *work* does not reach 10ms until roughly 10^10 tuples. The
+floor was refusing every query regardless of what our side cost.
+
+So under-charging the engine you are trying to beat is not the safe direction
+when a floor sits underneath the comparison. **A threshold turns an
+under-estimate into a blanket refusal**, and no amount of accuracy on the other
+side of the comparison can recover it.
+
+**Why our own side was 35x out, and it is structural.** `ours.startup_ms` was
+pinned to 0, so the per-input-row slope had to carry the fixed cost as well. A
+slope carrying an intercept over-charges by that intercept times every row: at
+91,000 rows it predicted 111ms of scan for a query that runs end to end in
+3.5ms. A free intercept is the difference between a model that is imprecise and
+one that cannot express the shape at all.
+
+    ours    {0.0,   1.225e-3, 1.694e-4}  ->  {0.108542, 2.445e-5, 3.961e-5}
+    duckdb  {9.799, 1.105e-6, 8.788e-7}  ->  {0.0,      2.324e-5, 3.981e-6}
+
+The DuckDB per-tuple value has now been wrong in both directions: 3.946e-5
+over-charged and caused D19's seven regressions; 8.788e-7 under-charged and
+caused this. The new value is 10x *below* the one that caused regressions, which
+bounds the risk of having moved back toward it.
+
+**Measured, 15 shapes, release build, held-out validation:**
+
+                        fires-and-wins   misses a >=2.5x win   regressions
+    shipped                    0                  6                 0
+    ours refitted only         0                  6                 0
+    both refitted              3                  3                 0
+
+End to end, `off` against `auto` rather than against `force`, which is the
+question a user asks:
+
+    star n=3 d=1000  r=100000    36ms -> 15ms   2.40x
+    star n=4 d=10000 r=100000    53ms ->  8ms   6.62x
+    star n=5 d=1000  r=10000     46ms ->  5ms   9.20x
+    the 27M star                 96ms ->  3ms  ~32x
+    the other 12 shapes          declined, unchanged
+
+**The grid was win-shaped, which is the criticism that mattered most.** Every
+shape in it was a star or a chain -- shapes with fan-out, where factorization
+has something to exploit and the engine was always going to win. A fit validated
+against such a grid is validated against nothing, because every error that makes
+the gate fire *too eagerly* is invisible in it. Two counter-shapes now sit in
+the grid and in the test suite:
+
+  - a join on a unique key, no fan-out anywhere, where the representation is the
+    same size as the flat result and pays for structure it never uses. Forced,
+    4ms becomes 16ms. The estimator sees it: predicted compression 0.6x, a
+    representation *larger* than the tuples it stands for. Declined.
+  - a star too small to matter, where DuckDB finishes in under a millisecond.
+    Declined by the floor, which is a different refusal for a different reason
+    and worth exercising separately.
+
+Across all 22 shapes under `auto`, including the ones chosen to lose, **nothing
+is slower than 1.00x**.
+
+And the converse belongs here too, because it contradicts the folklore: a chain
+of three is the shape where nothing is independent and the representation is the
+same order as the flat result. It wins **24x** anyway -- 148ms against 6ms --
+because the win is not compression, it is that the join is never materialised.
+A gate reasoning about compression would decline it. D14 already chose to
+compare predicted *times* instead; the chain is the case that proves the
+distinction was worth making.
+
+**The real bug was that nothing could tell you.** `refit-cost.py` and
+`calibrate-gate.sh` both read `tmp/ce_runnable.psv`, so re-fitting needed a
+5.3 GB corpus nobody had downloaded: on a fresh checkout the coefficients could
+only be inherited, which is the one thing DECISIONS O11 says not to do with
+them. And none of the four quantities the gate reasons about was observable from
+SQL, so a wrong decline could not be diagnosed from outside -- the decline
+message printed the two times and withheld the two sizes, which were printed
+only on the firing path, where nothing needed diagnosing.
+
+`scripts/calibrate-synthetic.py` needs nothing but `range()`.
+`factorized_stats(tables, joins)` returns count, records, bytes and slices.
+Declines now carry the sizes.
+
+**Caveats, since this is a calibration.** Synthetic uniform data, one machine.
+F18 records that our flat estimate is *already* weakest on uniform data, so this
+describes the friendly case: it is a way to find a coefficient wrong by an order
+of magnitude, not a substitute for calibrating against a corpus resembling the
+user's queries. And two measurement bugs were caught in the harness before it
+was trusted -- `-c` does not interpret dot commands, so `.timer on` silently
+produced no timings; and `SET` emits its own ~0ms `Run Time` line, so taking a
+minimum reported 1.0ms for both modes on a query that takes 94ms and 3.5ms.
+Both would have fitted coefficients confidently on garbage.

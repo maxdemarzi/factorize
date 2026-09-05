@@ -250,8 +250,17 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		return estimate;
 	}
 	if (estimate.duckdb_ms < thresholds.margin * estimate.ours_ms) {
+		// The sizes go in the decline too, not only the times, and not only when
+		// it fires. A decline reading "123ms against 21ms" says the gate said no
+		// and nothing about why, so the two ways it can be wrong -- a misjudged
+		// join size, or a per-tuple coefficient that does not describe this
+		// query -- are indistinguishable from outside. That is the asymmetry
+		// that hid a 24x win: the numbers needed to diagnose a decline were
+		// printed only on the path where nothing needed diagnosing.
 		estimate.reason = "predicted " + Millis(estimate.ours_ms) + "ms against DuckDB's " +
-		                  Millis(estimate.duckdb_ms) + "ms, under the " + Round(thresholds.margin) + "x margin";
+		                  Millis(estimate.duckdb_ms) + "ms, under the " + Round(thresholds.margin) +
+		                  "x margin; estimated " + Format(estimate.flat_tuples) + " tuples in " +
+		                  Format(estimate.factorized_records) + " records, compressed " + Round(estimate.ratio) + "x";
 		return estimate;
 	}
 
