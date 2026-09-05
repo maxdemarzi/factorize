@@ -86,7 +86,23 @@ struct FactorizedRegion {
 	//! The matcher declines constantly and silently by design, which means the
 	//! default experience of a misbehaving rule is nothing visibly happening.
 	//! This exists because that cost a whole rebuild cycle to diagnose once.
+	//!
+	//! The FIRST reason found, which is the one to show: it is the outermost
+	//! thing wrong with the query and usually the one a user can act on.
 	string decline;
+	//! Every reason found, not just the first.
+	//!
+	//! `decline` alone cannot answer "what would this query need in order to
+	//! match", because the matcher used to stop at the first failure and a
+	//! blocker sitting behind another one was invisible. That made the reason
+	//! counts unusable for exactly the question they were reached for: an
+	//! estimate built on them predicted +47 queries and shipping delivered +2,
+	//! because "one reported reason" is not "one blocker". Collecting all of
+	//! them makes the counts mean what they appear to mean.
+	//!
+	//! Order is the order found, outermost first, so `declines.front()` is
+	//! `decline`.
+	vector<string> declines;
 	vector<reference<LogicalGet>> relations;
 	//! The filter sitting above each relation's scan, if any. Parallel to
 	//! `relations`.
@@ -117,9 +133,19 @@ struct FactorizedRegion {
 };
 
 //! Records why a subtree was turned down and declines it. Always returns false,
-//! so every rejection site reads as `return Decline(region, "...")`.
+//! so every rejection site reads as `return Decline(region, "...")` where
+//! stopping is required, and as a bare `Decline(region, "...")` beside a
+//! cleared `ok` flag where the walk can safely carry on and find more.
+//!
+//! Carrying on is not always safe: a check whose failure makes the code below
+//! it meaningless -- a cast that would be wrong, a child that may not exist --
+//! must still stop. The rule is that a site keeps walking only when what
+//! follows does not depend on the thing that just failed.
 static bool Decline(FactorizedRegion &region, string reason) {
-	region.decline = std::move(reason);
+	if (region.decline.empty()) {
+		region.decline = reason;
+	}
+	region.declines.push_back(std::move(reason));
 	return false;
 }
 
@@ -184,36 +210,61 @@ static bool MatchJoinGraph(LogicalOperator &op, FactorizedRegion &region) {
 		return MatchLeaf(op, region);
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
+	bool ok = true;
 	if (join.join_type != JoinType::INNER) {
-		return Decline(region, "join is " + JoinTypeToString(join.join_type) + ", not INNER");
+		// Recorded rather than returned: what is wrong with this join says
+		// nothing about the subtrees under it, and those are where most of the
+		// other blockers live. Stopping here is what made the join type look
+		// like a rare blocker when the aggregate above simply reached its own
+		// verdict first.
+		Decline(region, "join is " + JoinTypeToString(join.join_type) + ", not INNER");
+		ok = false;
 	}
 	if (!join.duplicate_eliminated_columns.empty()) {
 		// Delim joins carry correlated-subquery machinery the region cannot model.
-		return Decline(region, "join is duplicate-eliminated");
+		Decline(region, "join is duplicate-eliminated");
+		ok = false;
 	}
 	if (join.predicate) {
 		// An ON-clause restriction that references only one side. It filters the
 		// join's output and nothing outside the region would apply it.
-		return Decline(region, "join carries an ON-clause filter");
+		Decline(region, "join carries an ON-clause filter");
+		ok = false;
 	}
-	if (join.conditions.empty() || join.children.size() != 2) {
-		return Decline(region, "join has no conditions");
+	if (join.conditions.empty()) {
+		Decline(region, "join has no conditions");
+		ok = false;
+	}
+	if (join.children.size() != 2) {
+		// The one that has to stop: everything below reads children[0] and
+		// children[1], so carrying on would be reading operators that are not
+		// there.
+		Decline(region, "join does not have two children");
+		return false;
 	}
 	for (auto &cond : join.conditions) {
 		if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-			return Decline(region, "join condition is not an equality");
+			Decline(region, "join condition is not an equality");
+			ok = false;
+			continue;
 		}
 		// A cast, or any other computed expression, would have to be evaluated
 		// on values the f-representation holds in packed integer slots. Only a
 		// bare column reference maps onto one.
 		if (cond.left->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
 		    cond.right->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			return Decline(region, "join key is computed, not a plain column");
+			Decline(region, "join key is computed, not a plain column");
+			ok = false;
+			continue;
 		}
 		region.edges.emplace_back(cond.left->Cast<BoundColumnRefExpression>().binding,
 		                          cond.right->Cast<BoundColumnRefExpression>().binding);
 	}
-	return MatchJoinGraph(*join.children[0], region) && MatchJoinGraph(*join.children[1], region);
+	// Both sides, always: `&&` would have skipped the second subtree whenever
+	// the first declined, hiding every blocker on the right of a bad left.
+	const bool left = MatchJoinGraph(*join.children[0], region);
+	const bool right = MatchJoinGraph(*join.children[1], region);
+	return ok && left && right;
 }
 
 //! Accepts zero or more pure column-pruning projections above the join graph.
@@ -222,6 +273,7 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 		return MatchJoinGraph(op, region);
 	}
 	auto &proj = op.Cast<LogicalProjection>();
+	bool ok = true;
 	for (auto &expr : proj.expressions) {
 		if (expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 			// A constant per row changes no row's existence, so it changes no
@@ -235,19 +287,26 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 			// before an aggregate and widens it again afterwards. Reproducing
 			// that transformation here would tie this rule to the semantics of
 			// an internal function; declining says so, and names the way out.
-			return Decline(region, "compressed materialization is in the way; "
-			                       "SET disabled_optimizers='compressed_materialization' to factorize this");
+			Decline(region, "compressed materialization is in the way; "
+			                "SET disabled_optimizers='compressed_materialization' to factorize this");
+			ok = false;
+			continue;
 		}
 		if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			// Any other computed expression would have to be evaluated on
 			// flattened tuples, which the sealed island does not produce.
-			return Decline(region, "projection computes an expression");
+			Decline(region, "projection computes an expression");
+			ok = false;
+			continue;
 		}
 	}
 	if (proj.children.size() != 1) {
-		return Decline(region, "projection has no single child");
+		// Has to stop: there is no single child to descend into.
+		Decline(region, "projection has no single child");
+		return false;
 	}
-	return MatchProjections(*proj.children[0], region);
+	const bool below = MatchProjections(*proj.children[0], region);
+	return ok && below;
 }
 
 //! Accepts an ungrouped COUNT(*) -- v1's only aggregate (plan §1.1). The
@@ -257,9 +316,16 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		return false;
 	}
 	auto &aggr = op.Cast<LogicalAggregate>();
+	// Recorded, not returned. Everything wrong with the aggregate is local to
+	// this node, and the join graph underneath is walked regardless -- which is
+	// the whole point: an aggregate blocker used to hide every blocker below it,
+	// so the reason counts measured which check ran first rather than what a
+	// query would need.
+	bool ok = true;
 	if (!aggr.grouping_functions.empty() || aggr.grouping_sets.size() > 1) {
 		// GROUPING SETS / ROLLUP ask for several groupings at once.
-		return Decline(region, "aggregate has grouping sets");
+		Decline(region, "aggregate has grouping sets");
+		ok = false;
 	}
 	if (!aggr.groups.empty()) {
 		// Any number of grouping columns. This used to stop at one, on the
@@ -275,18 +341,21 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		region.group_index = aggr.group_index;
 		for (auto &group : aggr.groups) {
 			if (group->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-				return Decline(region, "aggregate groups on a computed expression");
+				Decline(region, "aggregate groups on a computed expression");
+				ok = false;
+				continue;
 			}
 			region.group_bindings.push_back(group->Cast<BoundColumnRefExpression>().binding);
 			region.group_types.push_back(group->return_type);
 		}
 	}
 	if (aggr.expressions.empty()) {
-		return Decline(region, "aggregate computes nothing");
+		Decline(region, "aggregate computes nothing");
+		ok = false;
 	}
 	if (aggr.expressions.size() > factorize::kMaxAggregates) {
-		return Decline(region, "aggregate computes more than " + std::to_string(factorize::kMaxAggregates) +
-		                           " values");
+		Decline(region, "aggregate computes more than " + std::to_string(factorize::kMaxAggregates) + " values");
+		ok = false;
 	}
 	region.aggregate_index = aggr.aggregate_index;
 	// Several aggregates are folded side by side in one walk of the
@@ -297,11 +366,17 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 	// hiding them behind an earlier refusal.
 	for (auto &expression : aggr.expressions) {
 		if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
-			return Decline(region, "aggregate expression is not an aggregate");
+			// Has to stop looking at THIS expression: the cast below would be
+			// wrong. The walk still continues to the next one.
+			Decline(region, "aggregate expression is not an aggregate");
+			ok = false;
+			continue;
 		}
 		auto &bound = expression->Cast<BoundAggregateExpression>();
 		if (bound.IsDistinct() || bound.filter || bound.order_bys) {
-			return Decline(region, "aggregate is DISTINCT, FILTERed or ORDERed");
+			Decline(region, "aggregate is DISTINCT, FILTERed or ORDERed");
+			ok = false;
+			continue;
 		}
 		RegionAggregate entry;
 		entry.type = expression->return_type;
@@ -315,26 +390,34 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			// than evaluated.
 			if (bound.children.size() != 1 ||
 			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-				return Decline(region, "sum() of a computed expression");
+				Decline(region, "sum() of a computed expression");
+				ok = false;
+				continue;
 			}
 			entry.kind = factorize::Aggregate::SUM;
 			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
 		} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
-			return Decline(region, "aggregate is " + name + "(), not count(*) or sum()");
+			Decline(region, "aggregate is " + name + "(), not count(*) or sum()");
+			ok = false;
+			continue;
 		}
 		region.aggregates.push_back(std::move(entry));
 	}
 	if (aggr.children.size() != 1) {
-		return Decline(region, "aggregate has no single child");
-	}
-	if (!MatchProjections(*aggr.children[0], region)) {
+		// Has to stop: there is no single child to walk.
+		Decline(region, "aggregate has no single child");
 		return false;
 	}
+	// Always walked, even when the aggregate above is already refused, because
+	// what a query needs in order to match is the UNION of its blockers and
+	// this is where most of them are.
+	const bool below = MatchProjections(*aggr.children[0], region);
 	if (region.relations.size() < 2 || region.edges.empty()) {
 		// A single relation has nothing to factorize.
-		return Decline(region, "fewer than two joined relations");
+		Decline(region, "fewer than two joined relations");
+		ok = false;
 	}
-	return true;
+	return ok && below;
 }
 
 //===--------------------------------------------------------------------===//
@@ -977,6 +1060,14 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 	// about are exactly the ones where the match itself failed.
 	if (explain && !region.decline.empty()) {
 		Printer::Print("[factorize] declined: " + region.decline);
+		// The rest, when there are more. The first line stays as it was so that
+		// reading one reason still works; these are what turn the reason counts
+		// into an answer to "what would this query need", which the first line
+		// alone cannot give -- it names whichever check ran first, not the set
+		// of things standing in the way.
+		for (size_t i = 1; i < region.declines.size(); i++) {
+			Printer::Print("[factorize] also: " + region.declines[i]);
+		}
 	}
 	for (auto &child : op->children) {
 		RewriteRecursive(context, child, gated, explain);
