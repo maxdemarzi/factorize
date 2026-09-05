@@ -54,7 +54,20 @@ static void Expect(bool condition, const std::string &what) {
 	std::printf("  FAIL %s\n", what.c_str());
 }
 
+//! A group is only "ok" if nothing inside it failed.
+//!
+//! This printed ok unconditionally, so a group with failing checks showed
+//! its FAIL lines and then said ok on the next line. The totals and the
+//! exit code were right, so CI still caught it -- but a human scanning
+//! output reads the last line of a group, and that line was a lie.
+static int g_reported = 0;
+
 static void Report(const std::string &group) {
+	if (g_failures > g_reported) {
+		g_reported = g_failures;
+		std::printf("  FAIL %s\n", group.c_str());
+		return;
+	}
 	std::printf("  ok   %s\n", group.c_str());
 }
 
