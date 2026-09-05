@@ -39,6 +39,11 @@ public:
 	LogicalType group_type = LogicalType::BIGINT;
 	size_t group_relation = 0;
 	size_t group_column = 0;
+	//! Which fold to run, and for sum, which column and result type.
+	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
+	size_t sum_relation = 0;
+	size_t sum_column = 0;
+	LogicalType sum_type = LogicalType::HUGEINT;
 
 public:
 	string GetName() const override;

@@ -795,3 +795,128 @@ SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP 
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# sum(). The aggregate that actually appears in analytics SQL: across the 99
+# TPC-DS optimized plans it occurs 193 times over inner-only join graphs against
+# 24 for count(*). Counting multiplies; summing weights a slot's values by how
+# many tuples the other slots make, which is the semiring product of §4.5.
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE s_hub AS SELECT * FROM (VALUES (1), (2)) t(k);
+
+statement ok
+CREATE TABLE s_arm AS SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30)) t(k, v);
+
+statement ok
+CREATE TABLE s_other AS SELECT * FROM (VALUES (1), (1), (2)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+# s_arm's values are each seen once per matching s_other row: k=1 has two such
+# rows, so 10 and 20 count twice; k=2 has one, so 30 counts once.
+query I
+SELECT sum(s_arm.v) FROM s_hub, s_arm, s_other
+ WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k;
+----
+90
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(s_arm.v) FROM s_hub, s_arm, s_other
+ WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k;
+----
+90
+
+query II
+EXPLAIN SELECT sum(s_arm.v) FROM s_hub, s_arm, s_other
+ WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Summing a join key works too, and is the case where the value sits at the top
+# of the tree rather than in a branch.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(s_hub.k) FROM s_hub, s_arm, s_other WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k;
+----
+6
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(s_hub.k) FROM s_hub, s_arm, s_other WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k;
+----
+6
+
+# sum with GROUP BY: both generalisations at once.
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+statement ok
+SET factorize_mode = 'off';
+
+query II
+SELECT s_hub.k, sum(s_arm.v) FROM s_hub, s_arm, s_other
+ WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k GROUP BY s_hub.k ORDER BY 1;
+----
+1	60
+2	30
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT s_hub.k, sum(s_arm.v) FROM s_hub, s_arm, s_other
+ WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k GROUP BY s_hub.k ORDER BY 1;
+----
+1	60
+2	30
+
+statement ok
+RESET disabled_optimizers;
+
+# A row that joins with nothing contributes nothing to the sum.
+statement ok
+CREATE TABLE s_lonely AS SELECT * FROM (VALUES (1, 5), (99, 100000)) t(k, v);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(s_lonely.v) FROM s_lonely, s_hub WHERE s_lonely.k = s_hub.k;
+----
+5
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(s_lonely.v) FROM s_lonely, s_hub WHERE s_lonely.k = s_hub.k;
+----
+5
+
+# The fold is over integers, so a DECIMAL column is declined -- and answered.
+statement ok
+CREATE TABLE s_money AS SELECT * FROM (VALUES (1, 1.50), (2, 2.25)) t(k, amount);
+
+query I
+SELECT sum(s_money.amount) FROM s_money, s_hub WHERE s_money.k = s_hub.k;
+----
+3.75
+
+# sum of a computed expression is not a fold over a stored column.
+query I
+SELECT sum(s_arm.v * 2) FROM s_hub, s_arm WHERE s_hub.k = s_arm.k;
+----
+120
+
+statement ok
+SET factorize_mode = 'off';

@@ -42,6 +42,13 @@ public:
 	//! Which of the region's columns the grouping key is.
 	size_t group_relation = 0;
 	size_t group_column = 0;
+	//! Which fold to run, and for sum, which column carries the values and what
+	//! type the answer has to come back as. DuckDB widens sum to HUGEINT even
+	//! over narrow integers, and the operators above were bound against that.
+	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
+	size_t sum_relation = 0;
+	size_t sum_column = 0;
+	LogicalType sum_type = LogicalType::HUGEINT;
 	//! The tables to scan, and the columns of each that a predicate touches.
 	vector<BoundRelation> relations;
 	//! The join graph, indexed by position in `relations`.

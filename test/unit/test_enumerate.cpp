@@ -237,6 +237,80 @@ static void TestGroupOnDeepKeyDeclines() {
 	Report("a grouping key that is not at the top is declined rather than guessed");
 }
 
+//! Summing is not counting, and the difference is a weight. A value in one
+//! child slot appears once per combination of the *other* slots, so its
+//! contribution is its slot's sum times how many tuples the rest make. Getting
+//! that weight wrong is invisible on a two-relation join, where it is 1 -- so
+//! this checks against enumeration, which cannot be fooled by it.
+static void TestSumMatchesEnumeration() {
+	MemorySource source;
+	// A star: the hub joins two arms, so a hub value is multiplied by the
+	// product of the arms' matching rows, and each arm's values are weighted by
+	// the other arm's count.
+	source.Add({{1, 2}});          // hub(k)
+	source.Add({{1, 1, 2}});       // arm1(k): two rows for k=1
+	source.Add({{1, 2, 2, 2}});    // arm2(k): one for k=1, three for k=2
+	// Values to sum live on arm1, which is neither the root nor alone.
+	QueryGraph graph;
+	graph.column_counts = {1, 1, 1};
+	graph.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	// Enumerate and add up by hand: whatever the fold says, this is the answer.
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "sum: materialize succeeds (" + materialized.error + ")");
+	for (size_t column = 0; column < 3; column++) {
+		int64_t by_hand = 0;
+		for (const auto &tuple : materialized.tuples) {
+			by_hand += tuple[column];
+		}
+		const auto folded = ExecuteSum(graph, plan, source, JoinMode::BOTTOM_INSERT, column, 0);
+		Expect(folded.ok, "sum: fold succeeds for relation " + std::to_string(column) + " (" + folded.error + ")");
+		Expect(folded.count == by_hand, "sum: relation " + std::to_string(column) + " folds to " +
+		                                    std::to_string(folded.count) + ", enumeration gives " +
+		                                    std::to_string(by_hand));
+	}
+	Report("summing a column agrees with enumerating and adding up, at every position in the tree");
+}
+
+//! A column whose rows join with nothing must contribute nothing, and a group
+//! of zeroes must still be a group.
+static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
+	MemorySource source;
+	source.Add({{1, 2, 3}, {10, 20, 999}}); // left(k, v): k=3 joins nothing
+	source.Add({{1, 2}});                   // right(k)
+
+	QueryGraph graph;
+	graph.column_counts = {2, 1};
+	graph.column_types = {{ValueType::INT64, ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}};
+	const auto plan = BuildPlan(graph);
+
+	const auto folded = ExecuteSum(graph, plan, source, JoinMode::BOTTOM_INSERT, 0, 1);
+	Expect(folded.ok, "sum: succeeds (" + folded.error + ")");
+	Expect(folded.count == 30, "sum: 999 joins nothing and must not be summed; got " + std::to_string(folded.count));
+
+	// Zeroes: the group exists, and its sum is 0.
+	MemorySource zeroes;
+	zeroes.Add({{1, 1}, {0, 0}});
+	zeroes.Add({{1}});
+	QueryGraph zero_graph;
+	zero_graph.column_counts = {2, 1};
+	zero_graph.column_types = {{ValueType::INT64, ValueType::INT64}, {ValueType::INT64}};
+	zero_graph.predicates = {Predicate {0, 0, 1, 0}};
+	const auto zero_plan = BuildPlan(zero_graph);
+	auto grouped = ExecuteGroupSum(zero_graph, zero_plan, zeroes, JoinMode::BOTTOM_INSERT, 0, 0, 0, 1);
+	Expect(grouped.ok, "sum: grouped sum succeeds (" + grouped.error + ")");
+	Expect(grouped.groups.size() == 1, "sum: a group whose values are all zero is still a group, got " +
+	                                       std::to_string(grouped.groups.size()));
+	if (!grouped.groups.empty()) {
+		Expect(grouped.groups[0].second == 0, "sum: that group's sum is 0, got " +
+		                                          std::to_string(grouped.groups[0].second));
+	}
+	Report("unmatched rows contribute nothing, and a group summing to zero is still a group");
+}
+
 int main() {
 	std::printf("factorize core: enumerate\n\n");
 	TestEnumerationMatchesTheJoin();
@@ -248,6 +322,10 @@ int main() {
 	TestGroupCountMatchesEnumeration();
 	std::printf("\n");
 	TestGroupOnDeepKeyDeclines();
+	std::printf("\n");
+	TestSumMatchesEnumeration();
+	std::printf("\n");
+	TestSumIgnoresUnmatchedAndKeepsZeroGroups();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

@@ -236,6 +236,21 @@ public:
 	//! Cardinality of one subtree, memoized in the record.
 	int64_t SubtreeSize(Record record) const;
 
+	//! Sum of `attribute` over the tuples one subtree denotes, without
+	//! enumerating them (the semiring generalisation, section 4.5).
+	//!
+	//! Counting multiplies; summing does not. A record's tuples are the cross
+	//! product of its child slots, so a value living in one slot appears once
+	//! per combination of the *others* -- its slot's sum is weighted by how many
+	//! tuples the remaining slots produce. That weight is `count / slot_total`,
+	//! which divides exactly because the count is the product of the slot
+	//! totals.
+	//!
+	//! Not memoized, unlike SubtreeSize: the answer depends on which attribute
+	//! is being summed, and a record has one cache slot. Each record is still
+	//! visited once per call, so a sum costs O(|f-rep|) like a count does.
+	int64_t SubtreeSum(Record record, AttributeId attribute) const;
+
 	//===------------------------------------------------------------------===//
 	// Diagnostics
 	//===------------------------------------------------------------------===//

@@ -101,6 +101,10 @@ struct FactorizedRegion {
 	idx_t group_index = 0;
 	ColumnBinding group_binding;
 	LogicalType group_type;
+	//! Which fold the aggregate asks for, and for sum, which column.
+	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
+	ColumnBinding sum_binding;
+	LogicalType sum_type;
 };
 
 //! Records why a subtree was turned down and declines it. Always returns false,
@@ -278,8 +282,21 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		return Decline(region, "aggregate is DISTINCT, FILTERed or ORDERed");
 	}
 	auto name = StringUtil::Lower(bound.function.name);
-	if (name != "count_star" && !(name == "count" && bound.children.empty())) {
-		return Decline(region, "aggregate is " + name + "(), not count(*)");
+	if (name == "sum") {
+		// Summing is the semiring generalisation the plan always had as the
+		// widening step (§4.5), and on TPC-DS it is the aggregate that actually
+		// appears: 193 occurrences over inner-only join graphs against 24 for
+		// count(*). The column has to be a plain column of the region, since it
+		// is folded through the representation rather than evaluated.
+		if (bound.children.size() != 1 ||
+		    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return Decline(region, "sum() of a computed expression");
+		}
+		region.aggregate = factorize::Aggregate::SUM;
+		region.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+		region.sum_type = expr.return_type;
+	} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
+		return Decline(region, "aggregate is " + name + "(), not count(*) or sum()");
 	}
 	if (aggr.children.size() != 1) {
 		return Decline(region, "aggregate has no single child");
@@ -425,7 +442,7 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 
 //! False if any part of the region cannot be expressed, which is a decline.
 static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relations, factorize::QueryGraph &graph,
-                       size_t &group_relation, size_t &group_column) {
+                       size_t &group_relation, size_t &group_column, size_t &sum_relation, size_t &sum_column) {
 	std::map<idx_t, size_t> relation_of_table_index;
 	for (size_t i = 0; i < region.relations.size(); i++) {
 		auto &get = region.relations[i].get();
@@ -589,6 +606,49 @@ static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relation
 		}
 	}
 
+	if (region.aggregate == factorize::Aggregate::SUM) {
+		// The summed column is the first thing the region reads that is not a
+		// join key, so unlike the grouping key it is *added* to the scan rather
+		// than required to be there already. Appended, never inserted: the
+		// predicates above hold local column indices, and inserting would move
+		// the ground under them.
+		auto found = relation_of_table_index.find(region.sum_binding.table_index);
+		if (found == relation_of_table_index.end()) {
+			return Decline(region, "summed column belongs to no relation of the region");
+		}
+		auto &get = region.relations[found->second].get();
+		auto &column_ids = get.GetColumnIds();
+		if (region.sum_binding.column_index >= column_ids.size()) {
+			return Decline(region, "summed column is not among the scanned columns");
+		}
+		auto &column_index = column_ids[region.sum_binding.column_index];
+		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
+			return Decline(region, "summed column is not a stored scalar column");
+		}
+		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+		if (definition.Generated()) {
+			return Decline(region, "summed column is generated");
+		}
+		factorize::ValueType value_type;
+		if (!TryIntegerKeyType(definition.Type(), value_type)) {
+			// DECIMAL would work in principle -- its storage is an integer and a
+			// scale, and summing the integers then applying the scale is exact --
+			// but the result type widens to DECIMAL(38, s) and this engine folds
+			// in int64. Declining is the honest version of that.
+			return Decline(region, "summed column " + definition.Name() + " is " + definition.Type().ToString() +
+			                           ", and the fold is over integers");
+		}
+		auto &bound = relations[found->second];
+		const auto physical = static_cast<idx_t>(definition.Physical().index);
+		if (bound.LocalIndex(physical) < 0) {
+			bound.columns.push_back(physical);
+			bound.column_names.push_back(definition.Name());
+			bound.column_types.push_back(value_type);
+		}
+		sum_relation = found->second;
+		sum_column = static_cast<size_t>(bound.LocalIndex(physical));
+	}
+
 	if (region.grouped) {
 		// The grouping key has to be a column the region reads, and it only
 		// reads join columns: anything else was never scanned, because it cannot
@@ -738,7 +798,9 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 		factorize::QueryGraph graph;
 		size_t group_relation = 0;
 		size_t group_column = 0;
-		if (BindRegion(region, relations, graph, group_relation, group_column)) {
+		size_t sum_relation = 0;
+		size_t sum_column = 0;
+		if (BindRegion(region, relations, graph, group_relation, group_column, sum_relation, sum_column)) {
 			// The join order is decided here rather than at execution: a graph
 			// the planner cannot order (a disconnected one, most of all) has to
 			// be a decline, not a query that fails halfway through running.
@@ -766,6 +828,10 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					replacement->group_type = region.group_type;
 					replacement->group_relation = group_relation;
 					replacement->group_column = group_column;
+					replacement->aggregate = region.aggregate;
+					replacement->sum_relation = sum_relation;
+					replacement->sum_column = sum_column;
+					replacement->sum_type = region.sum_type.id() == LogicalTypeId::INVALID ? LogicalType::HUGEINT : region.sum_type;
 					replacement->estimated_cardinality = 1;
 					replacement->ResolveOperatorTypes();
 					op = std::move(replacement);

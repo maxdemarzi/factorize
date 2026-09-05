@@ -750,11 +750,58 @@ MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const 
 	return result;
 }
 
-GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                                   size_t group_relation, size_t group_column, PathStrategy strategy) {
+ExecuteResult ExecuteSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                         size_t sum_relation, size_t sum_column, PathStrategy strategy) {
+	ExecuteResult result;
+	if (!plan.complete) {
+		result.error = plan.reason.empty() ? "no plan" : plan.reason;
+		return result;
+	}
+	if (sum_relation >= graph.RelationCount() || sum_column >= graph.column_counts[sum_relation]) {
+		result.error = "summed column is not a column of the query";
+		return result;
+	}
+	// The last join cannot be fused: fusing counts the output as it goes, and a
+	// sum needs the column's values, which only exist once the representation
+	// does.
+	auto built = BuildRepresentation(graph, plan, source, mode, strategy);
+	if (!built.ok) {
+		result.error = built.error;
+		result.out_of_memory = built.out_of_memory;
+		return result;
+	}
+	try {
+		const auto &rep = built.relation->Rep();
+		const auto attribute = AttributeOf(graph, sum_relation, sum_column);
+		int64_t total = 0;
+		rep.ForEachRoot([&](Record root) { total = CheckedCardinalityAdd(total, rep.SubtreeSum(root, attribute)); });
+		result.count = total;
+		result.records = rep.RecordCount();
+		result.bytes = rep.BytesAllocated();
+		result.ok = true;
+	} catch (const MemoryLimitExceeded &error) {
+		result.error = error.what();
+		result.out_of_memory = true;
+	} catch (const std::exception &error) {
+		result.error = error.what();
+	}
+	return result;
+}
+
+namespace {
+
+//! The grouped folds differ only in what a root's subtree contributes.
+GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                         size_t group_relation, size_t group_column, Aggregate aggregate, size_t sum_relation,
+                         size_t sum_column, PathStrategy strategy) {
 	GroupCountResult result;
 	if (!plan.complete) {
 		result.error = plan.reason.empty() ? "no plan" : plan.reason;
+		return result;
+	}
+	if (aggregate == Aggregate::SUM &&
+	    (sum_relation >= graph.RelationCount() || sum_column >= graph.column_counts[sum_relation])) {
+		result.error = "summed column is not a column of the query";
 		return result;
 	}
 	if (group_relation >= graph.RelationCount() || group_column >= graph.column_counts[group_relation]) {
@@ -792,19 +839,26 @@ GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, Re
 			return result;
 		}
 
-		std::map<int64_t, int64_t> totals;
+		const auto sum_attribute =
+		    aggregate == Aggregate::SUM ? AttributeOf(graph, sum_relation, sum_column) : AttributeId(0);
+		// A group with no tuples is not a group, but a group whose values sum to
+		// zero is. Emptiness has to be judged by the count even when the answer
+		// is a sum, or `sum(x)` over a group of zeroes would vanish.
+		std::map<int64_t, std::pair<int64_t, int64_t>> totals;
 		const auto &rep = accumulated.Rep();
 		rep.ForEachRoot([&](Record root) {
 			const auto value = rep.GetValue(root, found);
 			auto &slot = totals[value];
-			slot = CheckedCardinalityAdd(slot, rep.SubtreeSize(root));
+			slot.first = CheckedCardinalityAdd(slot.first, rep.SubtreeSize(root));
+			slot.second = CheckedCardinalityAdd(
+			    slot.second, aggregate == Aggregate::SUM ? rep.SubtreeSum(root, sum_attribute) : rep.SubtreeSize(root));
 		});
 		for (const auto &entry : totals) {
 			// A root whose subtree is empty denotes no tuples, so it is not a
 			// group: it is a value that joined with nothing, and an inner join
 			// does not report those.
-			if (entry.second > 0) {
-				result.groups.emplace_back(entry.first, entry.second);
+			if (entry.second.first > 0) {
+				result.groups.emplace_back(entry.first, entry.second.second);
 			}
 		}
 		result.records = rep.RecordCount();
@@ -817,6 +871,20 @@ GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, Re
 		result.error = error.what();
 	}
 	return result;
+}
+
+} // namespace
+
+GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                   size_t group_relation, size_t group_column, PathStrategy strategy) {
+	return GroupBy(graph, plan, source, mode, group_relation, group_column, Aggregate::COUNT, 0, 0, strategy);
+}
+
+GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                 size_t group_relation, size_t group_column, size_t sum_relation, size_t sum_column,
+                                 PathStrategy strategy) {
+	return GroupBy(graph, plan, source, mode, group_relation, group_column, Aggregate::SUM, sum_relation, sum_column,
+	               strategy);
 }
 
 ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,

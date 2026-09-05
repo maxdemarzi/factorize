@@ -89,6 +89,14 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 		// correct general answer and is not written; one thread is.
 		slices = 1;
 	}
+	if (aggregate == factorize::Aggregate::SUM) {
+		// So does summing, and for a sharper reason: ExecuteSum takes the whole
+		// source, not a bucket of it. Left parallel, every thread would sum the
+		// entire join and the totals would be added together -- an answer N
+		// times too large, on N threads, silently. Slicing the sum is the same
+		// partition argument as for counting and is simply not written yet.
+		slices = 1;
+	}
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / slices));
 }
 
@@ -101,8 +109,11 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		if (!gstate.groups) {
 			factorize::SetGlobalMemoryLimit(gstate.memory_per_slice);
 			SharedRelations source(client, relations);
-			auto result = factorize::ExecuteGroupCount(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-			                                           group_relation, group_column);
+			auto result = aggregate == factorize::Aggregate::SUM
+			                  ? factorize::ExecuteGroupSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+			                                               group_relation, group_column, sum_relation, sum_column)
+			                  : factorize::ExecuteGroupCount(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+			                                                 group_relation, group_column);
 			if (!result.ok) {
 				throw InvalidInputException("factorize: %s", result.error);
 			}
@@ -117,7 +128,10 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		// The key goes back out in the type the aggregate gave it, not the int64
 		// the engine counted in.
 		chunk.SetValue(0, produced, Value::Numeric(group_type, groups[gstate.handed_out].first));
-		chunk.SetValue(1, produced, Value::BIGINT(groups[gstate.handed_out].second));
+		chunk.SetValue(1, produced,
+		               aggregate == factorize::Aggregate::SUM
+		                   ? Value::HUGEINT(hugeint_t(groups[gstate.handed_out].second)).DefaultCastAs(sum_type)
+		                   : Value::BIGINT(groups[gstate.handed_out].second));
 		gstate.handed_out++;
 		produced++;
 	}
@@ -161,8 +175,14 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 	// Within memory, not merely up to it: a bucket that does not fit is
 	// subdivided rather than abandoned. The rule replaced a plan DuckDB could
 	// have run, so failing here would turn a slow query into no query at all.
-	const auto result = factorize::ExecuteCountSliceWithinMemory(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-	                                                            slice, gstate.slices);
+	// Summing partitions the same way counting does -- the buckets are disjoint
+	// sets of tuples, so their sums add -- but it cannot use the sliced count
+	// path, which fuses the last join and never builds the values.
+	const auto result =
+	    aggregate == factorize::Aggregate::SUM
+	        ? factorize::ExecuteSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, sum_relation, sum_column)
+	        : factorize::ExecuteCountSliceWithinMemory(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, slice,
+	                                                  gstate.slices);
 
 	idx_t completed;
 	{
@@ -187,7 +207,9 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 			throw InvalidInputException("factorize: %s", gstate.error);
 		}
 		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(gstate.total));
+		chunk.SetValue(0, 0, aggregate == factorize::Aggregate::SUM
+		                         ? Value::HUGEINT(hugeint_t(gstate.total)).DefaultCastAs(sum_type)
+		                         : Value::BIGINT(gstate.total));
 	}
 	// Not FINISHED: that would tell DuckDB this thread is done with the operator
 	// entirely, and with fewer threads scheduled than there are buckets the rest

@@ -19,10 +19,11 @@ void LogicalFactorized::ResolveTypes() {
 	// The group key keeps the type the aggregate gave it rather than the int64
 	// the engine works in: operators above were bound against that type, and
 	// handing them a wider one is a plan that type-checks and then misbehaves.
+	const auto answer = aggregate == factorize::Aggregate::SUM ? sum_type : LogicalType::BIGINT;
 	if (grouped) {
-		types = {group_type, LogicalType::BIGINT};
+		types = {group_type, answer};
 	} else {
-		types = {LogicalType::BIGINT};
+		types = {answer};
 	}
 }
 
@@ -61,6 +62,10 @@ InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 	if (grouped) {
 		result["Group"] = relations[group_relation].alias + "." + relations[group_relation].column_names[group_column];
 	}
+	result["Aggregate"] = aggregate == factorize::Aggregate::SUM
+	                          ? "sum(" + relations[sum_relation].alias + "." +
+	                                relations[sum_relation].column_names[sum_column] + ")"
+	                          : "count(*)";
 	return result;
 }
 
@@ -79,6 +84,10 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	factorized.group_type = group_type;
 	factorized.group_relation = group_relation;
 	factorized.group_column = group_column;
+	factorized.aggregate = aggregate;
+	factorized.sum_relation = sum_relation;
+	factorized.sum_column = sum_column;
+	factorized.sum_type = sum_type;
 	return physical;
 }
 

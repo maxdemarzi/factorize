@@ -169,6 +169,47 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 	return size;
 }
 
+int64_t FRepresentation::SubtreeSum(Record record, AttributeId attribute) const {
+	const int64_t count = SubtreeSize(record);
+	if (count == 0) {
+		// An empty subtree denotes no tuples, so it contributes no values. This
+		// is the section 4.6 hazard again: bottom-inserts produce these, and a
+		// fold that walked into one anyway would sum values no tuple contains.
+		return 0;
+	}
+	const auto &level = layout->Level(record.Level());
+	for (size_t i = 0; i < level.payload.size(); i++) {
+		if (level.payload[i].attribute != attribute) {
+			continue;
+		}
+		// The value lives here, so every tuple of this subtree carries it.
+		const int64_t value = level.payload[i].type == ValueType::INT32 ? static_cast<int64_t>(GetInt32(record, i))
+		                                                                : GetInt64(record, i);
+		return CheckedCardinalityMul(value, count);
+	}
+
+	int64_t total = 0;
+	for (size_t slot_index = 0; slot_index < level.slots.size(); slot_index++) {
+		int64_t slot_count = 0;
+		int64_t slot_sum = 0;
+		ForEachChild(record, slot_index, [&](Record child) {
+			slot_count = CheckedCardinalityAdd(slot_count, SubtreeSize(child));
+			slot_sum = CheckedCardinalityAdd(slot_sum, SubtreeSum(child, attribute));
+		});
+		if (slot_count == 0) {
+			// Cannot happen while count > 0, since the count is the product of
+			// the slot totals -- but dividing by it below would be worse than
+			// saying so.
+			return 0;
+		}
+		// How many tuples the *other* slots make, which is how often each of
+		// this slot's values appears.
+		const int64_t others = count / slot_count;
+		total = CheckedCardinalityAdd(total, CheckedCardinalityMul(slot_sum, others));
+	}
+	return total;
+}
+
 int64_t FRepresentation::Count() const {
 	int64_t total = 0;
 	ForEachRoot([&](Record root) { total = CheckedCardinalityAdd(total, SubtreeSize(root)); });

@@ -194,6 +194,25 @@ struct MaterializeResult {
 MaterializeResult ExecuteMaterialize(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                      size_t limit, PathStrategy strategy = PathStrategy::LEVELWISE);
 
+//! Which fold to run over the join. Both are semiring folds over the same
+//! representation (section 4.5); they differ in what a node contributes.
+enum class Aggregate : uint8_t {
+	//! How many tuples: slots multiply.
+	COUNT,
+	//! The total of one column over those tuples: a slot's values are weighted
+	//! by how many tuples the other slots make.
+	SUM
+};
+
+//! Sums one column over the join without materializing it.
+//!
+//! The column has to be scanned to be summed, which makes this the first thing
+//! the region reads that is not a join key. It is still not a tuple stream:
+//! the value is folded through the representation, so the cost is the size of
+//! the representation and not of the result.
+ExecuteResult ExecuteSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                         size_t sum_relation, size_t sum_column, PathStrategy strategy = PathStrategy::LEVELWISE);
+
 struct GroupCountResult {
 	bool ok = false;
 	std::string error;
@@ -221,6 +240,14 @@ struct GroupCountResult {
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                    size_t group_relation, size_t group_column,
                                    PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! `SELECT g, sum(x) ... GROUP BY g`, the two generalisations at once.
+//!
+//! Same shape as ExecuteGroupCount -- a root record is a group -- with the fold
+//! under it summing a column instead of counting tuples.
+GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                 size_t group_relation, size_t group_column, size_t sum_relation, size_t sum_column,
+                                 PathStrategy strategy = PathStrategy::LEVELWISE);
 
 //! Runs `plan` for tuples, and if the representation does not fit, gathers them
 //! a bucket of the join key at a time instead.
