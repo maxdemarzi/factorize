@@ -318,6 +318,41 @@ static void TestOutOfMemoryFallsBackToSlices() {
 	Report("a count too large to fit whole is assembled from slices instead of failing");
 }
 
+//! EXISTS has to agree with COUNT on emptiness, for a join with tuples and for
+//! one without. Stopping at the first witness is only worth anything if it
+//! stops at a *correct* one, and the failure mode of a partitioned search is
+//! answering false because the witness was in a bucket never examined.
+static void TestExistsAgreesWithCount() {
+	// Non-empty, and deliberately sparse: only one key value joins, so most
+	// buckets of the partition are empty and the answer lives in one of them.
+	MemorySource present;
+	present.Add({{7, 1, 2, 3}});
+	present.Add({{7, 4, 5, 6}});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 1};
+	graph.column_types = {{ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}};
+	const auto plan = BuildPlan(graph);
+
+	const auto counted = ExecuteCount(graph, plan, present, JoinMode::BOTTOM_INSERT);
+	Expect(counted.ok && counted.count == 1, "exists: the sparse join has exactly one tuple, got " +
+	                                             std::to_string(counted.count));
+	const auto found = ExecuteExists(graph, plan, present, JoinMode::BOTTOM_INSERT);
+	Expect(found.ok, "exists: succeeds (" + found.error + ")");
+	Expect(found.count == 1, "exists: must find the witness wherever its bucket falls");
+
+	// Empty: every bucket has to be examined before answering, and the answer
+	// still has to be no.
+	MemorySource absent;
+	absent.Add({{1, 2, 3}});
+	absent.Add({{4, 5, 6}});
+	const auto none = ExecuteExists(graph, plan, absent, JoinMode::BOTTOM_INSERT);
+	Expect(none.ok, "exists: succeeds on an empty join (" + none.error + ")");
+	Expect(none.count == 0, "exists: a join with no tuples must answer no");
+	Report("exists agrees with count on emptiness, including when the witness is sparse");
+}
+
 int main() {
 	std::printf("factorize core: plan\n\n");
 	TestInt32Baseline();
@@ -337,6 +372,8 @@ int main() {
 	TestSlicingIsExact();
 	std::printf("\n");
 	TestOutOfMemoryFallsBackToSlices();
+	std::printf("\n");
+	TestExistsAgreesWithCount();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

@@ -23,6 +23,7 @@
 #pragma once
 
 #include "cost.hpp"
+#include "enumerate.hpp"
 #include "ftree.hpp"
 #include "join.hpp"
 
@@ -165,6 +166,85 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 //! slower answer but no answer.
 ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                  size_t slices, PathStrategy strategy = PathStrategy::LEVELWISE);
+
+struct MaterializeResult {
+	bool ok = false;
+	std::string error;
+	bool out_of_memory = false;
+	//! One entry per tuple, each holding one value per attribute in the order
+	//! the graph declares them: relation 0's columns, then relation 1's, and so
+	//! on.
+	std::vector<std::vector<int64_t>> tuples;
+	//! Records and bytes the representation the tuples came out of occupied.
+	size_t records = 0;
+	size_t bytes = 0;
+};
+
+//! Runs `plan` and hands back the flat tuples, at most `limit` of them (0 for
+//! all).
+//!
+//! The honest accounting (plan section 10.3): emitting N tuples costs Omega(N)
+//! and factorization does not change that. What it changes is the
+//! *intermediate* cost -- a flat engine duplicates at each of the n-1 joins,
+//! this pays once, at the end -- and, when `limit` is small, what gets built at
+//! all. A hundred rows out of a join with a trillion of them costs a hundred
+//! rows of enumeration over a representation that was cheap to build, which is
+//! a thing stock DuckDB cannot do at any speed: it materialises the hash-join
+//! intermediates whatever the LIMIT says.
+MaterializeResult ExecuteMaterialize(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                     size_t limit, PathStrategy strategy = PathStrategy::LEVELWISE);
+
+struct GroupCountResult {
+	bool ok = false;
+	std::string error;
+	bool out_of_memory = false;
+	//! One entry per distinct value of the grouping column, value first.
+	std::vector<std::pair<int64_t, int64_t>> groups;
+	size_t records = 0;
+	size_t bytes = 0;
+};
+
+//! `SELECT g, count(*) ... GROUP BY g`, without materializing the join.
+//!
+//! This is the case plan section 10.1 describes as workable: the grouping key
+//! sits at the top of the f-tree, so each root record *is* a group, and the
+//! tuples belonging to it are exactly the ones its subtree denotes -- a number
+//! the representation already knows how to compute without enumerating them.
+//! Summing memoized subtree sizes per distinct value is the whole algorithm.
+//!
+//! When the key is not at the root this declines rather than guessing. A key
+//! further down is reachable in principle -- descend to it, carrying the
+//! product of the sibling slots you did not descend into -- but a key scattered
+//! across independent sibling branches needs their cross product and is a
+//! different algorithm. Declining the first case costs coverage; guessing at
+//! the second would cost correctness.
+GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                   size_t group_relation, size_t group_column,
+                                   PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! Runs `plan` for tuples, and if the representation does not fit, gathers them
+//! a bucket of the join key at a time instead.
+//!
+//! The union of the buckets' tuples is the join's tuples, so this is the same
+//! result assembled differently. With a limit it is better than that: one
+//! bucket usually supplies the whole prefix, and the rest are never built.
+MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source,
+                                                 JoinMode mode, size_t limit,
+                                                 PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! Whether the join has any tuple at all, stopping at the first witness.
+//!
+//! Counting asks a harder question than EXISTS does, and the difference is
+//! worth taking: the join is non-empty exactly when *some* bucket of the join
+//! key is non-empty, so the buckets are examined one at a time and the first
+//! that yields anything ends the query. On data where witnesses are common --
+//! which is most data -- that reads a fraction of the input, and on data where
+//! they are not it costs one extra pass over inputs that were about to be read
+//! anyway.
+//!
+//! `count` is 0 or 1, so a caller that wants a boolean has one.
+ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                            PathStrategy strategy = PathStrategy::LEVELWISE);
 
 //! Counts one bucket of the partition: the tuples whose join key hashes to
 //! `slice` of `slices`. Summing every bucket gives the whole count, and the

@@ -646,3 +646,61 @@ The plan also asks for a version matrix (§7.1). This extension supports exactly
 one DuckDB version -- v1.5.5, pinned in D4 -- because the C++ API it uses is
 version-locked (D5), so a matrix over versions it does not claim to support
 would test nothing. The matrix that exists is over platforms, minus WASM.
+
+## D23 — The v2 roadmap: what §10 asks for, and which parts of it are real
+
+Section 10 is explicitly post-ship and says not to begin before Phase 6. Phase 6
+is done, so here is all of it, with the parts that turned out cheaper and dearer
+than the plan expected.
+
+**§10.4 EXISTS — cheap, as advertised, and cheaper than expected.** The plan
+budgets 1-2 weeks for a semi-join that stops at the first witness. Phase 4's
+partitioning had already made it nearly free: a join is non-empty exactly when
+some bucket of its join key is non-empty, so the buckets are examined one at a
+time and the first that yields a tuple ends the query. `factorized_exists`.
+
+**§10.3 tuple output and §10.2 LIMIT — one piece of work, not two.** The plan
+sizes LIMIT at "3-4 weeks on top of a working flattening iterator", with an
+O(log n) seek built on per-node prefix sums. That machinery is for *random
+access* by tuple id -- what §5.1 wanted for parallel enumeration. LIMIT does not
+need it: taking the first k tuples needs only a prefix, and a prefix is what an
+iterator that can stop already gives. So `Enumerate` takes a limit and stops,
+and §10.2's demo falls out of §10.3 with no id arithmetic at all.
+
+The §4.6 hazard the plan flags -- bottom-inserts leave records whose child slot
+is empty, and enumerating one invents tuples that do not exist -- is handled by
+construction rather than by a check: an empty slot iterates nothing, exactly as
+SubtreeSize multiplies by zero. The regression test is a three-relation chain
+whose middle relation has rows that join upward but not downward.
+
+One piece of C++ worth recording. The natural way to write the enumerator is
+with a templated continuation ("what to do once this subtree is fixed"), and it
+cannot be done: the continuation at depth d has a type built from the type at
+depth d-1, so the compiler would have to instantiate a family of functions whose
+size is a property of the *data*. It is type-erased through a function pointer
+instead, one indirect call per level, which is the price of the recursion
+terminating at compile time.
+
+**§10.1 GROUP BY — the case the plan names, and a decline for the rest.** When
+the grouping key is at the top of the f-tree, each root record *is* a group and
+the tuples belonging to it are the ones its subtree denotes -- a number the
+representation already memoizes. Summing `SubtreeSize` per distinct value is the
+whole algorithm, and it never enumerates a tuple.
+
+Below the root it declines. Descending to a deeper key is reachable in principle
+(carry the product of the sibling slots not descended into), and a key scattered
+across independent sibling branches needs their cross product and is a different
+algorithm entirely. The plan says detect that case and decline; this declines
+one case more than it strictly must, and says which.
+
+**§10.5 and §10.6 are not implemented, deliberately.** §10.5's outer and
+non-equi joins the paper itself calls "naïve" and leaves as future work, and the
+plan says to treat them as research and not put them on a schedule. §10.6 is a
+list of things not to pursue -- `COUNT(DISTINCT)` is not a semiring, `ORDER BY`
+and window functions need the flat ordered relation -- and implementing them
+would mean disagreeing with the plan's reasoning rather than executing it.
+
+All four are table functions rather than optimizer rules. The rule matches
+`count(*)` and nothing else, so `SELECT ... LIMIT 100` over a join is still
+answered by DuckDB unless the user calls `factorized_tuples` by name. Wiring
+these into the matcher is the obvious next step and is not done.

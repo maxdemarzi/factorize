@@ -250,3 +250,137 @@ SELECT count(*) FROM chainable p, no_rows q WHERE p.d = q.s;
 
 statement ok
 ROLLBACK;
+
+#
+# factorized_exists: the same join, asked whether it has any tuple rather than
+# how many (plan §10.4). Cheaper to answer, and it must never disagree with the
+# count about emptiness.
+#
+query I
+SELECT * FROM factorized_exists(['a', 'b', 'c'], ['a.s = b.s', 'b.s = c.s']);
+----
+true
+
+query I
+SELECT * FROM factorized_exists(['a', 'empty_side'], ['a.s = empty_side.s']);
+----
+false
+
+# The count says 200 and the existence says true, over the same NULL-ridden
+# composite key.
+query I
+SELECT * FROM factorized_exists(['a x', 'a y', 'composite'], ['x.s = composite.p', 'y.s = composite.q']);
+----
+true
+
+# A relation with no rows at all cannot witness anything.
+query I
+SELECT * FROM factorized_exists(['chainable p', 'no_rows q'], ['p.d = q.s']);
+----
+false
+
+# Existence over a join far too large to count by materialising it: this is the
+# case the early exit is for, and it must still answer.
+query I
+SELECT * FROM factorized_exists(['chainable p', 'chainable q', 'chainable r'],
+                                ['p.d = q.s', 'q.d = r.s']);
+----
+true
+
+# The rejections are the count's rejections: same binder, same messages.
+statement error
+SELECT * FROM factorized_exists(['a', 'b'], ['a.s > b.s']);
+----
+not an equality
+
+#
+# factorized_tuples: the join itself rather than an aggregate of it, and with a
+# limit, the thing stock DuckDB cannot do at any speed (plan §10.2, §10.3).
+#
+# One column per join column, named <relation>_<column>. Columns no predicate
+# mentions were never read -- they cannot change a count, and that trade is why
+# this is not SELECT *.
+#
+query IIII
+SELECT * FROM factorized_tuples(['a x', 'a y', 'composite'], ['x.s = composite.p', 'y.s = composite.q'])
+ ORDER BY ALL LIMIT 3;
+----
+1	1	1	1
+1	1	1	1
+1	1	1	1
+
+# The tuples must be exactly what the count counted.
+query I
+SELECT count(*) FROM factorized_tuples(['a x', 'a y', 'composite'],
+                                       ['x.s = composite.p', 'y.s = composite.q']);
+----
+200
+
+# A limit takes a prefix without building the rest. The chain below has fifty
+# million tuples; asking for five must not materialise fifty million.
+query I
+SELECT count(*) FROM factorized_tuples(['chainable p', 'chainable q', 'chainable r'],
+                                       ['p.d = q.s', 'q.d = r.s'], 5);
+----
+5
+
+# Every tuple of an equi-join agrees on the joined columns, whatever the limit.
+query I
+SELECT count(*) FROM factorized_tuples(['a', 'b'], ['a.s = b.s'], 100) WHERE a_s <> b_s;
+----
+0
+
+# A limit past the end is not an error and does not invent rows.
+query I
+SELECT count(*) FROM factorized_tuples(['a', 'empty_side'], ['a.s = empty_side.s'], 50);
+----
+0
+
+statement error
+SELECT * FROM factorized_tuples(['a', 'b'], ['a.s = b.s'], -1);
+----
+must not be negative
+
+#
+# factorized_group_count: one row per distinct value of the grouping column,
+# counting the tuples in each without enumerating them (plan §10.1). Works when
+# the key is at the top of the f-tree; declines otherwise rather than guessing.
+#
+query II
+SELECT * FROM factorized_group_count(['a', 'b', 'c'], ['a.s = b.s', 'b.s = c.s'], 'a.s')
+ ORDER BY 1 LIMIT 3;
+----
+0	1000
+1	1000
+2	1000
+
+# The groups have to sum to the count of the whole join, or one of them is wrong.
+query I
+SELECT sum(count) FROM factorized_group_count(['a', 'b', 'c'], ['a.s = b.s', 'b.s = c.s'], 'a.s');
+----
+10000
+
+# Ten distinct values of s, each joining.
+query I
+SELECT count(*) FROM factorized_group_count(['a', 'b', 'c'], ['a.s = b.s', 'b.s = c.s'], 'a.s');
+----
+10
+
+# A value that joins with nothing is not a group: an inner join does not report
+# it, and neither does this.
+query I
+SELECT count(*) FROM factorized_group_count(['a', 'empty_side'], ['a.s = empty_side.s'], 'a.s');
+----
+0
+
+# The grouping column has to be one the query actually joins on -- only those
+# are read, so only those exist to group by.
+statement error
+SELECT * FROM factorized_group_count(['a', 'b'], ['a.s = b.s'], 'a.d');
+----
+not a join column
+
+statement error
+SELECT * FROM factorized_group_count(['a', 'b'], ['a.s = b.s'], 'nosuchrel.s');
+----
+does not name a listed relation

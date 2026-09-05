@@ -18,6 +18,11 @@ using factorize::QueryGraph;
 struct FactorizedCountBindData : public TableFunctionData {
 	vector<BoundRelation> relations;
 	QueryGraph graph;
+	//! How many tuples factorized_tuples should emit; 0 means all of them.
+	size_t limit = 0;
+	//! Which column factorized_group_count groups on.
+	size_t group_relation = 0;
+	size_t group_column = 0;
 };
 
 //! Splits on whitespace, so "yago2 a" and "yago2 AS a" both parse.
@@ -69,7 +74,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
                               vector<string> &names) {
 	auto result = make_uniq<FactorizedCountBindData>();
 
-	if (input.inputs.size() != 2) {
+	// Two lists, and whatever the caller adds after them: factorized_tuples
+	// takes a limit and factorized_group_count a grouping column, both of which
+	// they read themselves once the relations are bound.
+	if (input.inputs.size() < 2) {
 		throw BinderException("factorized_count(tables, joins) takes two lists");
 	}
 	auto tables = ListValue::GetChildren(input.inputs[0]);
@@ -174,13 +182,21 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 
 struct FactorizedCountGlobalState : public GlobalTableFunctionState {
 	bool emitted = false;
+	//! Grouping produces a row per distinct value, which can outrun one vector,
+	//! so the groups are computed once and handed out across calls.
+	unique_ptr<vector<std::pair<int64_t, int64_t>>> groups;
+	idx_t offset = 0;
 };
 
 unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionInitInput &) {
 	return make_uniq<FactorizedCountGlobalState>();
 }
 
-void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+//! Shared by both entry points, which differ only in the question they ask of
+//! the same join: how many, or whether any.
+template <bool EXISTS>
+void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	const char *name = EXISTS ? "factorized_exists" : "factorized_count";
 	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
 	if (state.emitted) {
 		output.SetCardinality(0);
@@ -206,7 +222,7 @@ void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output
 
 	const auto plan = factorize::BuildPlan(bind_data.graph);
 	if (!plan.complete) {
-		throw InvalidInputException("factorized_count: %s", plan.reason);
+		throw InvalidInputException("%s: %s", name, plan.reason);
 	}
 
 	StorageSource source(context, bind_data.relations);
@@ -218,21 +234,224 @@ void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output
 	// decides that slicing is needed -- but it now costs passes over the input
 	// instead of costing the answer.
 	const auto result =
-	    factorize::ExecuteCountWithinMemory(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
+	    EXISTS ? factorize::ExecuteExists(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT)
+	           : factorize::ExecuteCountWithinMemory(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
 	if (!result.ok) {
-		throw InvalidInputException("factorized_count: %s", result.error);
+		throw InvalidInputException("%s: %s", name, result.error);
 	}
 
 	output.SetCardinality(1);
-	output.SetValue(0, 0, Value::BIGINT(result.count));
+	if (EXISTS) {
+		output.SetValue(0, 0, Value::BOOLEAN(result.count > 0));
+	} else {
+		output.SetValue(0, 0, Value::BIGINT(result.count));
+	}
+}
+
+unique_ptr<FunctionData> BindExists(ClientContext &context, TableFunctionBindInput &input,
+                                    vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = Bind(context, input, return_types, names);
+	return_types.clear();
+	names.clear();
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("exists");
+	return result;
+}
+
+//! `factorized_tuples(tables, joins[, limit])`: the join itself, not an
+//! aggregate of it. One column per join column, named `<relation>_<column>`.
+unique_ptr<FunctionData> BindTuples(ClientContext &context, TableFunctionBindInput &input,
+                                    vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = Bind(context, input, return_types, names);
+	auto &bind_data = result->Cast<FactorizedCountBindData>();
+	if (input.inputs.size() > 2 && !input.inputs[2].IsNull()) {
+		const auto limit = input.inputs[2].GetValue<int64_t>();
+		if (limit < 0) {
+			throw BinderException("factorized_tuples: limit must not be negative");
+		}
+		bind_data.limit = static_cast<size_t>(limit);
+	}
+	return_types.clear();
+	names.clear();
+	for (auto &relation : bind_data.relations) {
+		for (auto &column : relation.column_names) {
+			// Only the join columns exist in the representation: a column no
+			// predicate mentions was never read, because it cannot change a
+			// count and carrying it would widen every record for nothing. That
+			// trade is right for counting and is the reason this is not
+			// `SELECT *`.
+			return_types.emplace_back(LogicalType::BIGINT);
+			names.emplace_back(relation.alias + "_" + column);
+		}
+	}
+	return result;
+}
+
+//! `factorized_group_count(tables, joins, 'relation.column')`: one row per
+//! distinct value of the grouping column, with the number of joined tuples it
+//! accounts for.
+unique_ptr<FunctionData> BindGroupCount(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = Bind(context, input, return_types, names);
+	auto &bind_data = result->Cast<FactorizedCountBindData>();
+	if (input.inputs.size() < 3 || input.inputs[2].IsNull()) {
+		throw BinderException("factorized_group_count: needs a grouping column");
+	}
+	const auto operand = Trim(StringValue::Get(input.inputs[2]));
+	const auto dot = operand.rfind('.');
+	if (dot == string::npos) {
+		throw BinderException("factorized_group_count: '%s' must be <relation>.<column>", operand);
+	}
+	const auto alias = operand.substr(0, dot);
+	const auto column = operand.substr(dot + 1);
+	bool found = false;
+	for (idx_t relation = 0; relation < bind_data.relations.size() && !found; relation++) {
+		auto &bound = bind_data.relations[relation];
+		if (bound.alias != alias) {
+			continue;
+		}
+		for (idx_t i = 0; i < bound.column_names.size(); i++) {
+			if (bound.column_names[i] == column) {
+				bind_data.group_relation = relation;
+				bind_data.group_column = i;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			// The column may exist on the table and simply not be read: only the
+			// columns a predicate touches are scanned, so grouping on any other
+			// would need a column the representation does not hold.
+			throw BinderException("factorized_group_count: %s.%s is not a join column of this query", alias, column);
+		}
+	}
+	if (!found) {
+		throw BinderException("factorized_group_count: '%s' does not name a listed relation", alias);
+	}
+	return_types.clear();
+	names.clear();
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back(alias + "_" + column);
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("count");
+	return result;
+}
+
+void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
+	auto &bind_data = data.bind_data->Cast<FactorizedCountBindData>();
+	if (!state.groups) {
+		const auto &config = DBConfig::GetConfig(context);
+		const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
+		                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
+		                            : config.options.maximum_memory;
+		factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+
+		const auto plan = factorize::BuildPlan(bind_data.graph);
+		if (!plan.complete) {
+			throw InvalidInputException("factorized_group_count: %s", plan.reason);
+		}
+		StorageSource source(context, bind_data.relations);
+		auto result = factorize::ExecuteGroupCount(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+		                                           bind_data.group_relation, bind_data.group_column);
+		if (!result.ok) {
+			throw InvalidInputException("factorized_group_count: %s", result.error);
+		}
+		state.groups = make_uniq<vector<std::pair<int64_t, int64_t>>>(std::move(result.groups));
+	}
+
+	// Groups can outnumber a vector, so this one hands them out a chunk at a
+	// time rather than refusing past the first.
+	auto &groups = *state.groups;
+	idx_t produced = 0;
+	while (state.offset < groups.size() && produced < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, produced, Value::BIGINT(groups[state.offset].first));
+		output.SetValue(1, produced, Value::BIGINT(groups[state.offset].second));
+		state.offset++;
+		produced++;
+	}
+	output.SetCardinality(produced);
+}
+
+void ExecuteTuples(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+
+	auto &bind_data = data.bind_data->Cast<FactorizedCountBindData>();
+	const auto &config = DBConfig::GetConfig(context);
+	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
+	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
+	                            : config.options.maximum_memory;
+	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+
+	const auto plan = factorize::BuildPlan(bind_data.graph);
+	if (!plan.complete) {
+		throw InvalidInputException("factorized_tuples: %s", plan.reason);
+	}
+
+	StorageSource source(context, bind_data.relations);
+	auto result = factorize::ExecuteMaterializeWithinMemory(bind_data.graph, plan, source,
+	                                                       factorize::JoinMode::BOTTOM_INSERT, bind_data.limit);
+	if (!result.ok) {
+		throw InvalidInputException("factorized_tuples: %s", result.error);
+	}
+	if (result.tuples.size() > STANDARD_VECTOR_SIZE) {
+		// One chunk, so the caller has to ask for an amount that fits in one.
+		// Streaming this properly means holding the representation across calls
+		// and an enumerator that can be resumed mid-tuple; the limit is the
+		// interesting case (plan §10.2) and it does fit.
+		throw InvalidInputException(
+		    "factorized_tuples: %llu tuples exceeds one vector; pass a limit of %llu or fewer",
+		    static_cast<uint64_t>(result.tuples.size()), static_cast<uint64_t>(STANDARD_VECTOR_SIZE));
+	}
+
+	output.SetCardinality(result.tuples.size());
+	for (idx_t row = 0; row < result.tuples.size(); row++) {
+		const auto &tuple = result.tuples[row];
+		for (idx_t column = 0; column < tuple.size(); column++) {
+			output.SetValue(column, row, Value::BIGINT(tuple[column]));
+		}
+	}
 }
 
 } // namespace
 
 void RegisterFactorizedCount(ExtensionLoader &loader) {
+	// Asking whether a join has any tuple is a cheaper question than asking how
+	// many, and the engine can stop as soon as it knows (plan §10.4).
+	TableFunction exists("factorized_exists",
+	                     {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
+	                     ExecuteQuestion<true>, BindExists, InitGlobal);
+	loader.RegisterFunction(exists);
+
+	// The join itself rather than an aggregate of it (plan §10.3), and with a
+	// limit, the thing DuckDB cannot do at any speed (§10.2): a hundred rows out
+	// of a join with a trillion, without materialising the trillion.
+	TableFunction tuples("factorized_tuples",
+	                     {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
+	                     ExecuteTuples, BindTuples, InitGlobal);
+	loader.RegisterFunction(tuples);
+
+	TableFunction limited_tuples(
+	    "factorized_tuples",
+	    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR), LogicalType::BIGINT},
+	    ExecuteTuples, BindTuples, InitGlobal);
+	loader.RegisterFunction(limited_tuples);
+
+	// One row per group, counted without enumerating the tuples in it (§10.1).
+	TableFunction group_count(
+	    "factorized_group_count",
+	    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	    ExecuteGroupCount, BindGroupCount, InitGlobal);
+	loader.RegisterFunction(group_count);
+
 	TableFunction function("factorized_count",
-	                       {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)}, Execute,
-	                       Bind, InitGlobal);
+	                       {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
+	                       ExecuteQuestion<false>, Bind, InitGlobal);
 	loader.RegisterFunction(function);
 }
 

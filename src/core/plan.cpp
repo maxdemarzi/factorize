@@ -547,6 +547,310 @@ ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, Rela
 	return result;
 }
 
+namespace {
+
+//! Runs every join in `plan`, fusing none, and hands back what they built.
+//!
+//! ExecuteCount fuses the last join because its output exists only to be
+//! counted. Everything that wants the *result* -- tuples, groups -- needs the
+//! representation to exist, so it needs this instead.
+struct BuiltRelation {
+	bool ok = false;
+	std::string error;
+	bool out_of_memory = false;
+	std::unique_ptr<FactorizedRelation> relation;
+	std::unique_ptr<EquivalenceClasses> classes;
+};
+
+BuiltRelation BuildRepresentation(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                  PathStrategy strategy) {
+	BuiltRelation built;
+	try {
+		if (graph.column_types.size() != graph.RelationCount()) {
+			throw std::runtime_error("QueryGraph::column_types must have one entry per relation");
+		}
+		AttributeTypes types;
+		for (size_t relation = 0; relation < graph.RelationCount(); relation++) {
+			if (graph.column_types[relation].size() != graph.column_counts[relation]) {
+				throw std::runtime_error("QueryGraph::column_types[" + std::to_string(relation) +
+				                         "] must have one entry per column");
+			}
+			for (size_t column = 0; column < graph.column_counts[relation]; column++) {
+				types.emplace_back(AttributeOf(graph, relation, column), graph.column_types[relation][column]);
+			}
+		}
+
+		auto make = [&](size_t relation) {
+			std::vector<AttributeId> attributes;
+			for (size_t column = 0; column < graph.column_counts[relation]; column++) {
+				attributes.push_back(AttributeOf(graph, relation, column));
+			}
+			return MakeScan(attributes, types, source.Columns(relation));
+		};
+
+		built.classes.reset(new EquivalenceClasses(graph));
+		auto accumulated = make(plan.steps[0].relation);
+
+		for (size_t i = 1; i < plan.steps.size(); i++) {
+			const auto &step = plan.steps[i];
+			JoinKeys keys;
+			std::vector<AttributeId> new_keys;
+			std::vector<AttributeId> accumulated_keys;
+			for (const auto &edge : step.edges) {
+				const bool left_is_new = edge.left_relation == step.relation;
+				new_keys.push_back(AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+				                               static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
+				const auto raw =
+				    AttributeOf(graph, left_is_new ? edge.right_relation : edge.left_relation,
+				                static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column));
+				accumulated_keys.push_back(ShallowestEquivalent(*built.classes, accumulated.Tree(), raw));
+			}
+			if (mode == JoinMode::TOP_INSERT) {
+				keys.build = new_keys;
+				keys.probe = accumulated_keys;
+				accumulated = FactorizedJoin(make(step.relation), accumulated, keys, mode, strategy);
+			} else {
+				keys.build = accumulated_keys;
+				keys.probe = new_keys;
+				accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy);
+			}
+		}
+		built.relation.reset(new FactorizedRelation(std::move(accumulated)));
+		built.ok = true;
+	} catch (const MemoryLimitExceeded &error) {
+		built.error = error.what();
+		built.out_of_memory = true;
+	} catch (const std::exception &error) {
+		built.error = error.what();
+	}
+	return built;
+}
+
+} // namespace
+
+MaterializeResult ExecuteMaterialize(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                     size_t limit, PathStrategy strategy) {
+	MaterializeResult result;
+	if (!plan.complete) {
+		result.error = plan.reason.empty() ? "no plan" : plan.reason;
+		return result;
+	}
+	auto built = BuildRepresentation(graph, plan, source, mode, strategy);
+	if (!built.ok) {
+		result.error = built.error;
+		result.out_of_memory = built.out_of_memory;
+		return result;
+	}
+	try {
+		auto &accumulated = *built.relation;
+		auto &classes = *built.classes;
+
+		// An equi-join's two key attributes are always equal, so the merge is
+		// free to keep only one of them. A tuple still has to carry both, and
+		// the value of the missing one is by definition the value of whichever
+		// equivalent attribute survived.
+		const auto &layout = accumulated.GetLayout();
+		auto present = [&](AttributeId attribute) {
+			for (size_t level = 0; level < layout.LevelCount(); level++) {
+				for (const auto &entry : layout.Level(static_cast<LevelId>(level)).payload) {
+					if (entry.attribute == attribute) {
+						return true;
+					}
+				}
+			}
+			return false;
+		};
+
+		std::vector<TupleColumn> columns;
+		size_t position = 0;
+		for (size_t relation = 0; relation < graph.RelationCount(); relation++) {
+			for (size_t column = 0; column < graph.column_counts[relation]; column++) {
+				const auto wanted = AttributeOf(graph, relation, column);
+				AttributeId source_attribute = wanted;
+				if (!present(wanted)) {
+					bool found = false;
+					for (size_t other = 0; other < graph.RelationCount() && !found; other++) {
+						for (size_t c = 0; c < graph.column_counts[other] && !found; c++) {
+							const auto candidate = AttributeOf(graph, other, c);
+							if (present(candidate) && classes.SameClass(candidate, wanted)) {
+								source_attribute = candidate;
+								found = true;
+							}
+						}
+					}
+					if (!found) {
+						throw std::runtime_error("attribute " + std::to_string(wanted) +
+						                         " is neither stored nor equal to anything stored");
+					}
+				}
+				columns.push_back(TupleColumn {source_attribute, position});
+				position++;
+			}
+		}
+
+		Enumerate(accumulated.Rep(), columns, limit, [&](const std::vector<int64_t> &values) {
+			result.tuples.push_back(values);
+			return true;
+		});
+		result.records = accumulated.Rep().RecordCount();
+		result.bytes = accumulated.Rep().BytesAllocated();
+		result.ok = true;
+	} catch (const MemoryLimitExceeded &error) {
+		result.error = error.what();
+		result.out_of_memory = true;
+	} catch (const std::exception &error) {
+		result.error = error.what();
+	}
+	return result;
+}
+
+MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source,
+                                                 JoinMode mode, size_t limit, PathStrategy strategy) {
+	auto result = ExecuteMaterialize(graph, plan, source, mode, limit, strategy);
+	if (result.ok || !result.out_of_memory) {
+		return result;
+	}
+	auto key_column = ChooseSliceColumns(graph);
+	if (key_column.empty()) {
+		return result;
+	}
+	static const size_t kSliceSteps[] = {8, 64, 512, 4096};
+	for (auto slices : kSliceSteps) {
+		MaterializeResult gathered;
+		bool fits = true;
+		for (size_t slice = 0; slice < slices && fits; slice++) {
+			SlicedSource sliced(source, key_column, slice, slices);
+			// Each bucket only has to supply what the limit still wants.
+			const size_t remaining = limit == 0 ? 0 : limit - gathered.tuples.size();
+			auto part = ExecuteMaterialize(graph, plan, sliced, mode, remaining, strategy);
+			if (!part.ok) {
+				if (!part.out_of_memory) {
+					return part;
+				}
+				fits = false;
+				result = part;
+				break;
+			}
+			for (auto &tuple : part.tuples) {
+				gathered.tuples.push_back(std::move(tuple));
+			}
+			gathered.records = gathered.records > part.records ? gathered.records : part.records;
+			gathered.bytes = gathered.bytes > part.bytes ? gathered.bytes : part.bytes;
+			if (limit != 0 && gathered.tuples.size() >= limit) {
+				// The prefix is complete; the remaining buckets are never built,
+				// which is the whole point of asking for a limit.
+				break;
+			}
+		}
+		if (fits) {
+			gathered.ok = true;
+			return gathered;
+		}
+	}
+	return result;
+}
+
+GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                   size_t group_relation, size_t group_column, PathStrategy strategy) {
+	GroupCountResult result;
+	if (!plan.complete) {
+		result.error = plan.reason.empty() ? "no plan" : plan.reason;
+		return result;
+	}
+	if (group_relation >= graph.RelationCount() || group_column >= graph.column_counts[group_relation]) {
+		result.error = "grouping column is not a column of the query";
+		return result;
+	}
+	auto built = BuildRepresentation(graph, plan, source, mode, strategy);
+	if (!built.ok) {
+		result.error = built.error;
+		result.out_of_memory = built.out_of_memory;
+		return result;
+	}
+	try {
+		const auto &accumulated = *built.relation;
+		auto &classes = *built.classes;
+		const auto &layout = accumulated.GetLayout();
+
+		// The grouping key has to be readable from a root record. An equivalent
+		// attribute will do: an equi-join's keys are equal by definition, so
+		// grouping on either gives the same groups.
+		const auto wanted = AttributeOf(graph, group_relation, group_column);
+		AttributeId found = 0;
+		bool present = false;
+		if (layout.LevelCount() > 0) {
+			for (const auto &entry : layout.Level(0).payload) {
+				if (entry.attribute == wanted || classes.SameClass(entry.attribute, wanted)) {
+					found = entry.attribute;
+					present = true;
+					break;
+				}
+			}
+		}
+		if (!present) {
+			result.error = "grouping column is not at the top of the f-tree, where each group is one root record";
+			return result;
+		}
+
+		std::map<int64_t, int64_t> totals;
+		const auto &rep = accumulated.Rep();
+		rep.ForEachRoot([&](Record root) {
+			const auto value = rep.GetValue(root, found);
+			auto &slot = totals[value];
+			slot = CheckedCardinalityAdd(slot, rep.SubtreeSize(root));
+		});
+		for (const auto &entry : totals) {
+			// A root whose subtree is empty denotes no tuples, so it is not a
+			// group: it is a value that joined with nothing, and an inner join
+			// does not report those.
+			if (entry.second > 0) {
+				result.groups.emplace_back(entry.first, entry.second);
+			}
+		}
+		result.records = rep.RecordCount();
+		result.bytes = rep.BytesAllocated();
+		result.ok = true;
+	} catch (const MemoryLimitExceeded &error) {
+		result.error = error.what();
+		result.out_of_memory = true;
+	} catch (const std::exception &error) {
+		result.error = error.what();
+	}
+	return result;
+}
+
+ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                            PathStrategy strategy) {
+	// Enough buckets that finding a witness early is worth something, few enough
+	// that a genuinely empty join does not pay for many passes to learn it. The
+	// buckets are examined in order and nothing about the answer depends on
+	// which one answers first.
+	static const size_t kProbeSlices = 16;
+	auto key_column = ChooseSliceColumns(graph);
+	const size_t slices = key_column.empty() ? 1 : kProbeSlices;
+
+	ExecuteResult result;
+	for (size_t slice = 0; slice < slices; slice++) {
+		auto part = ExecuteCountSliceWithinMemory(graph, plan, source, mode, slice, slices, strategy);
+		if (!part.ok) {
+			return part;
+		}
+		if (part.count > 0) {
+			result.ok = true;
+			result.count = 1;
+			result.records = part.records;
+			result.bytes = part.bytes;
+			// How much of the partition was read before the answer was known.
+			result.slices = slice + 1;
+			return result;
+		}
+	}
+	result.ok = true;
+	result.count = 0;
+	result.slices = slices;
+	return result;
+}
+
 ExecuteResult ExecuteCountWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                        PathStrategy strategy) {
 	auto result = ExecuteCount(graph, plan, source, mode, strategy);
