@@ -86,15 +86,29 @@ SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
   re-counted over a partition of its join key, which costs a pass over the
   input per partition. Skew is the case that defeats it: no number of buckets
   separates one value from itself.
-- **An error in the factorized path fails the query.** The plan asks for a
-  fallback to the stock plan instead (§7.5), and this design cannot give one —
-  the rule drops DuckDB's scans at optimize time, so by execution there is no
-  stock plan left to fall back to. What protects you is that the matcher
-  declines anything it cannot model, rather than that failures are recoverable;
-  `factorize_mode='off'` is the recovery.
+- **An error in the factorized path runs the stock plan instead, and that costs
+  parallelism.** The plan the rule replaces is carried rather than dropped, and
+  built into a pipeline the executor is not given, so it costs nothing until a
+  failure needs it (§7.5). The catch is that an operator which may have to drive
+  that pipeline cannot be a parallel source — several tasks park on its state
+  lock while one drives the fallback, and a parked worker is one the executor
+  cannot use to run the pipeline it is waiting for. So the factorized `count(*)`
+  runs on one thread: measured 7ms against 2–4ms at eight threads.
+
+  `factorize_fallback` defaults to **true** because on a 27M-tuple star the
+  engine is 32× faster than stock, and serialising leaves about 11×. Trading 32×
+  for 11× to make failure impossible is a good trade, but it is a trade — set it
+  to `false` to get the parallelism back and have failures surface again. Either
+  way `factorize_mode='off'` remains the blunt recovery. `FATAL` and `INTERRUPT`
+  are never recovered from: the first leaves nothing to fall back to, and the
+  second is you asking it to stop.
 - **The cost model's coefficients were fitted on one machine.** They are
-  checked in as defaults, not as constants. `scripts/refit-cost.py` re-fits
-  them against `scripts/calibrate-gate.sh` output from yours.
+  checked in as defaults, not as constants, and they have been wrong in both
+  directions (DECISIONS D19, D26). `scripts/calibrate-synthetic.py` re-fits them
+  against shapes it generates itself and needs nothing downloaded;
+  `scripts/refit-cost.py` re-fits against `scripts/calibrate-gate.sh` output,
+  which needs the CE corpus. `factorized_stats(tables, joins)` reports the sizes
+  the gate predicts, so a decline can be checked rather than guessed at.
 - **One DuckDB version.** The C++ extension API is version-locked; this builds
   against v1.5.5 and no other.
 - **Not built for WASM,** deliberately — see the CI configuration.
