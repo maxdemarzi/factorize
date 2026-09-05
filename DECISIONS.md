@@ -1228,6 +1228,31 @@ safe; answering wrongly never is.
 > A test written from the example encodes the example. A test written from the
 > property survives the fix.
 
+**Why a second reader is worth more than a more careful first one.** Both of
+this session's fix-caused defects, and the harness bug below, were caught by the
+same asymmetry:
+
+> You test that the changed thing changed. Someone else tests that the unchanged
+> thing did not.
+
+The `Report()` fix is the clean illustration. Its author mutation-tested that a
+broken check turns its own group's line to `FAIL`; the reviewer checked that a
+*clean* group after a failing one still says `ok`. A global latch passes the
+first test and fails the second, and it would have been wrong in the opposite
+direction -- every group after the first failure reported as failing. Neither
+question is harder. A single author just tends to ask only the first about their
+own change, because the second means suspecting yourself in a direction you were
+not already looking.
+
+That is a stronger argument for keeping the harnesses than any count of bugs
+found, because it does not depend on anyone being careful. It is also why
+descriptions and implementations must be checked separately: a rule that reached
+this codebase as "two INT64s throw" was a true example presented as a rule, and
+implementing the message rather than reading `join.cpp:161` would have shipped a
+boundary letting INT32+INT64 through to the very exception the decline exists to
+prevent. Trusting a summary over the code it summarises is the same error as
+trusting an argument over a measurement, pointing the other way.
+
 **And a tenth instance of the session's pattern, in the harness itself.**
 `Report()` printed `ok` unconditionally, so a group whose checks had failed
 printed its FAIL lines and then said ok. Totals and exit code were right, so CI
