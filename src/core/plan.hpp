@@ -177,6 +177,47 @@ struct ExecuteResult {
 ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                            PathStrategy strategy = PathStrategy::LEVELWISE);
 
+//! An inequality between two relations' columns, applied on top of a graph's
+//! equalities.
+//!
+//! Deliberately NOT a field on QueryGraph. Every existing consumer of a graph
+//! ignores fields it does not know about, so a `<>` living there would be
+//! silently dropped by BuildPlan, ExecuteCount, ExecuteSum and the cost model
+//! alike -- each of them answering a different query than the caller asked,
+//! with no error. Passing it as a separate argument to the one function that
+//! implements it means the only way to lose it is to not call that function.
+struct NotEqualPredicate {
+	size_t left_relation = 0;
+	int left_column = 0;
+	size_t right_relation = 0;
+	int right_column = 0;
+};
+
+//! Counts a join carrying one `<>` predicate, by inclusion-exclusion.
+//!
+//! Plan section 10.5 sends non-equality joins to a blockwise nested loop. For
+//! `<>` specifically that is the wrong shape entirely: it is not a range
+//! predicate and needs no comparison at all, because
+//!
+//!     |A join B on equalities, where A.x <> B.y|
+//!         = |A join B on equalities| - |A join B on equalities and A.x = B.y|
+//!
+//! and both terms are ordinary equi-join counts this engine already computes.
+//! The second is an equi-join on one more column, which is exactly the
+//! composite-key shape -- so this feature rests on the planner taking composite
+//! keys, and could not have been built before it did.
+//!
+//! Builds both plans itself rather than taking one, because the two terms are
+//! plans over DIFFERENT graphs and a caller holding one plan has no way to say
+//! which. Declines unless both terms plan and run: a difference of two counts
+//! is only right when both counts are.
+//!
+//! Costs two full passes to answer one query, so it is not automatically a win
+//! over a flat engine's single filtered pass -- see the measurement in
+//! test_notequal.cpp, which includes shapes where this loses.
+ExecuteResult ExecuteCountNotEqual(const QueryGraph &graph, const NotEqualPredicate &neq, RelationSource &source,
+                                   JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE);
+
 //! Runs `plan` `slices` times, each pass keeping only the rows whose join key
 //! falls in one hash bucket, and sums the counts.
 //!
