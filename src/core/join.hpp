@@ -98,6 +98,27 @@ enum class Preserve : uint8_t {
 	BOTH
 };
 
+//! What the join emits, as opposed to which side survives it.
+//!
+//! `Preserve` answers "which input keeps its tuples"; this answers "what is
+//! done with the partner". They are separate axes because SEMI and ANTI are not
+//! products at all: their output is one input's tuples, filtered by whether a
+//! partner exists, so no tuple of the other side ever appears. Folding them
+//! into `Preserve` would have made `Preserve::BUILD` mean two different things.
+enum class JoinKind : uint8_t {
+	//! The product: an inner join, or an outer one if `preserve` names a side.
+	//! `preserve` alone already says which, so there is no separate OUTER --
+	//! two fields that must agree are two fields that can disagree.
+	PRODUCT,
+	//! The tuples of the `preserve` side that have at least one partner.
+	//! `preserve` must name exactly one side.
+	SEMI,
+	//! The tuples of the `preserve` side that have no partner. NOT the
+	//! complement of SEMI over the product -- it is the complement over that
+	//! side's own tuples, which is why it counts the same units SEMI does.
+	ANTI
+};
+
 //! Statistics for a single join, for the Phase 1 harness and later EXPLAIN.
 struct JoinStats {
 	size_t build_keys = 0;
@@ -150,9 +171,21 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 //! stop dropping exactly those records. So an outer join is supported where it
 //! is the *last* join of a plan -- the one that is fused into the count -- and
 //! declined anywhere else.
+//! `kind` extends that to semi- and anti-joins (plan section 10.4 and the
+//! §10.5 staging), which cost less than counting rather than more: the marker
+//! an outer join already maintains is the whole mechanism, and the only
+//! difference is what the matched weight becomes at the insertion level.
+//!
+//!     inner   size *= matched                        (PRODUCT, preserve NEITHER)
+//!     outer   size *= (matched == 0 ? 1 : matched)     (PRODUCT, preserve a side)
+//!     semi    size  = (matched >  0 ? size : 0)
+//!     anti    size  = (matched == 0 ? size : 0)
+//!
+//! For SEMI and ANTI, `preserve` names the side whose tuples are emitted, and
+//! must be BUILD or PROBE -- BOTH and NEITHER have no meaning there and throw.
 int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRelation &probe, const JoinKeys &keys,
                             JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE, JoinStats *stats = nullptr,
-                            Preserve preserve = Preserve::NEITHER);
+                            Preserve preserve = Preserve::NEITHER, JoinKind kind = JoinKind::PRODUCT);
 
 //! Memory cap applied to every f-representation the core creates; 0 = none.
 //!

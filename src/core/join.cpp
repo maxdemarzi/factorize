@@ -440,6 +440,16 @@ struct LowerEntry {
 	bool matched;
 };
 
+//! What the upper walk does with the matched weight once it has it.
+//!
+//! MARK_ONLY exists because a semi- or anti-join that emits the *lower* side
+//! gets its answer from the sweep over the hash entries, not from the upper
+//! walk -- but the walk still has to run, because it is what sets the marks.
+//! It deliberately leaves `size` alone rather than returning zero: returning
+//! zero would make an ancestor's slot product zero and short-circuit the rest
+//! of the walk, and the branches it skipped would then never mark theirs.
+enum class UpperFold : uint8_t { PRODUCT, PRESERVE, SEMI, ANTI, MARK_ONLY };
+
 //! Cardinality of the whole join output, walking the upper side's plan and
 //! folding the matching lower subtree sizes in at the insertion level.
 struct OutputCounter {
@@ -450,8 +460,9 @@ struct OutputCounter {
 	const KeyReader &key;
 	ChainingHashTable<LowerEntry> &table;
 	size_t *matches;
-	//! An upper tuple with no partner still contributes one output tuple.
-	bool preserve_upper;
+	//! What the matched weight becomes at the insertion level. This is the only
+	//! place the four join kinds differ.
+	UpperFold fold;
 	//! Whether the marker has to be maintained at all.
 	bool mark_lower;
 
@@ -484,13 +495,30 @@ struct OutputCounter {
 					(*matches)++;
 				}
 			});
-			if (matched == 0 && preserve_upper) {
+			switch (fold) {
+			case UpperFold::PRODUCT:
+				size = CheckedCardinalityMul(size, matched);
+				break;
+			case UpperFold::PRESERVE:
 				// Null-extension, counted rather than represented: one output
 				// tuple per upper tuple, whatever the lower side's columns
 				// would have been.
-				matched = 1;
+				size = CheckedCardinalityMul(size, matched == 0 ? 1 : matched);
+				break;
+			case UpperFold::SEMI:
+				// The partner is a test, not a factor. These upper tuples
+				// appear once each or not at all, however many partners they
+				// have -- which is why a semi-join cannot overflow where the
+				// inner join it filters would.
+				size = matched > 0 ? size : 0;
+				break;
+			case UpperFold::ANTI:
+				size = matched == 0 ? size : 0;
+				break;
+			case UpperFold::MARK_ONLY:
+				// Marks are set above; `size` is discarded by the caller.
+				break;
 			}
-			size = CheckedCardinalityMul(size, matched);
 		}
 		return size;
 	}
@@ -499,7 +527,15 @@ struct OutputCounter {
 } // namespace
 
 int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRelation &probe, const JoinKeys &keys,
-                            JoinMode mode, PathStrategy strategy, JoinStats *stats, Preserve preserve) {
+                            JoinMode mode, PathStrategy strategy, JoinStats *stats, Preserve preserve, JoinKind kind) {
+	// Reject the combinations that have no meaning rather than picking one.
+	// A semi-join over "neither side" or "both sides" is not a conservative
+	// reading of an ambiguous request, it is a caller bug, and the count it
+	// would return looks perfectly ordinary.
+	const bool filtering = (kind == JoinKind::SEMI || kind == JoinKind::ANTI);
+	if (filtering && (preserve == Preserve::NEITHER || preserve == Preserve::BOTH)) {
+		throw std::runtime_error("join: a semi- or anti-join must emit exactly one side");
+	}
 	const bool build_on_top = (mode == JoinMode::BOTTOM_INSERT);
 	// `preserve` names the arguments; the counters think in upper and lower.
 	// Which argument is which depends on the mode, so the translation happens
@@ -508,6 +544,24 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 	const bool preserve_probe = (preserve == Preserve::PROBE || preserve == Preserve::BOTH);
 	const bool preserve_upper = build_on_top ? preserve_build : preserve_probe;
 	const bool preserve_lower = build_on_top ? preserve_probe : preserve_build;
+
+	// For SEMI/ANTI, "preserved" reads as "emitted". When the emitted side is
+	// the lower one the upper walk contributes nothing and only sets marks, and
+	// the answer comes from the sweep.
+	UpperFold fold = UpperFold::PRODUCT;
+	if (kind == JoinKind::PRODUCT && preserve_upper) {
+		fold = UpperFold::PRESERVE;
+	} else if (kind == JoinKind::SEMI) {
+		fold = preserve_upper ? UpperFold::SEMI : UpperFold::MARK_ONLY;
+	} else if (kind == JoinKind::ANTI) {
+		fold = preserve_upper ? UpperFold::ANTI : UpperFold::MARK_ONLY;
+	}
+	const bool emit_upper = !(filtering && preserve_lower);
+	const bool mark_lower = preserve_lower;
+	// Which entries the sweep collects: an outer or anti join wants the ones
+	// nothing reached, a semi join wants the ones something did.
+	const bool sweep_lower = mark_lower;
+	const bool sweep_matched = (kind == JoinKind::SEMI);
 	const FactorizedRelation &upper = build_on_top ? build : probe;
 	const FactorizedRelation &lower = build_on_top ? probe : build;
 	const std::vector<AttributeId> &upper_keys = build_on_top ? keys.build : keys.probe;
@@ -561,22 +615,27 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 	int64_t total = 0;
 	size_t matches = 0;
 	OutputCounter counter {upper_plan, upper.Rep(), upper_ctx, static_cast<int32_t>(merge.insertion_level),
-	                       upper_key,  table,       &matches,  preserve_upper,
-	                       preserve_lower};
+	                       upper_key,  table,       &matches,  fold,
+	                       mark_lower};
 	IterateLevel(upper_plan, 0, upper.Rep(), upper_ctx, 0, [&]() {
 		if (stats) {
 			stats->probe_rows++;
 		}
-		total = CheckedCardinalityAdd(total, counter.Of(0));
+		const auto contributed = counter.Of(0);
+		if (emit_upper) {
+			total = CheckedCardinalityAdd(total, contributed);
+		}
 	});
 
-	if (preserve_lower) {
-		// The other half of the paper's sketch. Every lower instance nothing
-		// reached is null-extended on the upper side's columns, which for a
-		// count means it contributes its own tuples and no more -- one output
-		// tuple per lower tuple, exactly the size already stored for it.
+	if (sweep_lower) {
+		// The other half of the paper's sketch, and the same sweep serves three
+		// kinds. An outer join adds every lower instance nothing reached, since
+		// each is null-extended on the upper columns and contributes its own
+		// tuples and no more. An anti-join emits exactly those same instances,
+		// and a semi-join emits their complement. One pass over the entries the
+		// build phase already created.
 		table.ForEachValue([&](const LowerEntry &entry) {
-			if (!entry.matched) {
+			if (entry.matched == sweep_matched) {
 				total = CheckedCardinalityAdd(total, entry.size);
 			}
 		});
