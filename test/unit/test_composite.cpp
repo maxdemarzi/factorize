@@ -49,20 +49,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &what) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", what.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", what.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 class MemorySource : public RelationSource {
 public:
@@ -117,6 +134,8 @@ static int64_t BruteForceTwo(const std::vector<std::vector<int64_t>> &a, const s
 //! equivalence classes, which is exactly why the old check refused this, and
 //! they are on one node, which is why the engine can do it.
 static void TestTwoRelationsCompositeKey() {
+	Group scope("two relations joined on two columns at once");
+
 	const std::vector<std::vector<int64_t>> a_rows = {{1, 10}, {1, 11}, {2, 10}, {2, 12}, {3, 10}};
 	const std::vector<std::vector<int64_t>> b_rows = {{1, 10}, {1, 12}, {2, 10}, {2, 10}, {4, 10}};
 
@@ -153,12 +172,13 @@ static void TestTwoRelationsCompositeKey() {
 	       "composite: the one-column join of the same tables still agrees");
 	Expect(single_truth != truth, "composite: the second key column actually narrows the join (" +
 	                                  std::to_string(single_truth) + " vs " + std::to_string(truth) + ")");
-	Report("two relations joined on two columns at once");
 }
 
 //! Both insert modes, because the tree is built from opposite ends in each and
 //! the planner simulates only one of them.
 static void TestCompositeUnderBothModes() {
+	Group scope("a composite key counts the same under both insert modes");
+
 	const std::vector<std::vector<int64_t>> a_rows = {{1, 5}, {1, 6}, {2, 5}, {2, 5}, {3, 7}};
 	const std::vector<std::vector<int64_t>> b_rows = {{1, 5}, {2, 5}, {2, 5}, {3, 8}};
 
@@ -183,7 +203,6 @@ static void TestCompositeUnderBothModes() {
 		       std::string("modes: ") + (mode == JoinMode::BOTTOM_INSERT ? "bottom" : "top") + "-insert gives " +
 		           std::to_string(counted.count) + ", brute force says " + std::to_string(truth));
 	}
-	Report("a composite key counts the same under both insert modes");
 }
 
 //! A third relation attaching on ONE of the two composite columns.
@@ -193,6 +212,8 @@ static void TestCompositeUnderBothModes() {
 //! k1 alone attaches to that node. The classes involved were never equal and
 //! never become so.
 static void TestThirdRelationOnOneOfTheKeys() {
+	Group scope("a third relation attaching on one column of a composite key");
+
 	const std::vector<std::vector<int64_t>> a_rows = {{1, 10}, {1, 11}, {2, 10}, {2, 12}, {3, 10}};
 	const std::vector<std::vector<int64_t>> b_rows = {{1, 10}, {1, 12}, {2, 10}, {2, 10}, {4, 10}};
 	const std::vector<std::vector<int64_t>> c_rows = {{1}, {1}, {2}, {5}};
@@ -231,7 +252,6 @@ static void TestThirdRelationOnOneOfTheKeys() {
 		       std::string("third: ") + (mode == JoinMode::BOTTOM_INSERT ? "bottom" : "top") + "-insert gives " +
 		           std::to_string(counted.count) + ", brute force says " + std::to_string(truth));
 	}
-	Report("a third relation attaching on one column of a composite key");
 }
 
 //! The packed key is one 64-bit word, and the rule is the SUM of the key
@@ -242,6 +262,8 @@ static void TestThirdRelationOnOneOfTheKeys() {
 //! rule written as "not two INT64s" would let exactly the common case through
 //! to an exception thrown from inside a running join.
 static void TestKeyWidthIsDeclinedNotThrown() {
+	Group scope("a key wider than the packed word is declined by the planner, not thrown by the join");
+
 	struct Case {
 		ValueType first;
 		ValueType second;
@@ -274,7 +296,6 @@ static void TestKeyWidthIsDeclinedNotThrown() {
 	single.column_types = {{ValueType::INT64}, {ValueType::INT64}};
 	single.predicates = {Predicate {0, 0, 1, 0}};
 	Expect(BuildPlan(single).complete, "width: one INT64 key is exactly 64 bits and still plans");
-	Report("a key wider than the packed word is declined by the planner, not thrown by the join");
 }
 
 //! Counts three relations by trying every combination against every predicate.
@@ -314,6 +335,8 @@ static int64_t BruteForceThree(const std::vector<std::vector<std::vector<int64_t
 //! "computes the answer" on purpose: declining is always safe, and answering
 //! wrongly never is. Both shapes below returned a wrong count before the fix.
 static void TestUnenforcedEqualityIsNeverSubstituted() {
+	Group scope("an equality no join has enforced is never substituted");
+
 	struct Shape {
 		const char *what;
 		std::vector<std::vector<std::vector<int64_t>>> rows;
@@ -368,13 +391,14 @@ static void TestUnenforcedEqualityIsNeverSubstituted() {
 			           std::to_string(counted.count) + ", brute force says " + std::to_string(truth));
 		}
 	}
-	Report("an equality no join has enforced is never substituted");
 }
 
 //! A genuinely cyclic graph must still be refused -- the point was never to
 //! accept everything, and a triangle's third relation reaches the other two
 //! through nodes that no transformation brings together.
 static void TestCyclicStillRefused() {
+	Group scope("a cyclic graph is still refused, and says so without claiming to be about keys");
+
 	QueryGraph graph;
 	graph.column_counts = {2, 2, 2};
 	graph.column_types = {{ValueType::INT32, ValueType::INT32},
@@ -384,13 +408,14 @@ static void TestCyclicStillRefused() {
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 1, 2, 0}, Predicate {2, 1, 0, 1}};
 	const auto plan = BuildPlan(graph);
 	Expect(!plan.complete, "cyclic: a triangle is still refused");
-	Report("a cyclic graph is still refused, and says so without claiming to be about keys");
 }
 
 //! A sweep, because the interesting failures are structural rather than
 //! arithmetic and one hand-written shape proves little. Every combination of
 //! key-column count and row content, counted against a nested loop.
 static void TestSweepAgainstBruteForce() {
+	Group scope("every composite shape in the sweep agrees with a nested loop");
+
 	int cases = 0;
 	for (int domain = 2; domain <= 4; domain++) {
 		for (int a_rows_n = 1; a_rows_n <= 6; a_rows_n++) {
@@ -432,7 +457,6 @@ static void TestSweepAgainstBruteForce() {
 		}
 	}
 	Expect(cases == 3 * 6 * 6 * 2, "sweep: ran every case, " + std::to_string(cases));
-	Report("every composite shape in the sweep agrees with a nested loop");
 }
 
 int main() {

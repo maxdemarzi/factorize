@@ -40,20 +40,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 //===--------------------------------------------------------------------===//
 // Flat reference implementation
@@ -269,6 +286,8 @@ static bool RunCase(std::mt19937 &rng, int relations, int columns, int rows, int
 //! Long chains with keys taken from *varying* columns, which is what the CE
 //! corpus actually looks like: `a.s = b.s and b.d = c.s and ...`.
 static void TestLongChains() {
+	Group scope("chains of up to 6 relations match the flat oracle");
+
 	std::printf("Long chains with mixed key columns\n");
 	std::mt19937 rng(31337);
 	int cases = 0;
@@ -328,9 +347,7 @@ static void TestLongChains() {
 		}
 	}
 	Expect(failures == 0, "long-chain mismatch: " + detail);
-	if (failures == 0) {
-		Report(std::to_string(cases) + " chains of up to 6 relations match the flat oracle");
-	}
+	scope.Detail(", " + std::to_string(cases) + " checked");
 }
 
 //! A star with N independent siblings, then a further join keyed on an
@@ -341,6 +358,8 @@ static void TestLongChains() {
 //! the one case the chain and star generators above both miss: they only ever
 //! key on the root.
 static void TestStarThenDeepJoin() {
+	Group scope("a star with N siblings, then a join keyed at depth 1");
+
 	std::printf("Star with N siblings, then a join at depth 1\n");
 	std::mt19937 rng(20260902);
 	int failures = 0;
@@ -410,6 +429,8 @@ static void TestStarThenDeepJoin() {
 }
 
 static void TestDifferential() {
+	Group scope("randomized queries match the flat oracle exactly");
+
 	std::printf("Randomized differential vs a flat oracle\n");
 	std::mt19937 rng(20260901);
 	int cases = 0;
@@ -437,15 +458,15 @@ static void TestDifferential() {
 		}
 	}
 	Expect(failures == 0, "differential mismatch: " + first_failure);
-	if (failures == 0) {
-		Report(std::to_string(cases) + " randomized queries match the flat oracle exactly");
-	}
+	scope.Detail(", " + std::to_string(cases) + " checked");
 }
 
 //===--------------------------------------------------------------------===//
 // The equivalence the paper proves: L (top-insert) R == R (bottom-insert) L
 //===--------------------------------------------------------------------===//
 static void TestModeEquivalence() {
+	Group scope("insert modes agree on shape, count and contents");
+
 	std::printf("Insert-mode equivalence\n");
 	std::mt19937 rng(7);
 	AttributeTypes types;
@@ -475,13 +496,14 @@ static void TestModeEquivalence() {
 
 	std::vector<AttributeId> order = {0, 1, 10, 11};
 	Expect(Sorted(Enumerate(top, order)) == Sorted(Enumerate(bottom, order)), "both modes encode the same tuples");
-	Report("insert modes agree on shape, count and contents");
 }
 
 //===--------------------------------------------------------------------===//
 // Partial flattening is genuinely exercised
 //===--------------------------------------------------------------------===//
 static void TestPartialFlattening() {
+	Group scope("bushy plan over four relations");
+
 	std::printf("Partial flattening\n");
 	std::mt19937 rng(99);
 
@@ -533,7 +555,7 @@ static void TestPartialFlattening() {
 	}
 	Expect(Sorted(flat_rows) == Sorted(Enumerate(joined, order)), "bushy join matches the flat oracle");
 	Expect(joined.Count() == static_cast<int64_t>(flat_rows.size()), "bushy join counts correctly");
-	Report("bushy plan over four relations, " + std::to_string(flat_rows.size()) + " tuples");
+	scope.Detail(", " + std::to_string(flat_rows.size()) + " tuples");
 	std::printf("       f-tree: %s\n", joined.Tree().ToString(DefaultAttributeName).c_str());
 	std::printf("       %zu records for %lld tuples%s\n", stats.output_records, static_cast<long long>(joined.Count()),
 	            stats.merged_nodes ? ", nodes were merged" : "");
@@ -556,6 +578,8 @@ static void TestPartialFlattening() {
 // then join R3 on  R1.v = R3.p  AND  R2.w = R3.q, closing the diamond.
 //===--------------------------------------------------------------------===//
 static void TestDiamondMerge() {
+	Group scope("cycle-closing join exercises partial flattening under both strategies");
+
 	std::printf("Diamond (cycle-closing) join -- forces node merging\n");
 	std::mt19937 rng(4242);
 
@@ -613,7 +637,6 @@ static void TestDiamondMerge() {
 		            joined.Tree().ToString(DefaultAttributeName).c_str(), static_cast<long long>(joined.Count()),
 		            stats.output_records);
 	}
-	Report("cycle-closing join exercises partial flattening under both strategies");
 }
 
 //===--------------------------------------------------------------------===//
@@ -624,6 +647,8 @@ static void TestDiamondMerge() {
 // what materializing and counting returns, across shapes and both modes.
 //===--------------------------------------------------------------------===//
 static void TestFusedCount() {
+	Group scope("fused count == materialize-then-count");
+
 	std::printf("Fused count vs materialize-then-count\n");
 	std::mt19937 rng(20260903);
 	int cases = 0;
@@ -679,9 +704,7 @@ static void TestFusedCount() {
 		}
 	}
 	Expect(failures == 0, "fused count disagrees: " + detail);
-	if (failures == 0) {
-		Report(std::to_string(cases) + " queries: fused count == materialize-then-count");
-	}
+	scope.Detail(", " + std::to_string(cases) + " queries");
 }
 
 //! The memory limit used to check only the OUTPUT arena (FRepresentation),
@@ -695,6 +718,8 @@ static void TestFusedCount() {
 //! 200,000 hash table entries, and checks the join throws instead of
 //! allocating past the caller's budget.
 static void TestMemoryLimitCoversBuildSide() {
+	Group scope("memory limit covers the hash table and top-insert snapshot arena, not only the output");
+
 	std::printf("Memory limit on the build side (hash table / snapshot arena)\n");
 	enum : AttributeId { A = 0 };
 	const AttributeTypes types = {{A, ValueType::INT32}};
@@ -741,7 +766,6 @@ static void TestMemoryLimitCoversBuildSide() {
 		Expect(threw, std::string("tight limit: build-side arena is caught, not silently unbounded (") +
 		                  (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ")");
 	}
-	Report("memory limit covers the hash table and top-insert snapshot arena, not only the output");
 }
 
 //! The exact composite-key width the packing accepts.
@@ -759,6 +783,8 @@ static void TestMemoryLimitCoversBuildSide() {
 //! discriminator beside a bigint id) is the common composite key in real
 //! schemas.
 static void TestCompositeKeyWidth() {
+	Group scope("composite key width: the cap is the sum of the columns, and it is what keeps the packing correct");
+
 	struct Case {
 		ValueType first;
 		ValueType second;
@@ -807,7 +833,6 @@ static void TestCompositeKeyWidth() {
 			                              std::to_string(count));
 		}
 	}
-	Report("composite key width: the cap is the sum of the columns, and it is what keeps the packing correct");
 }
 
 int main() {

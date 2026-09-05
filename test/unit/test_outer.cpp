@@ -54,20 +54,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 namespace {
 
@@ -174,6 +191,8 @@ const char *NameOf(Preserve preserve) {
 // Two flat relations, every preservation, both modes
 //===--------------------------------------------------------------------===//
 static void TestFlatOuterJoins() {
+	Group scope("every preservation, both modes, agrees with a nested loop");
+
 	std::printf("Outer joins against a nested loop\n");
 	std::mt19937 rng(20260904);
 	int cases = 0;
@@ -222,13 +241,14 @@ static void TestFlatOuterJoins() {
 	Expect(failures == 0, "outer join count differs from a nested loop in " + std::to_string(failures) + " of " +
 	                          std::to_string(cases) + " cases (" + detail + ")");
 	Expect(cases > 200, "the sweep covered " + std::to_string(cases) + " cases");
-	Report("every preservation, both modes, agrees with a nested loop");
 }
 
 //===--------------------------------------------------------------------===//
 // An inner join is what Preserve::NEITHER means
 //===--------------------------------------------------------------------===//
 static void TestNeitherIsUnchanged() {
+	Group scope("adding the parameter did not change what existing callers get");
+
 	std::printf("Preserve::NEITHER is the inner join it was\n");
 	std::mt19937 rng(7);
 	int mismatches = 0;
@@ -249,7 +269,6 @@ static void TestNeitherIsUnchanged() {
 	}
 	Expect(mismatches == 0, "the defaulted call and an explicit NEITHER disagree " + std::to_string(mismatches) +
 	                            " times");
-	Report("adding the parameter did not change what existing callers get");
 }
 
 //===--------------------------------------------------------------------===//
@@ -261,6 +280,8 @@ static void TestNeitherIsUnchanged() {
 // output tuples as it encodes. Counting it once -- the obvious bug, and the one
 // a flat-only test cannot see -- shows up as a count that is too small.
 static void TestPreservedSideIsFactorized() {
+	Group scope("an unmatched record contributes every tuple it encodes, not one");
+
 	std::printf("A preserved side that is itself factorized\n");
 
 	// r(a, b) joined with s(b, c) on b, then left-joined with u(a, d) on a.
@@ -308,13 +329,14 @@ static void TestPreservedSideIsFactorized() {
 			                               std::to_string(actual) + ", expected " + std::to_string(expected));
 		}
 	}
-	Report("an unmatched record contributes every tuple it encodes, not one");
 }
 
 //===--------------------------------------------------------------------===//
 // The degenerate sides, which are where an off-by-one lives
 //===--------------------------------------------------------------------===//
 static void TestEmptySides() {
+	Group scope("empty sides, in both directions");
+
 	std::printf("Empty sides\n");
 	Rows filled;
 	filled.attributes = {0, 1};
@@ -354,7 +376,6 @@ static void TestEmptySides() {
 		                           Preserve::BUILD) == 0,
 		       "preserving an empty build side gives nothing" + where);
 	}
-	Report("empty sides, in both directions");
 }
 
 int main() {

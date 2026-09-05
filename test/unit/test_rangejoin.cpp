@@ -57,20 +57,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 namespace {
 
@@ -187,6 +204,8 @@ Result FactorizedThetaCountAtRoot(const FactorizedRelation &left, const Factoriz
 // The predicate attribute is at the root: maximum sharing
 //===--------------------------------------------------------------------===//
 static void TestPredicateAtRoot() {
+	Group scope("same answer, fewer comparisons by exactly the squared compression");
+
 	std::printf("Range join, predicate attribute at the root\n");
 
 	const int keys = 300;
@@ -217,7 +236,6 @@ static void TestPredicateAtRoot() {
 	std::printf("    ratio       %12.1fx comparisons  %8.1fx time\n",
 	            static_cast<double>(flat.evaluations) / static_cast<double>(fact.evaluations),
 	            fact.ms > 0 ? flat.ms / fact.ms : 0.0);
-	Report("same answer, fewer comparisons by exactly the squared compression");
 }
 
 //===--------------------------------------------------------------------===//
@@ -228,6 +246,8 @@ static void TestPredicateAtRoot() {
 // tuple, so there is nothing to share and the factorized loop degenerates to
 // the flat one -- however compact the representation is overall.
 static void TestPredicateAtLeaf() {
+	Group scope("no sharing at a leaf, so a factorized loop has nothing to save");
+
 	std::printf("Range join, predicate attribute at a leaf\n");
 
 	const int keys = 300;
@@ -247,13 +267,14 @@ static void TestPredicateAtLeaf() {
 	           std::to_string(leaf_values.size()));
 	std::printf("    tuples %ld,  records holding the predicate attribute %ld  (compression 1.0x)\n",
 	            static_cast<long>(leaf_values.size()), static_cast<long>(leaf_records));
-	Report("no sharing at a leaf, so a factorized loop has nothing to save");
 }
 
 //===--------------------------------------------------------------------===//
 // How the saving scales with the compression at the predicate's node
 //===--------------------------------------------------------------------===//
 static void TestSavingTracksCompression() {
+	Group scope("the ratio is fanout^2 across a range of fan-outs, including 1x");
+
 	std::printf("The saving is the compression at that node, squared\n");
 
 	bool all_match = true;
@@ -281,7 +302,6 @@ static void TestSavingTracksCompression() {
 		            fact.ms, time_ratio, time_ratio < 1.0 ? "   <- SLOWER" : "");
 	}
 	Expect(all_match, "factorized and flat counts agree at every fan-out (" + detail + ")");
-	Report("the ratio is fanout^2 across a range of fan-outs, including 1x");
 }
 
 int main() {

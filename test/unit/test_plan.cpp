@@ -35,20 +35,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 //! An in-memory RelationSource: relations are supplied whole, one column list
 //! per relation. Real callers scan; this hands back what it was given.
@@ -77,6 +94,8 @@ private:
 //! A two-relation star on one INT32 key: 10 distinct values, N rows each ->
 //! N*N tuples. The baseline case, which worked before and must keep working.
 static void TestInt32Baseline() {
+	Group scope("int32 baseline");
+
 	MemorySource source;
 	// Relation 0: key column only (10 values, 3 rows each -> 30 rows).
 	std::vector<int64_t> keys_a;
@@ -98,7 +117,6 @@ static void TestInt32Baseline() {
 	const auto result = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(result.ok, "int32 baseline: executes without error (" + result.error + ")");
 	Expect(result.count == 10 * 3 * 3, "int32 baseline: count is 10*3*3 = 90, got " + std::to_string(result.count));
-	Report("int32 baseline");
 }
 
 //! The bug this file exists to catch: a BIGINT join key whose values straddle
@@ -107,6 +125,8 @@ static void TestInt32Baseline() {
 //! truncated every such value and this test would either miscount or, for
 //! values that alias after truncation, undercount by merging distinct keys.
 static void TestInt64BeyondInt32Range() {
+	Group scope("int64 values beyond int32 range, including a low-32-bit-aliasing pair");
+
 	MemorySource source;
 	const int64_t base = static_cast<int64_t>(2) * 1000 * 1000 * 1000; // > INT32_MAX (2147483647)
 	std::vector<int64_t> keys_a, keys_b;
@@ -160,12 +180,13 @@ static void TestInt64BeyondInt32Range() {
 	Expect(alias_result.ok, "int64 alias case: executes without error (" + alias_result.error + ")");
 	Expect(alias_result.count == 4,
 	      "int64 alias case: distinct high-32-bit values must not collide, got " + std::to_string(alias_result.count));
-	Report("int64 values beyond int32 range, including a low-32-bit-aliasing pair");
 }
 
 //! ExecuteCount must refuse to guess a missing or mismatched column_types
 //! entry rather than defaulting it -- that default is exactly the bug above.
 static void TestMissingColumnTypesRejected() {
+	Group scope("missing column_types is rejected, not silently defaulted");
+
 	MemorySource source;
 	source.Add({{1, 2, 3}});
 	source.Add({{1, 2, 3}});
@@ -178,12 +199,13 @@ static void TestMissingColumnTypesRejected() {
 	const auto plan = BuildPlan(graph);
 	const auto result = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(!result.ok, "missing column_types: ExecuteCount must fail, not default to INT32");
-	Report("missing column_types is rejected, not silently defaulted");
 }
 
 //! BuildPlan must refuse a disconnected join graph rather than producing a
 //! plan that silently computes a cross product.
 static void TestDisconnectedGraphRejected() {
+	Group scope("disconnected join graph is rejected");
+
 	QueryGraph graph;
 	graph.column_counts = {1, 1, 1};
 	graph.column_types = {{ValueType::INT32}, {ValueType::INT32}, {ValueType::INT32}};
@@ -191,13 +213,14 @@ static void TestDisconnectedGraphRejected() {
 
 	const auto plan = BuildPlan(graph);
 	Expect(!plan.complete, "disconnected graph: BuildPlan must not complete");
-	Report("disconnected join graph is rejected");
 }
 
 //! A caller-supplied relation count large enough to risk a stack overflow in
 //! the unbounded recursion downstream (ftree.cpp, materialize.cpp) must be
 //! refused before any of that recursion runs, not discovered by crashing.
 static void TestExcessiveRelationCountRejected() {
+	Group scope("an excessive relation count is rejected before any tree recursion runs");
+
 	QueryGraph graph;
 	const size_t huge = 100000;
 	graph.column_counts.assign(huge, 1);
@@ -208,7 +231,6 @@ static void TestExcessiveRelationCountRejected() {
 
 	const auto plan = BuildPlan(graph);
 	Expect(!plan.complete, "100,000 relations: BuildPlan must refuse, not recurse");
-	Report("an excessive relation count is rejected before any tree recursion runs");
 }
 
 //! A triangle cannot be arranged as an f-tree: its third relation reaches the
@@ -217,6 +239,8 @@ static void TestExcessiveRelationCountRejected() {
 //! ("key attributes did not converge on one level"); planning has to detect it
 //! first, or every caller's only signal is a query that dies mid-flight.
 static void TestCyclicGraphRejected() {
+	Group scope("cyclic join graph is rejected at planning time");
+
 	QueryGraph graph;
 	graph.column_counts = {2, 2, 2};
 	graph.column_types = {{ValueType::INT32, ValueType::INT32},
@@ -228,7 +252,6 @@ static void TestCyclicGraphRejected() {
 
 	const auto plan = BuildPlan(graph);
 	Expect(!plan.complete, "triangle: BuildPlan must not complete");
-	Report("cyclic join graph is rejected at planning time");
 }
 
 //! The same three relations joined on one shared key are *not* cyclic, however
@@ -237,6 +260,8 @@ static void TestCyclicGraphRejected() {
 //! Counting predicates against relations would call this cyclic and refuse a
 //! query the engine handles.
 static void TestRedundantStarAccepted() {
+	Group scope("one equivalence class stays acyclic however many predicates name it");
+
 	QueryGraph graph;
 	graph.column_counts = {1, 1, 1};
 	graph.column_types = {{ValueType::INT32}, {ValueType::INT32}, {ValueType::INT32}};
@@ -244,7 +269,6 @@ static void TestRedundantStarAccepted() {
 
 	const auto plan = BuildPlan(graph);
 	Expect(plan.complete, "star with a redundant predicate: BuildPlan must complete");
-	Report("one equivalence class stays acyclic however many predicates name it");
 }
 
 //! Slicing has to be exact, not approximate: the count assembled from N
@@ -253,6 +277,8 @@ static void TestRedundantStarAccepted() {
 //! the output into disjoint pieces -- if that reasoning is wrong the sum comes
 //! out short, and only comparing against the undivided answer catches it.
 static void TestSlicingIsExact() {
+	Group scope("a count assembled from slices equals the count taken whole");
+
 	MemorySource source;
 	// Skewed on purpose: one key appears far more often than the rest, so the
 	// buckets are uneven and a slicing bug shows up as a specific shortfall
@@ -289,11 +315,12 @@ static void TestSlicingIsExact() {
 		                                        std::to_string(sliced.count) + ", undivided gives " +
 		                                        std::to_string(whole.count));
 	}
-	Report("a count assembled from slices equals the count taken whole");
 }
 
 //! The point of the exercise: a query that does not fit must still answer.
 static void TestOutOfMemoryFallsBackToSlices() {
+	Group scope("a count too large to fit whole is assembled from slices instead of failing");
+
 	MemorySource source;
 	std::vector<int64_t> keys;
 	for (int64_t v = 0; v < 4000; v++) {
@@ -328,7 +355,6 @@ static void TestOutOfMemoryFallsBackToSlices() {
 	                                           ", unlimited count is " + std::to_string(whole.count));
 	Expect(recovered.slices > 1, "fallback: the answer must be reported as assembled from slices");
 	SetGlobalMemoryLimit(0);
-	Report("a count too large to fit whole is assembled from slices instead of failing");
 }
 
 //! EXISTS has to agree with COUNT on emptiness, for a join with tuples and for
@@ -336,6 +362,8 @@ static void TestOutOfMemoryFallsBackToSlices() {
 //! stops at a *correct* one, and the failure mode of a partitioned search is
 //! answering false because the witness was in a bucket never examined.
 static void TestExistsAgreesWithCount() {
+	Group scope("exists agrees with count on emptiness, including when the witness is sparse");
+
 	// Non-empty, and deliberately sparse: only one key value joins, so most
 	// buckets of the partition are empty and the answer lives in one of them.
 	MemorySource present;
@@ -363,7 +391,6 @@ static void TestExistsAgreesWithCount() {
 	const auto none = ExecuteExists(graph, plan, absent, JoinMode::BOTTOM_INSERT);
 	Expect(none.ok, "exists: succeeds on an empty join (" + none.error + ")");
 	Expect(none.count == 0, "exists: a join with no tuples must answer no");
-	Report("exists agrees with count on emptiness, including when the witness is sparse");
 }
 
 int main() {

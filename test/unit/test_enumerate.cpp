@@ -40,20 +40,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 class MemorySource : public RelationSource {
 public:
@@ -77,6 +94,8 @@ private:
 //! Builds a two-relation join and enumerates it, checking the tuples against
 //! the ones a nested loop over the same inputs produces.
 static void TestEnumerationMatchesTheJoin() {
+	Group scope("enumeration emits exactly the tuples the count counted");
+
 	MemorySource source;
 	//     left            right
 	//   k                k
@@ -115,13 +134,14 @@ static void TestEnumerationMatchesTheJoin() {
 	}
 	std::sort(keys.begin(), keys.end());
 	Expect(keys == std::vector<int64_t>({1, 1, 2, 2}), "enumerate: the key multiset is {1,1,2,2}");
-	Report("enumeration emits exactly the tuples the count counted");
 }
 
 //! The section 4.6 hazard, on a shape that produces it: a three-relation chain
 //! where the middle relation has rows that join upward but not downward, so the
 //! representation holds records whose subtree is empty.
 static void TestEmptySubtreesAreNotEnumerated() {
+	Group scope("records with empty subtrees are skipped, not enumerated");
+
 	MemorySource source;
 	// a.x joins b.x; b.y joins c.y. b has rows whose y matches nothing in c.
 	source.Add({{1, 2}});                  // a(x)
@@ -148,11 +168,12 @@ static void TestEmptySubtreesAreNotEnumerated() {
 		const bool y_is_real = std::find(tuple.begin(), tuple.end(), 99) == tuple.end();
 		Expect(y_is_real, "enumerate: the value that joins nothing must never appear in a tuple");
 	}
-	Report("records with empty subtrees are skipped, not enumerated");
 }
 
 //! What LIMIT needs: the first k tuples without building the rest.
 static void TestLimitStopsEarly() {
+	Group scope("a limit stops enumeration early, and a limit past the end is harmless");
+
 	MemorySource source;
 	// 50 keys x 20 rows each on both sides: 20,000 tuples, of which we want 5.
 	std::vector<int64_t> left, right;
@@ -183,7 +204,6 @@ static void TestLimitStopsEarly() {
 	auto plenty = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 1000000);
 	Expect(plenty.ok && plenty.tuples.size() == 20000,
 	       "limit: a limit past the end yields the whole result, got " + std::to_string(plenty.tuples.size()));
-	Report("a limit stops enumeration early, and a limit past the end is harmless");
 }
 
 //! GROUP BY on a key at the top of the f-tree: each root record is a group, and
@@ -191,6 +211,8 @@ static void TestLimitStopsEarly() {
 //! sum to the count, and each one must equal what enumerating and tallying by
 //! hand would give.
 static void TestGroupCountMatchesEnumeration() {
+	Group scope("grouping on a root attribute matches the count, group by group");
+
 	MemorySource source;
 	// key 1: 2 left x 3 right = 6 tuples
 	// key 2: 1 left x 1 right = 1 tuple
@@ -225,7 +247,6 @@ static void TestGroupCountMatchesEnumeration() {
 	const auto counted = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(counted.ok && summed == counted.count, "group: the groups sum to " + std::to_string(summed) +
 	                                                  " against a count of " + std::to_string(counted.count));
-	Report("grouping on a root attribute matches the count, group by group");
 }
 
 //! A key below the root used to be declined; the fold now descends to it,
@@ -233,6 +254,8 @@ static void TestGroupCountMatchesEnumeration() {
 //! rather than against the arithmetic, since the weight it accumulates on the
 //! way down is exactly what could be wrong.
 static void TestGroupOnDeepKey() {
+	Group scope("a grouping key below the root is descended to, not declined");
+
 	MemorySource source;
 	source.Add({{1, 2}});
 	source.Add({{1, 1, 2}, {10, 99, 20}});
@@ -267,7 +290,6 @@ static void TestGroupOnDeepKey() {
 		                                             std::to_string(entry.second[0]) + ", enumeration says " +
 		                                          std::to_string(found->second));
 	}
-	Report("a grouping key below the root is descended to, not declined");
 }
 
 //! Summing is not counting, and the difference is a weight. A value in one
@@ -276,6 +298,8 @@ static void TestGroupOnDeepKey() {
 //! that weight wrong is invisible on a two-relation join, where it is 1 -- so
 //! this checks against enumeration, which cannot be fooled by it.
 static void TestSumMatchesEnumeration() {
+	Group scope("summing a column agrees with enumerating and adding up, at every position in the tree");
+
 	MemorySource source;
 	// A star: the hub joins two arms, so a hub value is multiplied by the
 	// product of the arms' matching rows, and each arm's values are weighted by
@@ -304,12 +328,13 @@ static void TestSumMatchesEnumeration() {
 		                                    std::to_string(folded.count) + ", enumeration gives " +
 		                                    std::to_string(by_hand));
 	}
-	Report("summing a column agrees with enumerating and adding up, at every position in the tree");
 }
 
 //! A column whose rows join with nothing must contribute nothing, and a group
 //! of zeroes must still be a group.
 static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
+	Group scope("unmatched rows contribute nothing, and a group summing to zero is still a group");
+
 	MemorySource source;
 	source.Add({{1, 2, 3}, {10, 20, 999}}); // left(k, v): k=3 joins nothing
 	source.Add({{1, 2}});                   // right(k)
@@ -341,7 +366,6 @@ static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
 		Expect(grouped.groups[0].second[0] == 0, "sum: that group's sum is 0, got " +
 		                                             std::to_string(grouped.groups[0].second[0]));
 	}
-	Report("unmatched rows contribute nothing, and a group summing to zero is still a group");
 }
 
 //! Grouping on keys in *sibling* branches -- the case plan §10.1 expected to be
@@ -353,6 +377,8 @@ static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
 //! a fold that lost a branch's values behind another branch's counts would
 //! still produce plausible numbers.
 static void TestGroupOnSiblingBranches() {
+	Group scope("grouping across independent sibling branches matches enumeration");
+
 	MemorySource source;
 	// A star: hub joins two arms, and the group keys are one column from each
 	// arm, so neither is an ancestor of the other.
@@ -396,13 +422,14 @@ static void TestGroupOnSiblingBranches() {
 		                                             std::to_string(entry.second[0]) + ", enumeration says " +
 		                                          std::to_string(found->second));
 	}
-	Report("grouping across independent sibling branches matches enumeration");
 }
 
 //! The same shape, summing. This is where carrying only counts through the
 //! cross product would show up: every branch but the last would lose its
 //! values, and the totals would still look reasonable.
 static void TestGroupSumOnSiblingBranches() {
+	Group scope("summing a column from one branch while grouping on another matches enumeration");
+
 	MemorySource source;
 	source.Add({{1, 1, 2}});
 	source.Add({{1, 1, 2}, {7, 8, 9}});
@@ -439,7 +466,6 @@ static void TestGroupSumOnSiblingBranches() {
 		                                             std::to_string(entry.second[0]) + ", enumeration says " +
 		                                          std::to_string(found->second));
 	}
-	Report("summing a column from one branch while grouping on another matches enumeration");
 }
 
 //! Several aggregates in one walk. The point of doing them together is that
@@ -449,6 +475,8 @@ static void TestGroupSumOnSiblingBranches() {
 //! each is weighted by how many tuples the other branches make, and those
 //! weights differ per aggregate.
 static void TestSeveralAggregatesInOneWalk() {
+	Group scope("several aggregates folded in one walk agree with each folded alone");
+
 	MemorySource source;
 	source.Add({{1, 1, 2}});
 	source.Add({{1, 1, 2}, {7, 8, 9}});
@@ -514,12 +542,13 @@ static void TestSeveralAggregatesInOneWalk() {
 			       "several: aggregate " + std::to_string(i) + " alone agrees with it in company");
 		}
 	}
-	Report("several aggregates folded in one walk agree with each folded alone");
 }
 
 //! No grouping columns at all: the whole join is one group, which is how the
 //! ungrouped answer is computed once several aggregates are asked for.
 static void TestSeveralAggregatesUngrouped() {
+	Group scope("with no grouping columns the whole join is a single group");
+
 	MemorySource source;
 	source.Add({{1, 1, 2}});
 	source.Add({{1, 1, 2}, {7, 8, 9}});
@@ -562,7 +591,6 @@ static void TestSeveralAggregatesUngrouped() {
 		                                                  std::to_string(grouped.groups[0].second[2]) +
 		                                                  ", enumeration says " + std::to_string(second));
 	}
-	Report("with no grouping columns the whole join is a single group");
 }
 
 int main() {

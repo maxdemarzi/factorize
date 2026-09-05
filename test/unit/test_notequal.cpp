@@ -40,16 +40,38 @@ static void Expect(bool condition, const std::string &what) {
 }
 
 //! A group is only "ok" if nothing inside it failed.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//!
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 namespace {
 
@@ -142,6 +164,8 @@ QueryGraph MakeGraph(size_t relations, size_t columns, ValueType type) {
 //! each count is supposed to be mode-independent; if a mode were wrong the
 //! difference would be wrong in a way no single-mode test would show.
 static void TestDifferential() {
+	Group scope("counting `<>` by subtraction agrees with enumerating it");
+
 	std::mt19937 rng(70125);
 	int cases = 0;
 	int agreed = 0;
@@ -192,7 +216,6 @@ static void TestDifferential() {
 	                         " cases answered (rest declined) -- enough to be a test");
 	Expect(true, std::to_string(agreed) + " answered cases all match brute-force enumeration");
 	std::printf("       %d answered, %d declined\n", agreed, declined);
-	Report("counting `<>` by subtraction agrees with enumerating it");
 }
 
 //! The relational invariant: the pairs that differ plus the pairs that agree
@@ -203,6 +226,8 @@ static void TestDifferential() {
 //! in the same direction still fails it. This is the same shape as SEMI + ANTI
 //! equalling a side's own tuples in test_semi.cpp.
 static void TestPartition() {
+	Group scope("`<>` and `=` partition the equi-join exactly");
+
 	std::mt19937 rng(90210);
 	int checked = 0;
 	for (int trial = 0; trial < 120; trial++) {
@@ -239,7 +264,6 @@ static void TestPartition() {
 	}
 	Expect(checked > 40, std::to_string(checked) + " partitions checked");
 	Expect(true, "differ + agree == all, on every case");
-	Report("`<>` and `=` partition the equi-join exactly");
 }
 
 //===--------------------------------------------------------------------===//
@@ -247,6 +271,8 @@ static void TestPartition() {
 //===--------------------------------------------------------------------===//
 
 static void TestDeclines() {
+	Group scope("refusals: every unsupported shape is a decline with a reason, never a wrong number");
+
 	std::mt19937 rng(4);
 	auto source = MakeData(rng, 2, 2, 4, 3);
 
@@ -303,7 +329,6 @@ static void TestDeclines() {
 		Expect(result.error.find("equality term") != std::string::npos,
 		       "and the reason names which of the two terms could not be built");
 	}
-	Report("refusals: every unsupported shape is a decline with a reason, never a wrong number");
 }
 
 //===--------------------------------------------------------------------===//
@@ -318,6 +343,8 @@ static void TestDeclines() {
 //! one. It wins when the equi-join is where the time goes and loses when the
 //! `<>` is doing most of the filtering, and a gate would need to know which.
 static void TestCost() {
+	Group scope("cost: two passes, and the second is a composite-key join -- not free, and not always a win");
+
 	std::mt19937 rng(31337);
 	const size_t rows = 400;
 	auto graph = MakeGraph(2, 2, ValueType::INT32);
@@ -346,7 +373,6 @@ static void TestCost() {
 		Expect(result.count <= all.count, "the `<>` count never exceeds the equi-join it filters (domain " +
 		                                      std::to_string(domain) + ")");
 	}
-	Report("cost: two passes, and the second is a composite-key join -- not free, and not always a win");
 }
 
 int main() {

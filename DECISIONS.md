@@ -1257,6 +1257,53 @@ trusting an argument over a measurement, pointing the other way.
 `Report()` printed `ok` unconditionally, so a group whose checks had failed
 printed its FAIL lines and then said ok. Totals and exit code were right, so CI
 caught it -- but a human reads the last line of a group, and that line was a
-lie. Fixed in all seven files that define it, and mutation-tested: a deliberately
-broken check now turns its group's line to FAIL while untouched groups still say
-ok.
+lie.
+
+**Then the fix for it was wrong the same way.** Replacing the unconditional `ok`
+with a global `g_reported` watermark still computed the verdict from state
+outside the group. A group that fails and *returns early* -- which several do on
+purpose, so that one broken invariant does not print a hundred FAIL lines --
+never reaches its own report, and the watermark stamps its failure on the next
+group instead. The same injected failure through both harnesses:
+
+    old   FAIL INJECTED failure
+          FAIL a composite key counts the same under both insert modes   <- passed
+    new   FAIL INJECTED failure
+          FAIL two relations joined on two columns at once               <- actually failed
+          ok   a composite key counts the same under both insert modes
+
+The old one also loses the failing group's line entirely: seven group lines for
+eight groups. The single line a reader uses to localise a failure named a group
+that passed, and hid the group that did not.
+
+**The third shape cannot fail that way.** A `Group` object, constructed at the
+top of each group with the failure count as it stood then, reporting from its
+destructor. An early return still reports, and reports under its own name,
+because leaving the scope is what prints. The first two shapes both needed every
+group to reach its report and nothing made them; this one makes reaching it the
+only way to leave. Now in all eight files and all 52 groups -- one of which had
+never printed a verdict line at all. Mutation-tested in both directions: a group
+that fails mid-way, and a group that fails and then returns early, each turn
+their own line to FAIL, and the group after them still says ok.
+
+Reported by the second session, which hit it writing a sweep that returns on the
+first mismatch -- the same reason mine does.
+
+**The refactor that fixed it deleted three assertions.** Rewriting the
+`if (failures == 0) { Report(...) }` tails swallowed the `Expect(failures == 0,
+...)` line above each one, in the three largest randomized groups -- the single
+check each of those groups exists to make. Caught by counting `Expect(` sites per
+file against `HEAD` before building. Nothing else would have caught it: a suite
+with an assertion deleted goes green, and slightly faster than before. For a
+mechanical edit to test code that invariant is cheap enough to assert every
+time -- the number of checks must not change.
+
+**And once more in the check rather than in the code.** The run that first
+"passed" this fix was `core-test.sh 2>&1 | tail -70`: the exit status belonged to
+`tail`, and the log held the last of twenty-two runs. It could not have reported
+red. That is the same defect as the coverage analyser that ran, exited 0, and
+re-read the previous directory because its `sed` had matched nothing -- so it
+belongs among the instances above rather than beside them as a slip, because the
+question that catches it is the one this whole entry is about. Not *did the check
+pass* but *could this check have failed?* A pipeline that takes its exit status
+from its last stage answers no before it is ever run.

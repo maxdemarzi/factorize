@@ -56,20 +56,37 @@ static void Expect(bool condition, const std::string &what) {
 
 //! A group is only "ok" if nothing inside it failed.
 //!
-//! This printed ok unconditionally, so a group with failing checks showed
-//! its FAIL lines and then said ok on the next line. The totals and the
-//! exit code were right, so CI still caught it -- but a human scanning
-//! output reads the last line of a group, and that line was a lie.
-static int g_reported = 0;
-
-static void Report(const std::string &group) {
-	if (g_failures > g_reported) {
-		g_reported = g_failures;
-		std::printf("  FAIL %s\n", group.c_str());
-		return;
+//! Reporting from a destructor, against a failure count taken when the group
+//! started, is what makes that line trustworthy. Two earlier shapes were not.
+//! Printing "ok" unconditionally said ok for a group whose own checks had just
+//! printed FAIL. Comparing against a global "last reported" watermark fixed
+//! that but moved the FAIL onto the NEXT group's line whenever a group failed
+//! and returned before reporting -- which several groups below do on purpose,
+//! so that one broken invariant does not print a hundred FAIL lines. Both were
+//! wrong the same way: the verdict was computed from state outside the group,
+//! so it survived the group never reaching its own report.
+class Group {
+public:
+	explicit Group(std::string name) : name(std::move(name)), failures_before(g_failures) {
 	}
-	std::printf("  ok   %s\n", group.c_str());
-}
+	Group(const Group &) = delete;
+	Group &operator=(const Group &) = delete;
+
+	//! Some groups only learn part of their own label by running -- how many
+	//! cases they generated, say. A group that fails still has to be named, so
+	//! the label is fixed up front and the detail appended to it afterwards.
+	void Detail(const std::string &detail) {
+		name += detail;
+	}
+
+	~Group() {
+		std::printf("  %-4s %s\n", g_failures > failures_before ? "FAIL" : "ok", name.c_str());
+	}
+
+private:
+	std::string name;
+	const int failures_before;
+};
 
 namespace {
 
@@ -151,6 +168,8 @@ int64_t Run(const Rows &build, const Rows &probe, JoinMode mode, JoinKind kind, 
 // Every kind, both sides, both modes, against a nested loop
 //===--------------------------------------------------------------------===//
 static void TestAgainstBruteForce() {
+	Group scope("inner, semi and anti on both sides agree with a nested loop, both modes");
+
 	std::printf("Semi and anti against a nested loop\n");
 	std::mt19937 rng(20260905);
 	int cases = 0, failures = 0;
@@ -199,13 +218,14 @@ static void TestAgainstBruteForce() {
 	}
 	Expect(failures == 0, std::to_string(failures) + " of " + std::to_string(cases) + " disagree (" + detail + ")");
 	Expect(cases > 500, "the sweep covered " + std::to_string(cases) + " cases");
-	Report("inner, semi and anti on both sides agree with a nested loop, both modes");
 }
 
 //===--------------------------------------------------------------------===//
 // The relations between the kinds
 //===--------------------------------------------------------------------===//
 static void TestInvariants() {
+	Group scope("semi + anti == the side's own tuples, and semi <= inner");
+
 	std::printf("Semi and anti partition the side they emit\n");
 	std::mt19937 rng(99);
 	int checked = 0;
@@ -238,7 +258,6 @@ static void TestInvariants() {
 	Expect(partition_ok, "semi + anti must equal the emitted side's tuple count (" + detail + ")");
 	Expect(bound_ok, "a semi-join cannot exceed the inner join it filters");
 	Expect(checked == 120, "checked " + std::to_string(checked) + " combinations");
-	Report("semi + anti == the side's own tuples, and semi <= inner");
 }
 
 //===--------------------------------------------------------------------===//
@@ -249,6 +268,8 @@ static void TestInvariants() {
 // tuple that record encodes rather than the record once. This is the same trap
 // the outer-join work had, arriving through a different fold.
 static void TestFactorizedSide() {
+	Group scope("a record standing for many tuples emits all of them, not one");
+
 	std::printf("A factorized side, where one record is many tuples\n");
 
 	Rows r;
@@ -294,13 +315,14 @@ static void TestFactorizedSide() {
 		Expect(semi + anti == accumulated.Count(),
 		       "semi + anti must equal the factorized side's tuple count" + where);
 	}
-	Report("a record standing for many tuples emits all of them, not one");
 }
 
 //===--------------------------------------------------------------------===//
 // The combinations that have no meaning are refused
 //===--------------------------------------------------------------------===//
 static void TestInvalidCombinations() {
+	Group scope("only semi and anti constrain which side is named");
+
 	std::printf("Meaningless combinations are refused rather than answered\n");
 	Rows a;
 	a.attributes = {0, 1};
@@ -327,7 +349,6 @@ static void TestInvalidCombinations() {
 	Expect(!throws(JoinKind::PRODUCT, Preserve::NEITHER), "PRODUCT with NEITHER is the inner join");
 	Expect(!throws(JoinKind::PRODUCT, Preserve::BUILD), "PRODUCT with one side is the outer join");
 	Expect(!throws(JoinKind::PRODUCT, Preserve::BOTH), "PRODUCT with BOTH is the full outer join");
-	Report("only semi and anti constrain which side is named");
 }
 
 int main() {
