@@ -429,6 +429,17 @@ struct LowerSizeCounter {
 	}
 };
 
+//! One indexed lower-side instance: the number of tuples it would contribute,
+//! and whether any upper tuple ever reached it.
+//!
+//! The flag is the paper's build-side "marker" (section 4.8). It costs a byte
+//! per entry and one store per match, and it is only read when the lower side
+//! is preserved.
+struct LowerEntry {
+	int64_t size;
+	bool matched;
+};
+
 //! Cardinality of the whole join output, walking the upper side's plan and
 //! folding the matching lower subtree sizes in at the insertion level.
 struct OutputCounter {
@@ -437,8 +448,12 @@ struct OutputCounter {
 	FlattenContext &ctx;
 	int32_t insertion_level;
 	const KeyReader &key;
-	const ChainingHashTable<int64_t> &table;
+	ChainingHashTable<LowerEntry> &table;
 	size_t *matches;
+	//! An upper tuple with no partner still contributes one output tuple.
+	bool preserve_upper;
+	//! Whether the marker has to be maintained at all.
+	bool mark_lower;
 
 	int64_t Of(uint32_t plan_index) {
 		const auto &level = plan.Level(plan_index);
@@ -449,6 +464,10 @@ struct OutputCounter {
 			            [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
 			size = CheckedCardinalityMul(size, slot_total);
 			if (size == 0) {
+				// This upper record encodes no tuples at all, so there is
+				// nothing here for an outer join to preserve and nothing that
+				// may mark a lower entry as matched. Preservation is about
+				// tuples that exist and found no partner.
 				return 0;
 			}
 		}
@@ -456,12 +475,21 @@ struct OutputCounter {
 			// The slot the other side would have been attached to contributes
 			// the summed size of everything that matches this key.
 			int64_t matched = 0;
-			table.ForEachMatch(key.Read(plan, input, ctx), [&](int64_t subtree) {
-				matched = CheckedCardinalityAdd(matched, subtree);
+			table.ForEachMatchMutable(key.Read(plan, input, ctx), [&](LowerEntry &entry) {
+				matched = CheckedCardinalityAdd(matched, entry.size);
+				if (mark_lower) {
+					entry.matched = true;
+				}
 				if (matches) {
 					(*matches)++;
 				}
 			});
+			if (matched == 0 && preserve_upper) {
+				// Null-extension, counted rather than represented: one output
+				// tuple per upper tuple, whatever the lower side's columns
+				// would have been.
+				matched = 1;
+			}
 			size = CheckedCardinalityMul(size, matched);
 		}
 		return size;
@@ -471,8 +499,15 @@ struct OutputCounter {
 } // namespace
 
 int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRelation &probe, const JoinKeys &keys,
-                            JoinMode mode, PathStrategy strategy, JoinStats *stats) {
+                            JoinMode mode, PathStrategy strategy, JoinStats *stats, Preserve preserve) {
 	const bool build_on_top = (mode == JoinMode::BOTTOM_INSERT);
+	// `preserve` names the arguments; the counters think in upper and lower.
+	// Which argument is which depends on the mode, so the translation happens
+	// once, here, rather than at each use.
+	const bool preserve_build = (preserve == Preserve::BUILD || preserve == Preserve::BOTH);
+	const bool preserve_probe = (preserve == Preserve::PROBE || preserve == Preserve::BOTH);
+	const bool preserve_upper = build_on_top ? preserve_build : preserve_probe;
+	const bool preserve_lower = build_on_top ? preserve_probe : preserve_build;
 	const FactorizedRelation &upper = build_on_top ? build : probe;
 	const FactorizedRelation &lower = build_on_top ? probe : build;
 	const std::vector<AttributeId> &upper_keys = build_on_top ? keys.build : keys.probe;
@@ -512,11 +547,11 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 
 	// Index the lower side by key, storing the size each match would contribute
 	// rather than a handle to records that are never created.
-	ChainingHashTable<int64_t> table;
+	ChainingHashTable<LowerEntry> table;
 	table.SetMemoryLimit(GetGlobalMemoryLimit());
 	IterateKeyPath(lower_plan, 0, lower_key.plan_index, lower_parents, lower.Rep(), lower_ctx, [&]() {
 		LowerSizeCounter counter {lower_plan, lower_on_key_path, lower.Rep(), lower_ctx};
-		table.Insert(lower_key.Read(lower_plan, lower.Rep(), lower_ctx), counter.Of(0));
+		table.Insert(lower_key.Read(lower_plan, lower.Rep(), lower_ctx), LowerEntry {counter.Of(0), false});
 	});
 	table.Finalize();
 	if (stats) {
@@ -526,13 +561,27 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 	int64_t total = 0;
 	size_t matches = 0;
 	OutputCounter counter {upper_plan, upper.Rep(), upper_ctx, static_cast<int32_t>(merge.insertion_level),
-	                       upper_key,  table,       &matches};
+	                       upper_key,  table,       &matches,  preserve_upper,
+	                       preserve_lower};
 	IterateLevel(upper_plan, 0, upper.Rep(), upper_ctx, 0, [&]() {
 		if (stats) {
 			stats->probe_rows++;
 		}
-		total += counter.Of(0);
+		total = CheckedCardinalityAdd(total, counter.Of(0));
 	});
+
+	if (preserve_lower) {
+		// The other half of the paper's sketch. Every lower instance nothing
+		// reached is null-extended on the upper side's columns, which for a
+		// count means it contributes its own tuples and no more -- one output
+		// tuple per lower tuple, exactly the size already stored for it.
+		table.ForEachValue([&](const LowerEntry &entry) {
+			if (!entry.matched) {
+				total = CheckedCardinalityAdd(total, entry.size);
+			}
+		});
+	}
+
 	if (stats) {
 		stats->matches = matches;
 	}

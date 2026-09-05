@@ -118,6 +118,28 @@ public:
 		}
 	}
 
+	//! As ForEachMatch, but hands over a reference the caller can write to.
+	//!
+	//! This is what the paper's "marker" (section 4.8) needs: an outer join has
+	//! to know, after the probe phase, which indexed entries nothing ever
+	//! reached. Recording that on the value costs a byte and one store per
+	//! match, and it answers the question without a second pass over the
+	//! probing side.
+	template <typename Fn>
+	void ForEachMatchMutable(uint64_t key, Fn &&fn) {
+		for (auto *entry = FindMutable(key); entry; entry = FindNextMutable(entry, key)) {
+			fn(entry->value);
+		}
+	}
+
+	//! Every value, in insertion order, whether or not anything matched it.
+	template <typename Fn>
+	void ForEachValue(Fn &&fn) const {
+		for (const auto *entry : entries) {
+			fn(entry->value);
+		}
+	}
+
 	size_t Size() const {
 		return entries.size();
 	}
@@ -140,6 +162,29 @@ public:
 	}
 
 private:
+	//! Non-const twins of Find/FindNext. Deliberately not const_cast'd from the
+	//! const ones: a table being marked is genuinely being mutated, and saying
+	//! so in the type is what keeps the const overloads honest for every other
+	//! caller.
+	Entry *FindMutable(uint64_t key) {
+		if (!finalized || directory.empty()) {
+			return nullptr;
+		}
+		auto *entry = directory[Slot(key)];
+		while (entry && entry->key != key) {
+			entry = entry->next;
+		}
+		return entry;
+	}
+
+	static Entry *FindNextMutable(Entry *current, uint64_t key) {
+		auto *entry = current->next;
+		while (entry && entry->key != key) {
+			entry = entry->next;
+		}
+		return entry;
+	}
+
 	size_t Slot(uint64_t key) const {
 		// Take the high bits, as the paper does. `mask` guards the bits == 0
 		// case, where shift would be 64 and the shift itself undefined.

@@ -79,6 +79,25 @@ private:
 	std::unique_ptr<FRepresentation> frep;
 };
 
+//! Which input of an outer join keeps its tuples when nothing matches.
+//!
+//! Named for the two arguments rather than for SQL's LEFT and RIGHT, because
+//! the core has no idea which side the user wrote first and every mapping from
+//! one to the other is a chance to swap them. `A LEFT JOIN B` preserves
+//! whichever of `build`/`probe` A was passed as; the caller owns that mapping.
+//!
+//! Not the same axis as JoinMode. Mode chooses which side is indexed, which is
+//! a performance question and leaves the answer unchanged; this changes the
+//! answer.
+enum class Preserve : uint8_t {
+	//! An inner join: an unmatched tuple contributes nothing.
+	NEITHER,
+	BUILD,
+	PROBE,
+	//! FULL OUTER.
+	BOTH
+};
+
 //! Statistics for a single join, for the Phase 1 harness and later EXPLAIN.
 struct JoinStats {
 	size_t build_keys = 0;
@@ -118,8 +137,22 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 //!
 //! The count is a property of the relation, so both insert modes yield the same
 //! answer; `mode` still selects which side is indexed and which is scanned.
+//!
+//! `preserve` makes it an outer join (plan section 10.5, paper section 4.8).
+//! The paper's sketch is about representing null-extension, and a count never
+//! looks at a value -- so here the whole of it is arithmetic: an unmatched
+//! tuple has to contribute 1 rather than 0. Nothing about the record format
+//! changes, and no NULL is ever stored.
+//!
+//! Only this function takes it. FactorizedJoin, which builds a representation
+//! rather than a number, would need a record for the null-extended row and a
+//! way to say its columns are absent, and it would need PruneEmptySubtrees to
+//! stop dropping exactly those records. So an outer join is supported where it
+//! is the *last* join of a plan -- the one that is fused into the count -- and
+//! declined anywhere else.
 int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRelation &probe, const JoinKeys &keys,
-                            JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE, JoinStats *stats = nullptr);
+                            JoinMode mode, PathStrategy strategy = PathStrategy::LEVELWISE, JoinStats *stats = nullptr,
+                            Preserve preserve = Preserve::NEITHER);
 
 //! Memory cap applied to every f-representation the core creates; 0 = none.
 //!
