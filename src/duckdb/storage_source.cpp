@@ -277,6 +277,28 @@ void StorageSource::Load(size_t relation) {
 		// per value. Reading 18 million rows a row at a time, re-deciding the
 		// column's type for each one, was most of the runtime of a query whose
 		// join is supposed to be the expensive part.
+		// A NULL in a column the answer *carries* is not a row to drop, it is a
+		// row of the answer. Checked per chunk rather than per row, and only for
+		// the few columns where it can arise: whether such a column may be NULL
+		// at all was already decided from the statistics when the region was
+		// bound, so reaching this is the statistics having been wrong -- they
+		// cover committed row groups and not rows appended in this transaction.
+		// Throwing there is the point. A silently missing row would break the
+		// one contract this rule has, that turning it off changes only speed.
+		for (auto column : bound.no_null_columns) {
+			if (formats[column].validity.AllValid()) {
+				continue;
+			}
+			for (idx_t row = 0; row < chunk.size(); row++) {
+				if (formats[column].validity.RowIsValid(formats[column].sel->get_index(row))) {
+					continue;
+				}
+				throw InvalidInputException(
+				    "factorize: %s.%s contains NULL, which this query needs to report as its own "
+				    "group and the representation cannot carry; SET factorize_mode='off' to run it",
+				    bound.alias, bound.column_names[column]);
+			}
+		}
 		kept.clear();
 		for (idx_t row = 0; row < chunk.size(); row++) {
 			bool all_valid = true;

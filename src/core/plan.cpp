@@ -774,8 +774,15 @@ ExecuteResult ExecuteSum(const QueryGraph &graph, const Plan &plan, RelationSour
 		const auto &rep = built.relation->Rep();
 		const auto attribute = AttributeOf(graph, sum_relation, sum_column);
 		int64_t total = 0;
-		rep.ForEachRoot([&](Record root) { total = CheckedCardinalityAdd(total, rep.SubtreeSum(root, attribute)); });
+		int64_t tuples = 0;
+		rep.ForEachRoot([&](Record root) {
+			total = CheckedCardinalityAdd(total, rep.SubtreeSum(root, attribute));
+			// Counted alongside, because a total of zero says nothing about
+			// whether anything was summed, and SQL answers NULL when nothing was.
+			tuples = CheckedCardinalityAdd(tuples, static_cast<int64_t>(rep.SubtreeSize(root)));
+		});
 		result.count = total;
+		result.tuples = tuples;
 		result.records = rep.RecordCount();
 		result.bytes = rep.BytesAllocated();
 		result.ok = true;
@@ -790,13 +797,212 @@ ExecuteResult ExecuteSum(const QueryGraph &graph, const Plan &plan, RelationSour
 
 namespace {
 
-//! The grouped folds differ only in what a root's subtree contributes.
+//! Where each grouping column lives in the representation, and where its value
+//! goes in the emitted row.
+struct GroupSite {
+	AttributeId attribute = 0;
+	LevelId level = 0;
+	size_t position = 0;
+};
+
+//! Groups a representation by several columns at once, without enumerating a
+//! tuple.
+//!
+//! The single-key case is easy because a root record *is* a group. Several keys
+//! are not, and the plan (§10.1) expects the hard shape to be declined: keys
+//! scattered across independent sibling branches need the cross product of
+//! those branches. But that cross product is exactly what the representation is
+//! made of -- siblings are independent, which is the entire premise -- so the
+//! branches can be walked together rather than flattened.
+//!
+//! The walk fixes a key's value as it descends past it and multiplies by any
+//! slot that holds no key at all, because such a slot only decides *how many*
+//! tuples a combination stands for. When every key below has been fixed, what
+//! remains is one group and the subtree size beneath it.
+//!
+//! The cost is the number of groups, which is the size of the answer the caller
+//! asked for -- not the size of the join.
+class GroupFold {
+public:
+	//! What a set of tuples contributes: how many there are, and what they sum
+	//! to. Both folds are carried together because the sum needs the count.
+	//!
+	//! Independent sets combine by the semiring product, not by multiplying
+	//! twice: (c1,s1) x (c2,s2) = (c1*c2, s1*c2 + c1*s2). Each side's values
+	//! appear once per tuple of the other, which is why a sum cannot be carried
+	//! as a scalar weight -- propagating only the counts loses every value in
+	//! every branch but the last.
+	struct Fold {
+		int64_t count = 1;
+		int64_t sum = 0;
+	};
+
+	static Fold Combine(const Fold &a, const Fold &b) {
+		Fold result;
+		result.count = CheckedCardinalityMul(a.count, b.count);
+		result.sum = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum, b.count), CheckedCardinalityMul(a.count, b.sum));
+		return result;
+	}
+
+	static Fold Alternatives(const Fold &a, const Fold &b) {
+		Fold result;
+		result.count = CheckedCardinalityAdd(a.count, b.count);
+		result.sum = CheckedCardinalityAdd(a.sum, b.sum);
+		return result;
+	}
+
+	GroupFold(const FRepresentation &rep, std::vector<GroupSite> sites, size_t width, Aggregate aggregate,
+	          AttributeId sum_attribute)
+	    : rep(rep), sites(std::move(sites)), width(width), aggregate(aggregate), sum_attribute(sum_attribute) {
+		// Which levels have a key at or below them, so a slot leading nowhere
+		// useful can be collapsed into a multiplier instead of walked.
+		const auto &layout = rep.GetLayout();
+		carries.assign(layout.LevelCount(), false);
+		for (size_t level = layout.LevelCount(); level-- > 0;) {
+			for (const auto &site : this->sites) {
+				if (site.level == level) {
+					carries[level] = true;
+				}
+			}
+			for (const auto &slot : layout.Level(static_cast<LevelId>(level)).slots) {
+				if (carries[slot.child_level]) {
+					carries[level] = true;
+				}
+			}
+		}
+	}
+
+	void Run(std::map<std::vector<int64_t>, Fold> &out) {
+		std::vector<int64_t> row(width, 0);
+		Fold identity;
+		rep.ForEachRoot([&](Record root) { Descend(root, row, identity, out); });
+	}
+
+private:
+	//! What a slot's children stand for, taken together: they are alternatives,
+	//! so they add.
+	Fold SlotTotals(Record record, size_t slot_index) const {
+		Fold total;
+		total.count = 0;
+		rep.ForEachChild(record, slot_index, [&](Record child) {
+			Fold child_fold;
+			child_fold.count = rep.SubtreeSize(child);
+			child_fold.sum = aggregate == Aggregate::SUM ? rep.SubtreeSum(child, sum_attribute) : 0;
+			total = Alternatives(total, child_fold);
+		});
+		return total;
+	}
+
+	//! This record's own contribution before any child is considered: one tuple
+	//! so far, carrying its own value if the summed column lives here.
+	Fold Own(Record record) const {
+		Fold fold;
+		if (aggregate != Aggregate::SUM) {
+			return fold;
+		}
+		const auto &level = rep.GetLayout().Level(record.Level());
+		for (const auto &entry : level.payload) {
+			if (entry.attribute == sum_attribute) {
+				fold.sum = rep.GetValue(record, sum_attribute);
+				break;
+			}
+		}
+		return fold;
+	}
+
+	void Descend(Record record, std::vector<int64_t> &row, const Fold &incoming,
+	             std::map<std::vector<int64_t>, Fold> &out) {
+		if (incoming.count == 0 || rep.SubtreeSize(record) == 0) {
+			// An empty subtree denotes no tuples, so it names no group.
+			return;
+		}
+		for (const auto &site : sites) {
+			if (site.level == record.Level()) {
+				row[site.position] = rep.GetValue(record, site.attribute);
+			}
+		}
+		const auto &level = rep.GetLayout().Level(record.Level());
+
+		// Slots with no key beneath them cannot split a group, so they fold in
+		// now: they decide how many tuples a combination stands for, and what
+		// those tuples contribute.
+		Fold here = Combine(incoming, Own(record));
+		std::vector<size_t> walk;
+		for (size_t slot_index = 0; slot_index < level.slots.size(); slot_index++) {
+			if (carries[level.slots[slot_index].child_level]) {
+				walk.push_back(slot_index);
+				continue;
+			}
+			here = Combine(here, SlotTotals(record, slot_index));
+		}
+		if (here.count == 0) {
+			return;
+		}
+		if (walk.empty()) {
+			// Every key is fixed, so this subtree is one group's worth of tuples.
+			//
+			// Inserted with an explicit zero rather than through operator[]:
+			// Fold's default is the *multiplicative* identity, count 1, because
+			// that is what Combine needs -- and using it as an accumulator would
+			// add a tuple to every group that nothing counted.
+			auto found = out.find(row);
+			if (found == out.end()) {
+				found = out.emplace(row, Fold {0, 0}).first;
+			}
+			found->second = Alternatives(found->second, here);
+			return;
+		}
+		Cross(record, walk, 0, row, here, out);
+	}
+
+	//! The cross product over the slots that do carry keys.
+	//!
+	//! Each contributes its own groups and the combinations are the product of
+	//! them, which is precisely the case §10.1 expected to be declined. It is
+	//! computable because siblings are independent -- the property the whole
+	//! representation is built on -- so a branch can be grouped on its own and
+	//! its groups combined with the others afterwards.
+	void Cross(Record record, const std::vector<size_t> &walk, size_t index, std::vector<int64_t> &row,
+	           const Fold &incoming, std::map<std::vector<int64_t>, Fold> &out) {
+		const bool last = (index + 1 == walk.size());
+		rep.ForEachChild(record, walk[index], [&](Record child) {
+			if (last) {
+				Descend(child, row, incoming, out);
+				return;
+			}
+			// Group this branch by itself, then carry each of its groups into
+			// the remaining branches. Combining with the semiring product is
+			// what keeps a branch's values from being lost behind another
+			// branch's counts.
+			std::map<std::vector<int64_t>, Fold> nested;
+			std::vector<int64_t> child_row = row;
+			Fold identity;
+			Descend(child, child_row, identity, nested);
+			for (const auto &entry : nested) {
+				std::vector<int64_t> merged = entry.first;
+				Cross(record, walk, index + 1, merged, Combine(incoming, entry.second), out);
+			}
+		});
+	}
+
+	const FRepresentation &rep;
+	std::vector<GroupSite> sites;
+	size_t width;
+	Aggregate aggregate;
+	AttributeId sum_attribute;
+	std::vector<bool> carries;
+};
+
 GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                         size_t group_relation, size_t group_column, Aggregate aggregate, size_t sum_relation,
+                         const std::vector<GroupKey> &keys, Aggregate aggregate, size_t sum_relation,
                          size_t sum_column, PathStrategy strategy) {
 	GroupCountResult result;
 	if (!plan.complete) {
 		result.error = plan.reason.empty() ? "no plan" : plan.reason;
+		return result;
+	}
+	if (keys.empty()) {
+		result.error = "no grouping column";
 		return result;
 	}
 	if (aggregate == Aggregate::SUM &&
@@ -804,9 +1010,11 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 		result.error = "summed column is not a column of the query";
 		return result;
 	}
-	if (group_relation >= graph.RelationCount() || group_column >= graph.column_counts[group_relation]) {
-		result.error = "grouping column is not a column of the query";
-		return result;
+	for (const auto &key : keys) {
+		if (key.relation >= graph.RelationCount() || key.column >= graph.column_counts[key.relation]) {
+			result.error = "grouping column is not a column of the query";
+			return result;
+		}
 	}
 	auto built = BuildRepresentation(graph, plan, source, mode, strategy);
 	if (!built.ok) {
@@ -819,50 +1027,45 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 		auto &classes = *built.classes;
 		const auto &layout = accumulated.GetLayout();
 
-		// The grouping key has to be readable from a root record. An equivalent
-		// attribute will do: an equi-join's keys are equal by definition, so
-		// grouping on either gives the same groups.
-		const auto wanted = AttributeOf(graph, group_relation, group_column);
-		AttributeId found = 0;
-		bool present = false;
-		if (layout.LevelCount() > 0) {
-			for (const auto &entry : layout.Level(0).payload) {
-				if (entry.attribute == wanted || classes.SameClass(entry.attribute, wanted)) {
-					found = entry.attribute;
-					present = true;
-					break;
+		// Find where each key's values are actually stored. An equi-join's keys
+		// are equal by definition, so grouping on either side of one names the
+		// same groups -- and the merge is free to have kept only one of them.
+		std::vector<GroupSite> sites;
+		for (size_t position = 0; position < keys.size(); position++) {
+			const auto wanted = AttributeOf(graph, keys[position].relation, keys[position].column);
+			bool found = false;
+			for (size_t level = 0; level < layout.LevelCount() && !found; level++) {
+				for (const auto &entry : layout.Level(static_cast<LevelId>(level)).payload) {
+					if (entry.attribute == wanted || classes.SameClass(entry.attribute, wanted)) {
+						sites.push_back(GroupSite {entry.attribute, static_cast<LevelId>(level), position});
+						found = true;
+						break;
+					}
 				}
 			}
-		}
-		if (!present) {
-			result.error = "grouping column is not at the top of the f-tree, where each group is one root record";
-			return result;
+			if (!found) {
+				result.error = "grouping column is not stored anywhere in the representation";
+				return result;
+			}
 		}
 
 		const auto sum_attribute =
 		    aggregate == Aggregate::SUM ? AttributeOf(graph, sum_relation, sum_column) : AttributeId(0);
-		// A group with no tuples is not a group, but a group whose values sum to
-		// zero is. Emptiness has to be judged by the count even when the answer
-		// is a sum, or `sum(x)` over a group of zeroes would vanish.
-		std::map<int64_t, std::pair<int64_t, int64_t>> totals;
-		const auto &rep = accumulated.Rep();
-		rep.ForEachRoot([&](Record root) {
-			const auto value = rep.GetValue(root, found);
-			auto &slot = totals[value];
-			slot.first = CheckedCardinalityAdd(slot.first, rep.SubtreeSize(root));
-			slot.second = CheckedCardinalityAdd(
-			    slot.second, aggregate == Aggregate::SUM ? rep.SubtreeSum(root, sum_attribute) : rep.SubtreeSize(root));
-		});
+		GroupFold fold(accumulated.Rep(), std::move(sites), keys.size(), aggregate, sum_attribute);
+		std::map<std::vector<int64_t>, GroupFold::Fold> totals;
+		fold.Run(totals);
+
 		for (const auto &entry : totals) {
-			// A root whose subtree is empty denotes no tuples, so it is not a
-			// group: it is a value that joined with nothing, and an inner join
-			// does not report those.
-			if (entry.second.first > 0) {
-				result.groups.emplace_back(entry.first, entry.second.second);
+			// A combination no tuple satisfies is not a group. Emptiness is
+			// judged by the count even when the answer is a sum, or a group
+			// whose values happen to total zero would vanish.
+			if (entry.second.count > 0) {
+				result.groups.emplace_back(entry.first,
+				                           aggregate == Aggregate::SUM ? entry.second.sum : entry.second.count);
 			}
 		}
-		result.records = rep.RecordCount();
-		result.bytes = rep.BytesAllocated();
+		result.records = accumulated.Rep().RecordCount();
+		result.bytes = accumulated.Rep().BytesAllocated();
 		result.ok = true;
 	} catch (const MemoryLimitExceeded &error) {
 		result.error = error.what();
@@ -876,17 +1079,15 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 } // namespace
 
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                                   size_t group_relation, size_t group_column, PathStrategy strategy) {
-	return GroupBy(graph, plan, source, mode, group_relation, group_column, Aggregate::COUNT, 0, 0, strategy);
+                                   const std::vector<GroupKey> &keys, PathStrategy strategy) {
+	return GroupBy(graph, plan, source, mode, keys, Aggregate::COUNT, 0, 0, strategy);
 }
 
 GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                                 size_t group_relation, size_t group_column, size_t sum_relation, size_t sum_column,
+                                 const std::vector<GroupKey> &keys, size_t sum_relation, size_t sum_column,
                                  PathStrategy strategy) {
-	return GroupBy(graph, plan, source, mode, group_relation, group_column, Aggregate::SUM, sum_relation, sum_column,
-	               strategy);
+	return GroupBy(graph, plan, source, mode, keys, Aggregate::SUM, sum_relation, sum_column, strategy);
 }
-
 ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                             PathStrategy strategy) {
 	// Enough buckets that finding a witness early is worth something, few enough

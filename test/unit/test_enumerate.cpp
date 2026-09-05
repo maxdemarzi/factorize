@@ -191,12 +191,12 @@ static void TestGroupCountMatchesEnumeration() {
 	graph.predicates = {Predicate {0, 0, 1, 0}};
 	const auto plan = BuildPlan(graph);
 
-	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT, 0, 0);
+	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}});
 	Expect(grouped.ok, "group: succeeds (" + grouped.error + ")");
 
 	std::map<int64_t, int64_t> got;
 	for (const auto &entry : grouped.groups) {
-		got[entry.first] = entry.second;
+		got[entry.first[0]] = entry.second;
 	}
 	Expect(got.size() == 2, "group: two keys join, got " + std::to_string(got.size()) + " groups");
 	Expect(got[1] == 6, "group: key 1 has 6 tuples, got " + std::to_string(got[1]));
@@ -215,9 +215,11 @@ static void TestGroupCountMatchesEnumeration() {
 	Report("grouping on a root attribute matches the count, group by group");
 }
 
-//! A key the representation does not hold at the top has to be declined, not
-//! guessed at.
-static void TestGroupOnDeepKeyDeclines() {
+//! A key below the root used to be declined; the fold now descends to it,
+//! carrying the tuples the levels above stand for. Checked against enumeration
+//! rather than against the arithmetic, since the weight it accumulates on the
+//! way down is exactly what could be wrong.
+static void TestGroupOnDeepKey() {
 	MemorySource source;
 	source.Add({{1, 2}});
 	source.Add({{1, 1, 2}, {10, 99, 20}});
@@ -230,11 +232,29 @@ static void TestGroupOnDeepKeyDeclines() {
 	const auto plan = BuildPlan(graph);
 
 	// Relation 2's column is at the bottom of the chain, not the top.
-	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT, 2, 0);
-	Expect(!grouped.ok, "group: a key below the root must be declined");
-	Expect(grouped.error.find("top of the f-tree") != std::string::npos,
-	       "group: the decline must say what is wrong, got '" + grouped.error + "'");
-	Report("a grouping key that is not at the top is declined rather than guessed");
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "deep key: materialize succeeds (" + materialized.error + ")");
+	// Attributes are a.x, b.x, b.y, c.y -- so relation 2's column is index 3.
+	std::map<int64_t, int64_t> by_hand;
+	for (const auto &tuple : materialized.tuples) {
+		by_hand[tuple[3]]++;
+	}
+
+	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {2, 0}});
+	Expect(grouped.ok, "deep key: fold succeeds (" + grouped.error + ")");
+	Expect(grouped.groups.size() == by_hand.size(), "deep key: " + std::to_string(grouped.groups.size()) +
+	                                                    " groups against " + std::to_string(by_hand.size()));
+	for (const auto &entry : grouped.groups) {
+		const auto found = by_hand.find(entry.first[0]);
+		if (found == by_hand.end()) {
+			Expect(false, "deep key: fold invented group " + std::to_string(entry.first[0]));
+			continue;
+		}
+		Expect(entry.second == found->second, "deep key: group " + std::to_string(entry.first[0]) + " counts " +
+		                                          std::to_string(entry.second) + ", enumeration says " +
+		                                          std::to_string(found->second));
+	}
+	Report("a grouping key below the root is descended to, not declined");
 }
 
 //! Summing is not counting, and the difference is a weight. A value in one
@@ -300,7 +320,7 @@ static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
 	zero_graph.column_types = {{ValueType::INT64, ValueType::INT64}, {ValueType::INT64}};
 	zero_graph.predicates = {Predicate {0, 0, 1, 0}};
 	const auto zero_plan = BuildPlan(zero_graph);
-	auto grouped = ExecuteGroupSum(zero_graph, zero_plan, zeroes, JoinMode::BOTTOM_INSERT, 0, 0, 0, 1);
+	auto grouped = ExecuteGroupSum(zero_graph, zero_plan, zeroes, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}}, 0, 1);
 	Expect(grouped.ok, "sum: grouped sum succeeds (" + grouped.error + ")");
 	Expect(grouped.groups.size() == 1, "sum: a group whose values are all zero is still a group, got " +
 	                                       std::to_string(grouped.groups.size()));
@@ -309,6 +329,104 @@ static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
 		                                          std::to_string(grouped.groups[0].second));
 	}
 	Report("unmatched rows contribute nothing, and a group summing to zero is still a group");
+}
+
+//! Grouping on keys in *sibling* branches -- the case plan §10.1 expected to be
+//! declined, because the groups are the cross product of the branches.
+//!
+//! It is computable precisely because siblings are independent, which is the
+//! property the representation exists to preserve. The check is against
+//! enumeration: group the flat tuples by hand and demand the same table, since
+//! a fold that lost a branch's values behind another branch's counts would
+//! still produce plausible numbers.
+static void TestGroupOnSiblingBranches() {
+	MemorySource source;
+	// A star: hub joins two arms, and the group keys are one column from each
+	// arm, so neither is an ancestor of the other.
+	source.Add({{1, 1, 2}});             // hub(k)
+	source.Add({{1, 1, 2}, {7, 8, 9}});  // arm1(k, a)
+	source.Add({{1, 2, 2}, {70, 80, 90}}); // arm2(k, b)
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "sibling groups: materialize succeeds (" + materialized.error + ")");
+	// Attribute order is relation 0's columns, then 1's, then 2's: hub.k, arm1.k,
+	// arm1.a, arm2.k, arm2.b -- so a is index 2 and b is index 4.
+	std::map<std::pair<int64_t, int64_t>, int64_t> by_hand;
+	for (const auto &tuple : materialized.tuples) {
+		by_hand[{tuple[2], tuple[4]}]++;
+	}
+
+	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT,
+	                                 {GroupKey {1, 1}, GroupKey {2, 1}});
+	Expect(grouped.ok, "sibling groups: fold succeeds (" + grouped.error + ")");
+	Expect(grouped.groups.size() == by_hand.size(), "sibling groups: " + std::to_string(grouped.groups.size()) +
+	                                                    " groups against " + std::to_string(by_hand.size()) +
+	                                                    " from enumeration");
+	for (const auto &entry : grouped.groups) {
+		const auto key = std::make_pair(entry.first[0], entry.first[1]);
+		const auto found = by_hand.find(key);
+		if (found == by_hand.end()) {
+			Expect(false, "sibling groups: fold invented the group (" + std::to_string(key.first) + "," +
+			                  std::to_string(key.second) + ")");
+			continue;
+		}
+		Expect(entry.second == found->second, "sibling groups: (" + std::to_string(key.first) + "," +
+		                                          std::to_string(key.second) + ") counts " +
+		                                          std::to_string(entry.second) + ", enumeration says " +
+		                                          std::to_string(found->second));
+	}
+	Report("grouping across independent sibling branches matches enumeration");
+}
+
+//! The same shape, summing. This is where carrying only counts through the
+//! cross product would show up: every branch but the last would lose its
+//! values, and the totals would still look reasonable.
+static void TestGroupSumOnSiblingBranches() {
+	MemorySource source;
+	source.Add({{1, 1, 2}});
+	source.Add({{1, 1, 2}, {7, 8, 9}});
+	source.Add({{1, 2, 2}, {70, 80, 90}});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "sibling sums: materialize succeeds (" + materialized.error + ")");
+	// Group by arm1.a, and sum arm2.b -- the summed column lives in the *other*
+	// branch from the grouping key.
+	std::map<int64_t, int64_t> by_hand;
+	for (const auto &tuple : materialized.tuples) {
+		by_hand[tuple[2]] += tuple[4];
+	}
+
+	auto grouped = ExecuteGroupSum(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {1, 1}}, 2, 1);
+	Expect(grouped.ok, "sibling sums: fold succeeds (" + grouped.error + ")");
+	Expect(grouped.groups.size() == by_hand.size(), "sibling sums: " + std::to_string(grouped.groups.size()) +
+	                                                    " groups against " + std::to_string(by_hand.size()));
+	for (const auto &entry : grouped.groups) {
+		const auto found = by_hand.find(entry.first[0]);
+		if (found == by_hand.end()) {
+			Expect(false, "sibling sums: fold invented group " + std::to_string(entry.first[0]));
+			continue;
+		}
+		Expect(entry.second == found->second, "sibling sums: group " + std::to_string(entry.first[0]) + " sums to " +
+		                                          std::to_string(entry.second) + ", enumeration says " +
+		                                          std::to_string(found->second));
+	}
+	Report("summing a column from one branch while grouping on another matches enumeration");
 }
 
 int main() {
@@ -321,11 +439,15 @@ int main() {
 	std::printf("\n");
 	TestGroupCountMatchesEnumeration();
 	std::printf("\n");
-	TestGroupOnDeepKeyDeclines();
+	TestGroupOnDeepKey();
 	std::printf("\n");
 	TestSumMatchesEnumeration();
 	std::printf("\n");
 	TestSumIgnoresUnmatchedAndKeepsZeroGroups();
+	std::printf("\n");
+	TestGroupOnSiblingBranches();
+	std::printf("\n");
+	TestGroupSumOnSiblingBranches();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

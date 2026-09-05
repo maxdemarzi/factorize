@@ -745,3 +745,119 @@ tree at all:
 A second checkout backed by the same `.git`. The shared tree's HEAD never
 moves, so nothing anyone is reading or compiling changes, and the branch still
 reaches the remote.
+
+## D25 — Four bugs behind one blind spot: a missing row is not a wrong number
+
+Multi-column `GROUP BY` (plan §10.1) needed grouping columns that are not join
+keys, which meant appending them to the scan the way a summed column already
+was. Asking what happens to a row the scan drops turned up four bugs. Three
+were live on `origin/main` and none had anything to do with the feature being
+added.
+
+    H1  IS NULL on a non-join column          3     = 3        not a bug
+    H2  sum, every contributing row NULL      NULL vs 0        BUG
+    H5  filter on a non-join column + sum     500  vs 700      BUG
+    H6  same with count(*), nothing appended  2     = 2        not a bug
+    H7  sum over a join matching nothing      NULL vs 0        BUG
+    H8  grouped sum, one all-NULL group       2 rows vs 1 row  BUG
+
+**H5, the filter position.** `StorageSource` reads `bound.columns` and then
+`bound.filter_columns`, so a filter-only column is placed at
+`columns.size() + its index in filter_columns`. That position is *derived from*
+`columns.size()`, and the summed column is appended to `columns` afterwards, so
+every filter-only position was short by the number appended and the filter
+landed on whatever now occupied its slot:
+
+    p(k, v, w), q(k):  SELECT sum(p.v) FROM p, q WHERE p.k = q.k AND p.w > 5
+    filter on w:  position = columns.size()(=1, just k) + 0 = 1
+    sum appends v:  columns = [k, v], so the scan reads k=0, v=1, w=2
+    the filter still says 1, and `v > 5` is not `w > 5`: 700, not 500.
+
+Introduced by 767409d and live for two commits. The comment above the append
+was worse than the bug -- "Appended, never inserted: inserting would move the
+ground under them" is true of `columns` and blind to the positions computed
+*from* `columns.size()`, so it is the reasoning that says the bug cannot exist.
+Fixed by running the aggregate's appends before the filter re-keying, and the
+comment now states the invariant a reader can check: nothing may be appended to
+`columns` below that point.
+
+**H2 and H7 are one bug, and it is not about NULL.** `sum` over zero
+contributing tuples returned 0 where SQL says NULL, because a total of zero
+cannot distinguish an empty join from a join of zeroes. NULLs only make it
+easier to reach -- an ordinary join that happens to match nothing is enough.
+`ExecuteSum` now counts the tuples beside the sum and the operator emits NULL
+when that count is zero. The count is taken *after* the NULL drop, so it is
+exactly the number of join tuples built from rows with a non-NULL value, and
+SQL returns NULL precisely when that is zero: the same set, not a proxy for it.
+
+The first version of H7 used disjoint key ranges, DuckDB proved the join empty,
+planted an `EMPTY_RESULT`, the rule declined, and the answer came back correct.
+A false negative. **A test for an empty join needs one whose emptiness is only
+discoverable at run time**, or it tests the decline path instead.
+
+**H8, and what the drop rule actually is.** The scan drops a row holding a NULL
+in any column of `bound.columns`. Correct for a join key: NULL equals nothing,
+so the row cannot contribute to an inner join. Correct for a summed column when
+ungrouped: such a row contributes NULL to the sum either way. Wrong for a
+grouping column, and wrong for a summed column when grouped -- a group whose
+every row is NULL there is still a row of the answer, with a NULL sum, and
+dropping those rows deletes the group. Nothing in the representation can carry a
+NULL instead: a key slot is an integer with every value already spoken for.
+
+Handled in two layers, and the order matters. **Decline** when the statistics
+say the column may be NULL, so the common case is a query DuckDB answers rather
+than an error. **Throw** from the scan when a NULL turns up anyway, because
+`DataTable::GetStatistics` is `row_groups->CopyStats` -- committed row groups
+only, so rows appended in the current transaction are not covered, and
+`StorageSource` reads transaction-local storage. A throw as the *primary*
+behaviour would turn a working query into an error under `auto`, which breaks
+the contract from the other side; a throw as the backstop keeps it.
+
+**H1 is the most useful of the six, and it passed.** Filter-only columns never
+enter `bound.columns` -- they are scanned but never read into the row buffer --
+so the drop rule is "any *join* column", not "any scanned column", and filter
+columns were always exempt. Only the aggregate's appends put value-carrying
+columns into that set.
+
+The invariant that falls out of it is worth more than the bug that found it:
+
+> A relation's columns live in two sets with different NULL semantics, and only
+> one of them is filtered. `bound.columns` is read into the row buffer and a row
+> is dropped if any of them is NULL; `bound.filter_columns` is pushed into the
+> scan as a filter and never read, so those columns are exempt. **Any future
+> feature that needs a column's NULLs removed must put that column in
+> `bound.columns` deliberately** -- arriving as a filter column silently skips
+> the filtering.
+
+The known case is the `<>` join count planned in
+`tmp/20260904-10.5-other-join-types.md`, computed as the difference of two
+equi-join counts, which is exact only over inputs with NULL-valued rows dropped
+on both sides. Measured, the unfiltered form gave 12 against a truth of 5.
+
+**The blind spot.** Four bugs, one gap: every `sum` test joined on equalities
+only, every group test used a join column as the key, and no test had a NULL
+near an aggregate. H5 needs *both* a filter on a column the region does not
+otherwise read *and* an aggregate that appends one -- the H6 twin has the same
+filter, no append, and was always right. Each fixture now states what it needs
+to reproduce, so the pair says the append is the cause rather than the filter.
+
+The general form is worth keeping: **these are all missing rows, not wrong
+numbers.** A count that is wrong looks wrong. A row that is absent looks like
+the query. Comparing a single scalar against stock DuckDB cannot see any of
+them, which is why the fuzzer now generates grouped queries and compares whole
+result blocks rather than one line.
+
+**And the corpus could not have caught them either, which is the more
+uncomfortable half.** None of the 2590 CE queries is capable of reaching any of
+the four: every one is an ungrouped `count(*)` over equality predicates with no
+NULLs. H2 and H7 need a sum; H5 needs a sum and a filter; H8 needs a grouped
+sum. Zero of 2590 qualify -- not because the corpus is small, it is 2590
+queries, but because it is *uniform*. 466 assertions and 2590 corpus queries
+passing is not evidence about grouped sums with NULLs; it is evidence about
+ungrouped counts, 2590 times over.
+
+So the reaction to four bugs is not only "add tests". It is that **corpus
+breadth and corpus size are different quantities, and this project has size.**
+The 99.3% acyclic coverage figure measured against CE is a statement about one
+query shape, and reporting it without that qualification would turn a
+matcher-coverage number into an implied claim about SQL in general.

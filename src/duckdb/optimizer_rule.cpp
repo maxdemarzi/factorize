@@ -94,13 +94,14 @@ struct FactorizedRegion {
 	//! fails at execution with "Failed to bind column reference". The
 	//! replacement has to inherit the binding it is replacing.
 	idx_t aggregate_index = 0;
-	//! Set for `GROUP BY g, count(*)`. The grouped answer has two columns and
-	//! they live under two different table indexes: DuckDB gives an aggregate
-	//! one for its groups and another for its aggregates.
+	//! Set for `GROUP BY g..., count(*)`. The grouped answer has one column per
+	//! key beside the aggregate, and they live under two different table
+	//! indexes: DuckDB gives an aggregate one for its groups and another for
+	//! its aggregates.
 	bool grouped = false;
 	idx_t group_index = 0;
-	ColumnBinding group_binding;
-	LogicalType group_type;
+	vector<ColumnBinding> group_bindings;
+	vector<LogicalType> group_types;
 	//! Which fold the aggregate asks for, and for sum, which column.
 	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
 	ColumnBinding sum_binding;
@@ -252,22 +253,25 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		// GROUPING SETS / ROLLUP ask for several groupings at once.
 		return Decline(region, "aggregate has grouping sets");
 	}
-	if (aggr.groups.size() > 1) {
-		// Several keys need the cross product of independent branches when they
-		// are scattered, which is a different algorithm (plan §10.1).
-		return Decline(region, "aggregate groups on more than one column");
-	}
-	if (aggr.groups.size() == 1) {
-		// One grouping key is the case the representation answers directly: it
-		// sits at the top of the f-tree, so each root record is a group and the
-		// tuples under it are a number already memoized.
-		if (aggr.groups[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			return Decline(region, "aggregate groups on a computed expression");
-		}
+	if (!aggr.groups.empty()) {
+		// Any number of grouping columns. This used to stop at one, on the
+		// reading that scattered keys need the cross product of independent
+		// branches and are therefore a different algorithm (plan §10.1) -- true
+		// about the cross product, wrong about the conclusion, since siblings
+		// being independent is the property the representation is built on and
+		// the branches can be grouped separately and combined.
+		//
+		// It is also, measured against TPC-DS, the single restriction that
+		// mattered most: 47 of 99 queries were declined for this reason alone.
 		region.grouped = true;
 		region.group_index = aggr.group_index;
-		region.group_binding = aggr.groups[0]->Cast<BoundColumnRefExpression>().binding;
-		region.group_type = aggr.groups[0]->return_type;
+		for (auto &group : aggr.groups) {
+			if (group->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return Decline(region, "aggregate groups on a computed expression");
+			}
+			region.group_bindings.push_back(group->Cast<BoundColumnRefExpression>().binding);
+			region.group_types.push_back(group->return_type);
+		}
 	}
 	if (aggr.expressions.size() != 1) {
 		return Decline(region, "aggregate computes more than one value");
@@ -441,8 +445,9 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 }
 
 //! False if any part of the region cannot be expressed, which is a decline.
-static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relations, factorize::QueryGraph &graph,
-                       size_t &group_relation, size_t &group_column, size_t &sum_relation, size_t &sum_column) {
+static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<BoundRelation> &relations,
+                       factorize::QueryGraph &graph, vector<factorize::GroupKey> &group_keys, size_t &sum_relation,
+                       size_t &sum_column) {
 	std::map<idx_t, size_t> relation_of_table_index;
 	for (size_t i = 0; i < region.relations.size(); i++) {
 		auto &get = region.relations[i].get();
@@ -528,12 +533,166 @@ static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relation
 		}
 	}
 
+	// Everything scanned so far is a join key. What the aggregate adds below is
+	// read for its values alone, and the two have different NULL rules, so the
+	// boundary between them is recorded here.
+	std::vector<size_t> join_columns;
+	join_columns.reserve(relations.size());
+	for (const auto &relation : relations) {
+		join_columns.push_back(relation.columns.size());
+	}
+
+	if (region.aggregate == factorize::Aggregate::SUM) {
+		// The summed column is the first thing the region reads that is not a
+		// join key, so unlike a join key it is *added* to the scan rather than
+		// required to be there already. Appended, never inserted: the join
+		// predicates above hold local column indices, and inserting would move
+		// the ground under them. (Filters are re-keyed below, after every
+		// append, for the same reason from the other direction.)
+		auto found = relation_of_table_index.find(region.sum_binding.table_index);
+		if (found == relation_of_table_index.end()) {
+			return Decline(region, "summed column belongs to no relation of the region");
+		}
+		auto &get = region.relations[found->second].get();
+		auto &column_ids = get.GetColumnIds();
+		if (region.sum_binding.column_index >= column_ids.size()) {
+			return Decline(region, "summed column is not among the scanned columns");
+		}
+		auto &column_index = column_ids[region.sum_binding.column_index];
+		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
+			return Decline(region, "summed column is not a stored scalar column");
+		}
+		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+		if (definition.Generated()) {
+			return Decline(region, "summed column is generated");
+		}
+		factorize::ValueType value_type;
+		if (!TrySummableType(definition.Type(), value_type)) {
+			// Floating point is excluded on purpose rather than for want of a
+			// fold: reassociation makes a sum depend on the order it was taken
+			// in, and this rule's whole contract is that 'auto' and 'off' agree
+			// (DECISIONS D10). A DECIMAL past precision 18 is int128-backed and
+			// simply wider than the fold.
+			return Decline(region, "summed column " + definition.Name() + " is " + definition.Type().ToString() +
+			                           ", which the fold cannot carry");
+		}
+		auto &bound = relations[found->second];
+		const auto physical = static_cast<idx_t>(definition.Physical().index);
+		if (bound.LocalIndex(physical) < 0) {
+			bound.columns.push_back(physical);
+			bound.column_names.push_back(definition.Name());
+			bound.column_types.push_back(value_type);
+		}
+		sum_relation = found->second;
+		sum_column = static_cast<size_t>(bound.LocalIndex(physical));
+		if (region.grouped && sum_column >= join_columns[found->second]) {
+			// Ungrouped, a row whose summed value is NULL can be dropped: it
+			// contributes NULL to the sum either way. Grouped, it cannot -- a
+			// group whose every row is NULL here is still a row of the answer,
+			// with a NULL sum, and dropping those rows deletes the group.
+			//
+			// Declined up front on the statistics, so the common case stays a
+			// decline that DuckDB answers rather than an error; the run-time
+			// guard below it is for the rows the statistics do not cover.
+			auto statistics = get.GetTable()->GetStatistics(context, column_index.GetPrimaryIndex());
+			if (!statistics || statistics->CanHaveNull()) {
+				return Decline(region, "grouped sum over " + definition.Name() +
+				                           ", which may contain NULL and would drop a group entirely");
+			}
+			bound.no_null_columns.push_back(static_cast<idx_t>(sum_column));
+		}
+	}
+
+	for (const auto &binding : region.group_bindings) {
+		// A grouping column is added to the scan if it is not already read, the
+		// same way a summed column is: it changes no count, but the answer has
+		// one row per distinct value of it, so its values have to be there.
+		auto found = relation_of_table_index.find(binding.table_index);
+		if (found == relation_of_table_index.end()) {
+			return Decline(region, "grouping column belongs to no relation of the region");
+		}
+		auto &get = region.relations[found->second].get();
+		auto &column_ids = get.GetColumnIds();
+		if (binding.column_index >= column_ids.size()) {
+			return Decline(region, "grouping column is not among the scanned columns");
+		}
+		auto &column_index = column_ids[binding.column_index];
+		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
+			return Decline(region, "grouping column is not a stored scalar column");
+		}
+		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+		if (definition.Generated()) {
+			return Decline(region, "grouping column is generated");
+		}
+		factorize::ValueType value_type;
+		if (!TryIntegerKeyType(definition.Type(), value_type)) {
+			// A grouping key is a value the answer carries, so unlike a summed
+			// column it has to fit a key slot and come back out as itself.
+			return Decline(region, "grouping column " + definition.Name() + " is " + definition.Type().ToString() +
+			                           ", which the representation cannot carry");
+		}
+		auto &bound = relations[found->second];
+		const auto physical = static_cast<idx_t>(definition.Physical().index);
+		const auto existing = bound.LocalIndex(physical);
+		if (existing < 0 || static_cast<size_t>(existing) >= join_columns[found->second]) {
+			// The scan drops a row when any column of `columns` is NULL. That
+			// is right for a join key -- NULL equals nothing, so the row cannot
+			// contribute to an inner join.
+			//
+			// It is wrong for a grouping column. SQL groups NULLs together and
+			// answers for that group, so dropping those rows deletes a row of
+			// the answer and the groups would no longer sum to the count.
+			// Nothing in the representation can carry a NULL instead: a key slot
+			// is an integer with every value already spoken for.
+			//
+			// So a grouping column that is not already a join key is a decline
+			// unless it provably has no NULLs. The statistics say that exactly,
+			// and say it without reading the data; a column with no statistics
+			// is assumed to have them. They speak for committed row groups only
+			// (DataTable::GetStatistics is row_groups->CopyStats), so rows
+			// appended in the current transaction are not covered -- which is
+			// why the scan also guards this at run time rather than trusting the
+			// answer here.
+			auto statistics = get.GetTable()->GetStatistics(context, column_index.GetPrimaryIndex());
+			if (!statistics || statistics->CanHaveNull()) {
+				return Decline(region, "grouping column " + definition.Name() +
+				                           " may contain NULL, which is a group the representation cannot carry");
+			}
+		}
+		if (existing < 0) {
+			bound.columns.push_back(physical);
+			bound.column_names.push_back(definition.Name());
+			bound.column_types.push_back(value_type);
+		}
+		const auto local = static_cast<size_t>(bound.LocalIndex(physical));
+		if (local >= join_columns[found->second]) {
+			bound.no_null_columns.push_back(static_cast<idx_t>(local));
+		}
+		group_keys.push_back(factorize::GroupKey {found->second, local});
+	}
+
 	// Carry over every restriction the plan placed on each scan: the filters
 	// DuckDB pushed into the scan, and any it left in a filter above it.
 	// Dropping one would count rows the stock plan never sees, and replaying it
 	// by hand would be a second implementation of DuckDB's filter semantics
 	// judged against a count that has to match DuckDB's exactly. Re-keying them
 	// onto our own scan and letting the storage layer apply them is neither.
+	//
+	// THIS MUST RUN LAST. A filter-only column is placed at `columns.size() +
+	// its index in filter_columns`, because the scan reads `columns` and then
+	// `filter_columns`. That position is derived from columns.size(), so
+	// appending to `columns` afterwards moves every filter-only column and the
+	// filter lands on whatever now occupies its old slot -- a wrong count, with
+	// nothing to indicate it. This was live from the sum work until multi-column
+	// GROUP BY, which appends more and made it easy to hit:
+	//
+	//     p(k, v, w), q(k):  SELECT sum(p.v) FROM p, q WHERE p.k = q.k AND p.w > 5
+	//     filter on w:  position = columns.size()(=1, just k) + 0 = 1
+	//     sum appends v:  columns = [k, v], so the scan reads k=0, v=1, w=2
+	//     the filter still says 1, and `v > 5` is not `w > 5`: 700, not 500.
+	//
+	// The invariant a reader can check: nothing may be appended to `columns`
+	// below this point.
 	for (size_t i = 0; i < relations.size(); i++) {
 		auto &get = region.relations[i].get();
 		auto &bound = relations[i];
@@ -604,78 +763,6 @@ static bool BindRegion(FactorizedRegion &region, vector<BoundRelation> &relation
 		if (!remapped->filters.empty()) {
 			bound.filters = std::move(remapped);
 		}
-	}
-
-	if (region.aggregate == factorize::Aggregate::SUM) {
-		// The summed column is the first thing the region reads that is not a
-		// join key, so unlike the grouping key it is *added* to the scan rather
-		// than required to be there already. Appended, never inserted: the
-		// predicates above hold local column indices, and inserting would move
-		// the ground under them.
-		auto found = relation_of_table_index.find(region.sum_binding.table_index);
-		if (found == relation_of_table_index.end()) {
-			return Decline(region, "summed column belongs to no relation of the region");
-		}
-		auto &get = region.relations[found->second].get();
-		auto &column_ids = get.GetColumnIds();
-		if (region.sum_binding.column_index >= column_ids.size()) {
-			return Decline(region, "summed column is not among the scanned columns");
-		}
-		auto &column_index = column_ids[region.sum_binding.column_index];
-		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
-			return Decline(region, "summed column is not a stored scalar column");
-		}
-		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
-		if (definition.Generated()) {
-			return Decline(region, "summed column is generated");
-		}
-		factorize::ValueType value_type;
-		if (!TrySummableType(definition.Type(), value_type)) {
-			// Floating point is excluded on purpose rather than for want of a
-			// fold: reassociation makes a sum depend on the order it was taken
-			// in, and this rule's whole contract is that 'auto' and 'off' agree
-			// (DECISIONS D10). A DECIMAL past precision 18 is int128-backed and
-			// simply wider than the fold.
-			return Decline(region, "summed column " + definition.Name() + " is " + definition.Type().ToString() +
-			                           ", which the fold cannot carry");
-		}
-		auto &bound = relations[found->second];
-		const auto physical = static_cast<idx_t>(definition.Physical().index);
-		if (bound.LocalIndex(physical) < 0) {
-			bound.columns.push_back(physical);
-			bound.column_names.push_back(definition.Name());
-			bound.column_types.push_back(value_type);
-		}
-		sum_relation = found->second;
-		sum_column = static_cast<size_t>(bound.LocalIndex(physical));
-	}
-
-	if (region.grouped) {
-		// The grouping key has to be a column the region reads, and it only
-		// reads join columns: anything else was never scanned, because it cannot
-		// change a count. That is also exactly the condition ExecuteGroupCount
-		// needs -- a key that is not a join key is not at the top of the f-tree.
-		auto found = relation_of_table_index.find(region.group_binding.table_index);
-		if (found == relation_of_table_index.end()) {
-			return Decline(region, "grouping column belongs to no relation of the region");
-		}
-		auto &get = region.relations[found->second].get();
-		auto &column_ids = get.GetColumnIds();
-		if (region.group_binding.column_index >= column_ids.size()) {
-			return Decline(region, "grouping column is not among the scanned columns");
-		}
-		auto &column_index = column_ids[region.group_binding.column_index];
-		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
-			return Decline(region, "grouping column is not a stored scalar column");
-		}
-		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
-		const auto physical = static_cast<idx_t>(definition.Physical().index);
-		const auto local = relations[found->second].LocalIndex(physical);
-		if (local < 0) {
-			return Decline(region, "grouping column " + definition.Name() + " is not a join column of this query");
-		}
-		group_relation = found->second;
-		group_column = static_cast<size_t>(local);
 	}
 
 	for (auto &relation : relations) {
@@ -797,11 +884,10 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && MatchAggregate(*op, region)) {
 		vector<BoundRelation> relations;
 		factorize::QueryGraph graph;
-		size_t group_relation = 0;
-		size_t group_column = 0;
+		vector<factorize::GroupKey> group_keys;
 		size_t sum_relation = 0;
 		size_t sum_column = 0;
-		if (BindRegion(region, relations, graph, group_relation, group_column, sum_relation, sum_column)) {
+		if (BindRegion(context, region, relations, graph, group_keys, sum_relation, sum_column)) {
 			// The join order is decided here rather than at execution: a graph
 			// the planner cannot order (a disconnected one, most of all) has to
 			// be a decline, not a query that fails halfway through running.
@@ -826,9 +912,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					                                               std::move(graph), std::move(plan));
 					replacement->grouped = region.grouped;
 					replacement->group_index = region.group_index;
-					replacement->group_type = region.group_type;
-					replacement->group_relation = group_relation;
-					replacement->group_column = group_column;
+					replacement->group_types = region.group_types;
+					replacement->group_keys = std::move(group_keys);
 					replacement->aggregate = region.aggregate;
 					replacement->sum_relation = sum_relation;
 					replacement->sum_column = sum_column;

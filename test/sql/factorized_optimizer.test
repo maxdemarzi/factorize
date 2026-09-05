@@ -762,8 +762,9 @@ SELECT g_right.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP
 1	2
 2	2
 
-# A grouping column that is not a join column was never scanned, so it is
-# declined -- and the stock plan answers.
+# A grouping column that is not a join column is added to the scan, the same way
+# a summed column is: it changes no count, but the answer has one row per value
+# of it, so its values have to be there.
 statement ok
 CREATE TABLE g_wide AS SELECT * FROM (VALUES (1, 7), (2, 8)) t(k, other);
 
@@ -773,14 +774,285 @@ SELECT g_wide.other, count(*) FROM g_wide, g_right WHERE g_wide.k = g_right.k GR
 7	1
 8	2
 
-# Two grouping keys need the cross product of independent branches, which is a
-# different algorithm: declined, and still answered.
+query II
+EXPLAIN SELECT g_wide.other, count(*) FROM g_wide, g_right WHERE g_wide.k = g_right.k GROUP BY g_wide.other;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Two grouping keys. Here they are the two sides of one equality, so they are
+# the same equivalence class and name the same groups twice over.
 query III
 SELECT g_left.k, g_right.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k
  GROUP BY g_left.k, g_right.k ORDER BY 1;
 ----
 1	1	2
 2	2	2
+
+query II
+EXPLAIN SELECT g_left.k, g_right.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k
+ GROUP BY g_left.k, g_right.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+#-----------------------------------------------------------------------------
+# Grouping keys scattered across independent sibling branches. Plan §10.1
+# expected this to be *declined*: several keys in different branches need the
+# cross product of those branches. But that cross product is what the
+# representation is made of -- siblings are independent, which is the premise --
+# so each branch is grouped on its own and the branches are combined.
+#
+# This is not an exotic shape. A star schema grouped on columns from two
+# dimension tables produces exactly it, which is why lifting the restriction
+# took the rule from 2 of 99 TPC-DS queries to 49.
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE x_hub AS SELECT * FROM (VALUES (1), (2)) t(k);
+
+statement ok
+CREATE TABLE x_arm1 AS SELECT * FROM (VALUES (1, 100), (1, 200), (2, 300)) t(k, p);
+
+statement ok
+CREATE TABLE x_arm2 AS SELECT * FROM (VALUES (1, 7), (2, 8), (2, 9)) t(k, q);
+
+statement ok
+SET factorize_mode = 'off';
+
+# p and q are payload columns of two different branches under the hub key, and
+# neither is a join column. k=1 pairs {100,200} with {7}; k=2 pairs {300} with
+# {8,9}.
+query III
+SELECT x_arm1.p, x_arm2.q, count(*) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2 ORDER BY 1, 2;
+----
+100	7	1
+200	7	1
+300	8	1
+300	9	1
+
+statement ok
+SET factorize_mode = 'force';
+
+query III
+SELECT x_arm1.p, x_arm2.q, count(*) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2 ORDER BY 1, 2;
+----
+100	7	1
+200	7	1
+300	8	1
+300	9	1
+
+query II
+EXPLAIN SELECT x_arm1.p, x_arm2.q, count(*) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Three keys, one of them the join key the two branches hang from -- so the
+# groups split by a value at the root and by a value in each branch at once.
+query IIII
+SELECT x_hub.k, x_arm1.p, x_arm2.q, count(*) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+----
+1	100	7	1
+1	200	7	1
+2	300	8	1
+2	300	9	1
+
+# The groups have to sum to the ungrouped count, or one of the two is wrong.
+query I
+SELECT sum(c) FROM (SELECT x_arm1.p, x_arm2.q, count(*) AS c FROM x_hub, x_arm1, x_arm2
+                     WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2) t;
+----
+4
+
+# Grouping on one branch while summing the other: the sum has to be weighted by
+# how many tuples the branches it is not in make (§4.5), and the grouping keys
+# change what "the other branches" means for each group.
+statement ok
+SET factorize_mode = 'off';
+
+query II
+SELECT x_arm2.q, sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1 ORDER BY 1;
+----
+7	300
+8	300
+9	300
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT x_arm2.q, sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1 ORDER BY 1;
+----
+7	300
+8	300
+9	300
+
+query II
+EXPLAIN SELECT x_arm2.q, sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Two keys from one relation, one of them a join column and one not.
+query III
+SELECT x_arm1.k, x_arm1.p, count(*) FROM x_hub, x_arm1, x_arm2
+ WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2 ORDER BY 1, 2;
+----
+1	100	1
+1	200	1
+2	300	2
+
+# A grouping column of a type the representation cannot carry is a decline, not
+# a wrong answer: the key has to come back out as itself.
+statement ok
+CREATE TABLE x_text AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(k, name);
+
+query II
+SELECT x_text.name, count(*) FROM x_hub, x_text WHERE x_hub.k = x_text.k GROUP BY 1 ORDER BY 1;
+----
+a	1
+b	1
+
+#-----------------------------------------------------------------------------
+# NULL, and rows that are not there. Four bugs found by asking what happens to a
+# row the scan drops, all of them answers that were wrong rather than absent.
+#-----------------------------------------------------------------------------
+
+# The scan reads `columns` and then `filter_columns`, so a filter-only column
+# sits at position columns.size()+i -- a position derived from columns.size()
+# and therefore invalidated by appending to it. The summed column is such an
+# append. Before the fix this returned 700: the filter `w > 5` was applied to
+# whatever occupied position 1, which the append had made `v`.
+#
+# It needs BOTH a filter on a column the region does not otherwise read AND an
+# aggregate that appends one. The count(*) twin below has the same filter and no
+# append, and was always right -- which is why no existing test caught this.
+statement ok
+CREATE TABLE n_p AS SELECT * FROM (VALUES (1, 100, 9), (1, 200, 1), (2, 400, 9)) t(k, v, w);
+
+statement ok
+CREATE TABLE n_q AS SELECT * FROM (VALUES (1), (2)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(n_p.v) FROM n_p, n_q WHERE n_p.k = n_q.k AND n_p.w > 5;
+----
+500
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(n_p.v) FROM n_p, n_q WHERE n_p.k = n_q.k AND n_p.w > 5;
+----
+500
+
+query II
+EXPLAIN SELECT sum(n_p.v) FROM n_p, n_q WHERE n_p.k = n_q.k AND n_p.w > 5;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# The twin with no appended column, which never had the bug. Its job is to say
+# that the append is what breaks it, not the filter.
+query I
+SELECT count(*) FROM n_p, n_q WHERE n_p.k = n_q.k AND n_p.w > 5;
+----
+2
+
+# sum over no rows is NULL, not zero, and the fold cannot tell the two apart --
+# an empty join and a join of zeroes both total zero. The ranges overlap on
+# purpose: with disjoint ones DuckDB proves the join empty and plants an
+# EMPTY_RESULT, which the rule declines, and the case goes untested.
+statement ok
+CREATE TABLE n_m AS SELECT * FROM (VALUES (1, 5), (3, 7)) t(k, v);
+
+statement ok
+CREATE TABLE n_n AS SELECT * FROM (VALUES (2), (4)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(n_m.v) FROM n_m, n_n WHERE n_m.k = n_n.k;
+----
+NULL
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(n_m.v) FROM n_m, n_n WHERE n_m.k = n_n.k;
+----
+NULL
+
+# Same answer by a different route: every row that could contribute is dropped
+# for holding a NULL in the summed column, so nothing is summed.
+statement ok
+CREATE TABLE n_c AS SELECT * FROM (VALUES (1, NULL)) t(k, v);
+
+statement ok
+CREATE TABLE n_d AS SELECT * FROM (VALUES (1), (1)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(n_c.v) FROM n_c, n_d WHERE n_c.k = n_d.k;
+----
+NULL
+
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(n_c.v) FROM n_c, n_d WHERE n_c.k = n_d.k;
+----
+NULL
+
+# A row dropped for a NULL is invisible in an ungrouped sum -- it contributes
+# NULL either way -- but grouped it takes a whole group with it. g=1's only row
+# is NULL in v, so before the fix the answer had one row where SQL has two.
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+statement ok
+CREATE TABLE n_r AS SELECT * FROM (VALUES (1, 1, NULL), (2, 2, 5)) t(k, g, v);
+
+statement ok
+CREATE TABLE n_s AS SELECT * FROM (VALUES (1), (2)) t(k);
+
+statement ok
+SET factorize_mode = 'off';
+
+query II
+SELECT n_r.g, sum(n_r.v) FROM n_r, n_s WHERE n_r.k = n_s.k GROUP BY n_r.g ORDER BY 1;
+----
+1	NULL
+2	5
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT n_r.g, sum(n_r.v) FROM n_r, n_s WHERE n_r.k = n_s.k GROUP BY n_r.g ORDER BY 1;
+----
+1	NULL
+2	5
+
+# A grouping column that may be NULL is its own group, which no key slot can
+# hold, so the rule declines rather than answer with a row missing. Declining is
+# checked by the answer being right: a takeover here would lose the NULL group.
+query II
+SELECT n_r.v, count(*) FROM n_r, n_s WHERE n_r.k = n_s.k GROUP BY n_r.v ORDER BY 1;
+----
+5	1
+NULL	1
 
 statement ok
 RESET disabled_optimizers;

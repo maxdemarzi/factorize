@@ -138,6 +138,12 @@ struct ExecuteResult {
 	bool out_of_memory = false;
 	//! How many slices the answer was assembled from; 1 when it fitted whole.
 	size_t slices = 1;
+	//! How many tuples the join denotes, set by ExecuteSum beside the sum.
+	//!
+	//! A sum needs it because SQL's sum over no rows is NULL, not zero, and the
+	//! fold cannot tell the two apart: a total of zero is what both an empty
+	//! join and a join of zeroes produce.
+	int64_t tuples = 0;
 	//! Records and bytes in the last materialized f-representation. Zero when
 	//! the plan was a single fused count join, which never materializes.
 	size_t records = 0;
@@ -217,36 +223,40 @@ struct GroupCountResult {
 	bool ok = false;
 	std::string error;
 	bool out_of_memory = false;
-	//! One entry per distinct value of the grouping column, value first.
-	std::vector<std::pair<int64_t, int64_t>> groups;
+	//! One entry per distinct combination of the grouping columns: the values,
+	//! in the order the caller listed them, and the aggregate over that group.
+	std::vector<std::pair<std::vector<int64_t>, int64_t>> groups;
 	size_t records = 0;
 	size_t bytes = 0;
 };
 
-//! `SELECT g, count(*) ... GROUP BY g`, without materializing the join.
+//! One column the caller wants to group by.
+struct GroupKey {
+	size_t relation = 0;
+	size_t column = 0;
+};
+
+//! `SELECT g..., count(*) ... GROUP BY g...`, without materializing the join.
 //!
-//! This is the case plan section 10.1 describes as workable: the grouping key
-//! sits at the top of the f-tree, so each root record *is* a group, and the
-//! tuples belonging to it are exactly the ones its subtree denotes -- a number
-//! the representation already knows how to compute without enumerating them.
-//! Summing memoized subtree sizes per distinct value is the whole algorithm.
+//! The case plan section 10.1 describes as workable is a single key at the top
+//! of the f-tree: each root record *is* a group, and the tuples belonging to it
+//! are exactly the ones its subtree denotes -- a number the representation
+//! already knows without enumerating them.
 //!
-//! When the key is not at the root this declines rather than guessing. A key
-//! further down is reachable in principle -- descend to it, carrying the
-//! product of the sibling slots you did not descend into -- but a key scattered
-//! across independent sibling branches needs their cross product and is a
-//! different algorithm. Declining the first case costs coverage; guessing at
-//! the second would cost correctness.
+//! This does more than that, because the restriction was not needed. A key
+//! below the root is descended to, carrying the product of the sibling slots
+//! not descended into. Keys scattered across independent sibling branches --
+//! which is what grouping on columns from two dimension tables looks like --
+//! are grouped per branch and combined by the cross product of the branches.
+//! Sibling independence is the property the representation is built on, so the
+//! combination is exact rather than an approximation of one.
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                                   size_t group_relation, size_t group_column,
+                                   const std::vector<GroupKey> &keys,
                                    PathStrategy strategy = PathStrategy::LEVELWISE);
 
-//! `SELECT g, sum(x) ... GROUP BY g`, the two generalisations at once.
-//!
-//! Same shape as ExecuteGroupCount -- a root record is a group -- with the fold
-//! under it summing a column instead of counting tuples.
+//! `SELECT g..., sum(x) ... GROUP BY g...`, the generalisations together.
 GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                                 size_t group_relation, size_t group_column, size_t sum_relation, size_t sum_column,
+                                 const std::vector<GroupKey> &keys, size_t sum_relation, size_t sum_column,
                                  PathStrategy strategy = PathStrategy::LEVELWISE);
 
 //! Runs `plan` for tuples, and if the representation does not fit, gathers them

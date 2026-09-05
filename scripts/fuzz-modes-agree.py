@@ -16,15 +16,23 @@ a filter that removes everything -- and none of them need volume to be wrong.
 The plan (§7.2) asks for exactly these degenerate shapes.
 """
 
+import os
 import random
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DUCKDB = ROOT / "build" / "release" / "duckdb"
-if not DUCKDB.exists():
-    DUCKDB = ROOT / "build" / "relassert" / "duckdb"
+# FACTORIZE_DUCKDB wins, because "whichever build exists" silently fuzzes a stale
+# binary: build/release can sit there for days while the work happens in
+# build/relassert, and a fuzzer run against the wrong binary reports no failures
+# in exactly the way a passing run does.
+if os.environ.get("FACTORIZE_DUCKDB"):
+    DUCKDB = Path(os.environ["FACTORIZE_DUCKDB"])
+else:
+    DUCKDB = ROOT / "build" / "release" / "duckdb"
+    if not DUCKDB.exists():
+        DUCKDB = ROOT / "build" / "relassert" / "duckdb"
 
 TYPES = ["INTEGER", "BIGINT", "SMALLINT", "TINYINT"]
 
@@ -104,7 +112,37 @@ def make_query(rng, tables):
                 ]
             )
         )
-    return f"SELECT count(*) FROM {froms} WHERE {' AND '.join(predicates)};"
+    where = " AND ".join(predicates)
+
+    # Two thirds plain counts, one third grouped. Grouping is where the newest
+    # and least obvious arithmetic lives: several keys scattered across
+    # independent branches of the f-tree are grouped branch by branch and
+    # combined by a semiring product, and nothing about that is checkable by
+    # inspection -- only by asking DuckDB the same question.
+    if rng.random() < 0.34:
+        keys = []
+        for _ in range(rng.randrange(1, 4)):
+            alias, _, cols = rng.choice(aliases)
+            key = f"{alias}.{rng.choice(cols)}"
+            if key not in keys:
+                keys.append(key)
+        if rng.random() < 0.4:
+            alias, _, cols = rng.choice(aliases)
+            aggregate = f"sum({alias}.{rng.choice(cols)})"
+        else:
+            aggregate = "count(*)"
+        # Ordered by every column, so two runs that agree as sets also agree as
+        # text -- and so a duplicated group cannot hide behind a reordering.
+        ordering = ", ".join(str(i + 1) for i in range(len(keys) + 1))
+        return (
+            f"SELECT {', '.join(keys)}, {aggregate} FROM {froms} WHERE {where} "
+            f"GROUP BY {', '.join(keys)} ORDER BY {ordering};"
+        )
+    return f"SELECT count(*) FROM {froms} WHERE {where};"
+
+
+#: Printed between modes so a grouped answer of many rows can still be split up.
+SEPARATOR = "=8=8="
 
 
 def run(script):
@@ -114,7 +152,10 @@ def run(script):
         text=True,
         timeout=120,
     )
-    return result.stdout.strip().splitlines(), result.stderr.strip()
+    # Split on the marker rather than counting lines: a grouped query answers
+    # with as many rows as there are groups, including none at all.
+    blocks = result.stdout.split(SEPARATOR)
+    return [block.strip().splitlines() for block in blocks], result.stderr.strip()
 
 
 def main():
@@ -137,18 +178,26 @@ def main():
         query = make_query(rng, tables)
 
         script = "\n".join(setup) + "\n"
-        for mode in ("off", "force", "auto"):
+        # DuckDB narrows a group key before the aggregate and widens it
+        # after, and the rule declines rather than reproduce an internal
+        # function. With the pass left on, every grouped query would be
+        # declined and this would compare stock DuckDB against itself.
+        script += "SET disabled_optimizers='compressed_materialization';\n"
+        for index, mode in enumerate(("off", "force", "auto")):
+            if index:
+                script += f"SELECT '{SEPARATOR}';\n"
             script += f"SET factorize_mode='{mode}';\n{query}\n"
 
-        lines, error = run(script)
-        if len(lines) != 3:
+        blocks, error = run(script)
+        if len(blocks) != 3:
             failures += 1
-            print(f"-- iteration {iteration}: expected three answers, got {lines} {error}")
+            print(f"-- iteration {iteration}: expected three answers, got {blocks} {error}")
             print(script)
             continue
-        if lines[0] != lines[1] or lines[0] != lines[2]:
+        off, force, auto = blocks
+        if off != force or off != auto:
             failures += 1
-            print(f"-- iteration {iteration}: off={lines[0]} force={lines[1]} auto={lines[2]}")
+            print(f"-- iteration {iteration}: off={off} force={force} auto={auto}")
             print(script)
 
     print(f"{iterations} random queries, {failures} disagreements", file=sys.stderr)

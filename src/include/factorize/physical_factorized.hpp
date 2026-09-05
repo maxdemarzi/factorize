@@ -34,11 +34,11 @@ public:
 	vector<BoundRelation> relations;
 	factorize::QueryGraph graph;
 	factorize::Plan plan;
-	//! Set for `GROUP BY g, count(*)`: one row per group rather than one row.
+	//! Set for `GROUP BY g1, ..., gn`: one row per group rather than one row.
 	bool grouped = false;
-	LogicalType group_type = LogicalType::BIGINT;
-	size_t group_relation = 0;
-	size_t group_column = 0;
+	//! One per key, in the aggregate's order, which is the answer's order.
+	vector<LogicalType> group_types;
+	vector<factorize::GroupKey> group_keys;
 	//! Which fold to run, and for sum, which column and result type.
 	factorize::Aggregate aggregate = factorize::Aggregate::COUNT;
 	size_t sum_relation = 0;

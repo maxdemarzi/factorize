@@ -44,6 +44,17 @@ struct BoundRelation {
 	vector<string> column_names;
 	//! Storage width for each entry of `columns`, parallel to it.
 	vector<factorize::ValueType> column_types;
+	//! Local indices into `columns` where a NULL is not a row to drop but a row
+	//! of the answer that would go missing.
+	//!
+	//! A NULL in a join key is a row that cannot join, so dropping it is right.
+	//! A NULL in a grouping column is its own group, and a group whose every row
+	//! is NULL in the summed column is still a row of the output with a NULL
+	//! sum. Neither can be carried -- a slot is an integer with every value
+	//! spoken for -- so the scan throws instead of silently answering with a row
+	//! missing. Empty whenever the query is not grouped, because an ungrouped
+	//! sum over such a row is unaffected: it contributes NULL either way.
+	vector<idx_t> no_null_columns;
 	//! Physical columns scanned only because a pushed-down filter reads them.
 	//! They are not join keys: they never reach the engine and need not be
 	//! integers. Scanned after `columns`, so filter positions are stable.

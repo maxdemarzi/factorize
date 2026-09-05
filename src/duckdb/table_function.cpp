@@ -20,9 +20,8 @@ struct FactorizedCountBindData : public TableFunctionData {
 	QueryGraph graph;
 	//! How many tuples factorized_tuples should emit; 0 means all of them.
 	size_t limit = 0;
-	//! Which column factorized_group_count groups on.
-	size_t group_relation = 0;
-	size_t group_column = 0;
+	//! Which columns factorized_group_count groups on, in the order given.
+	vector<factorize::GroupKey> group_keys;
 };
 
 //! Splits on whitespace, so "yago2 a" and "yago2 AS a" both parse.
@@ -55,6 +54,25 @@ string Trim(const string &text) {
 		end--;
 	}
 	return text.substr(start, end - start);
+}
+
+//! Splits on commas and trims, so "a.x, b.y" names two columns.
+vector<string> SplitCommas(const string &text) {
+	vector<string> parts;
+	size_t start = 0;
+	while (true) {
+		const auto comma = text.find(',', start);
+		const auto end = comma == string::npos ? text.size() : comma;
+		auto part = Trim(text.substr(start, end - start));
+		if (!part.empty()) {
+			parts.push_back(std::move(part));
+		}
+		if (comma == string::npos) {
+			break;
+		}
+		start = comma + 1;
+	}
+	return parts;
 }
 
 //! Named the relation explicitly, the caller gets told why its key will not do
@@ -184,7 +202,7 @@ struct FactorizedCountGlobalState : public GlobalTableFunctionState {
 	bool emitted = false;
 	//! Grouping produces a row per distinct value, which can outrun one vector,
 	//! so the groups are computed once and handed out across calls.
-	unique_ptr<vector<std::pair<int64_t, int64_t>>> groups;
+	unique_ptr<std::vector<std::pair<std::vector<int64_t>, int64_t>>> groups;
 	idx_t offset = 0;
 };
 
@@ -287,9 +305,11 @@ unique_ptr<FunctionData> BindTuples(ClientContext &context, TableFunctionBindInp
 	return result;
 }
 
-//! `factorized_group_count(tables, joins, 'relation.column')`: one row per
-//! distinct value of the grouping column, with the number of joined tuples it
-//! accounts for.
+//! `factorized_group_count(tables, joins, 'r.a, s.b')`: one row per distinct
+//! combination of the grouping columns, with the number of joined tuples it
+//! accounts for. Several keys are answered by grouping each branch of the
+//! f-tree that carries one and combining the branches, so they need not sit
+//! together or near the root.
 unique_ptr<FunctionData> BindGroupCount(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = Bind(context, input, return_types, names);
@@ -297,41 +317,48 @@ unique_ptr<FunctionData> BindGroupCount(ClientContext &context, TableFunctionBin
 	if (input.inputs.size() < 3 || input.inputs[2].IsNull()) {
 		throw BinderException("factorized_group_count: needs a grouping column");
 	}
-	const auto operand = Trim(StringValue::Get(input.inputs[2]));
-	const auto dot = operand.rfind('.');
-	if (dot == string::npos) {
-		throw BinderException("factorized_group_count: '%s' must be <relation>.<column>", operand);
+	return_types.clear();
+	names.clear();
+	const auto operands = SplitCommas(StringValue::Get(input.inputs[2]));
+	if (operands.empty()) {
+		throw BinderException("factorized_group_count: needs a grouping column");
 	}
-	const auto alias = operand.substr(0, dot);
-	const auto column = operand.substr(dot + 1);
-	bool found = false;
-	for (idx_t relation = 0; relation < bind_data.relations.size() && !found; relation++) {
-		auto &bound = bind_data.relations[relation];
-		if (bound.alias != alias) {
-			continue;
+	for (const auto &operand : operands) {
+		const auto dot = operand.rfind('.');
+		if (dot == string::npos) {
+			throw BinderException("factorized_group_count: '%s' must be <relation>.<column>", operand);
 		}
-		for (idx_t i = 0; i < bound.column_names.size(); i++) {
-			if (bound.column_names[i] == column) {
-				bind_data.group_relation = relation;
-				bind_data.group_column = i;
-				found = true;
-				break;
+		const auto alias = operand.substr(0, dot);
+		const auto column = operand.substr(dot + 1);
+		bool found = false;
+		for (idx_t relation = 0; relation < bind_data.relations.size() && !found; relation++) {
+			auto &bound = bind_data.relations[relation];
+			if (bound.alias != alias) {
+				continue;
+			}
+			for (idx_t i = 0; i < bound.column_names.size(); i++) {
+				if (bound.column_names[i] == column) {
+					bind_data.group_keys.push_back(factorize::GroupKey {relation, i});
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				// The column may exist on the table and simply not be read: only
+				// the columns a predicate touches are scanned, so grouping on any
+				// other would need a column the representation does not hold.
+				// (The optimizer rule adds such a column to the scan; this
+				// function takes the relations exactly as they were listed.)
+				throw BinderException("factorized_group_count: %s.%s is not a join column of this query", alias,
+				                      column);
 			}
 		}
 		if (!found) {
-			// The column may exist on the table and simply not be read: only the
-			// columns a predicate touches are scanned, so grouping on any other
-			// would need a column the representation does not hold.
-			throw BinderException("factorized_group_count: %s.%s is not a join column of this query", alias, column);
+			throw BinderException("factorized_group_count: '%s' does not name a listed relation", alias);
 		}
+		return_types.emplace_back(LogicalType::BIGINT);
+		names.emplace_back(alias + "_" + column);
 	}
-	if (!found) {
-		throw BinderException("factorized_group_count: '%s' does not name a listed relation", alias);
-	}
-	return_types.clear();
-	names.clear();
-	return_types.emplace_back(LogicalType::BIGINT);
-	names.emplace_back(alias + "_" + column);
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("count");
 	return result;
@@ -353,11 +380,11 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 		}
 		StorageSource source(context, bind_data.relations);
 		auto result = factorize::ExecuteGroupCount(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-		                                           bind_data.group_relation, bind_data.group_column);
+		                                           bind_data.group_keys);
 		if (!result.ok) {
 			throw InvalidInputException("factorized_group_count: %s", result.error);
 		}
-		state.groups = make_uniq<vector<std::pair<int64_t, int64_t>>>(std::move(result.groups));
+		state.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, int64_t>>>(std::move(result.groups));
 	}
 
 	// Groups can outnumber a vector, so this one hands them out a chunk at a
@@ -365,8 +392,11 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 	auto &groups = *state.groups;
 	idx_t produced = 0;
 	while (state.offset < groups.size() && produced < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, produced, Value::BIGINT(groups[state.offset].first));
-		output.SetValue(1, produced, Value::BIGINT(groups[state.offset].second));
+		const auto &group = groups[state.offset];
+		for (idx_t key = 0; key < group.first.size(); key++) {
+			output.SetValue(key, produced, Value::BIGINT(group.first[key]));
+		}
+		output.SetValue(group.first.size(), produced, Value::BIGINT(group.second));
 		state.offset++;
 		produced++;
 	}

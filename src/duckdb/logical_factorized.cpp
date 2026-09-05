@@ -20,21 +20,19 @@ void LogicalFactorized::ResolveTypes() {
 	// the engine works in: operators above were bound against that type, and
 	// handing them a wider one is a plan that type-checks and then misbehaves.
 	const auto answer = aggregate == factorize::Aggregate::SUM ? sum_type : LogicalType::BIGINT;
-	if (grouped) {
-		types = {group_type, answer};
-	} else {
-		types = {answer};
-	}
+	types = group_types;
+	types.push_back(answer);
 }
 
 vector<ColumnBinding> LogicalFactorized::GetColumnBindings() {
-	if (grouped) {
-		// DuckDB gives an aggregate two table indexes, and the operators above
-		// reference both. Groups come first, matching LogicalAggregate's own
-		// order.
-		return {ColumnBinding(group_index, 0), ColumnBinding(table_index, 0)};
+	// DuckDB gives an aggregate two table indexes, and the operators above
+	// reference both. Groups come first, matching LogicalAggregate's own order.
+	vector<ColumnBinding> bindings;
+	for (idx_t i = 0; i < group_types.size(); i++) {
+		bindings.emplace_back(group_index, i);
 	}
-	return {ColumnBinding(table_index, 0)};
+	bindings.emplace_back(table_index, 0);
+	return bindings;
 }
 
 void LogicalFactorized::ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) {
@@ -60,7 +58,12 @@ InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 	result["Predicates"] = DescribePredicates(relations, graph);
 	result["Join Order"] = DescribeJoinOrder(relations, plan);
 	if (grouped) {
-		result["Group"] = relations[group_relation].alias + "." + relations[group_relation].column_names[group_column];
+		string keys;
+		for (const auto &key : group_keys) {
+			keys += (keys.empty() ? "" : ", ") + relations[key.relation].alias + "." +
+			        relations[key.relation].column_names[key.column];
+		}
+		result["Group"] = keys;
 	}
 	result["Aggregate"] = aggregate == factorize::Aggregate::SUM
 	                          ? "sum(" + relations[sum_relation].alias + "." +
@@ -81,9 +84,8 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	auto &physical = planner.Make<PhysicalFactorized>(types, relations, graph, plan, estimated_cardinality);
 	auto &factorized = physical.Cast<PhysicalFactorized>();
 	factorized.grouped = grouped;
-	factorized.group_type = group_type;
-	factorized.group_relation = group_relation;
-	factorized.group_column = group_column;
+	factorized.group_types = group_types;
+	factorized.group_keys = group_keys;
 	factorized.aggregate = aggregate;
 	factorized.sum_relation = sum_relation;
 	factorized.sum_column = sum_column;

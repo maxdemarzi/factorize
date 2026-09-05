@@ -32,16 +32,19 @@ public:
 
 	//! Table index owning this operator's aggregate column.
 	idx_t table_index;
-	//! Set for `GROUP BY g, count(*)`, which answers with two columns rather
-	//! than one. DuckDB gives an aggregate two table indexes -- one for its
-	//! groups, one for its aggregates -- and operators above reference both, so
-	//! the replacement has to expose both.
+	//! Set for `GROUP BY g1, ..., gn, count(*)`, which answers with one column
+	//! per key beside the aggregate rather than a single scalar. DuckDB gives an
+	//! aggregate two table indexes -- one for its groups, one for its aggregates
+	//! -- and operators above reference both, so the replacement has to expose
+	//! both.
 	bool grouped = false;
 	idx_t group_index = 0;
-	LogicalType group_type = LogicalType::BIGINT;
-	//! Which of the region's columns the grouping key is.
-	size_t group_relation = 0;
-	size_t group_column = 0;
+	//! One per key, in the aggregate's own order, which is the order the answer
+	//! columns come back in. Kept as the types the aggregate bound rather than
+	//! the int64 the engine works in.
+	vector<LogicalType> group_types;
+	//! Which of the region's columns each grouping key is, same order.
+	vector<factorize::GroupKey> group_keys;
 	//! Which fold to run, and for sum, which column carries the values and what
 	//! type the answer has to come back as. DuckDB widens sum to HUGEINT even
 	//! over narrow integers, and the operators above were bound against that.

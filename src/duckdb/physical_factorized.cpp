@@ -49,6 +49,9 @@ public:
 	//! beside the cost of counting one.
 	mutex lock;
 	int64_t total = 0;
+	//! How many tuples went into `total`, for a sum. SQL's sum over no rows is
+	//! NULL and not zero, and a total of zero cannot tell those apart.
+	int64_t tuples = 0;
 	idx_t completed = 0;
 	string error;
 	//! The inputs, read once and shared. Built lazily under `lock` by whichever
@@ -57,7 +60,7 @@ public:
 	unique_ptr<SharedRelations> inputs;
 	//! For a grouped query: the groups, and how many have been handed out. There
 	//! can be more of them than fit one vector.
-	unique_ptr<vector<std::pair<int64_t, int64_t>>> groups;
+	unique_ptr<std::vector<std::pair<std::vector<int64_t>, int64_t>>> groups;
 	idx_t handed_out = 0;
 };
 
@@ -123,13 +126,13 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			SharedRelations source(client, relations);
 			auto result = aggregate == factorize::Aggregate::SUM
 			                  ? factorize::ExecuteGroupSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-			                                               group_relation, group_column, sum_relation, sum_column)
+			                                               group_keys, sum_relation, sum_column)
 			                  : factorize::ExecuteGroupCount(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-			                                                 group_relation, group_column);
+			                                                 group_keys);
 			if (!result.ok) {
 				throw InvalidInputException("factorize: %s", result.error);
 			}
-			gstate.groups = make_uniq<vector<std::pair<int64_t, int64_t>>>(std::move(result.groups));
+			gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, int64_t>>>(std::move(result.groups));
 		}
 	}
 
@@ -137,13 +140,15 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 	idx_t produced = 0;
 	lock_guard<mutex> guard(gstate.lock);
 	while (gstate.handed_out < groups.size() && produced < STANDARD_VECTOR_SIZE) {
-		// The key goes back out in the type the aggregate gave it, not the int64
-		// the engine counted in.
-		chunk.SetValue(0, produced, Value::Numeric(group_type, groups[gstate.handed_out].first));
-		chunk.SetValue(1, produced,
-		               aggregate == factorize::Aggregate::SUM
-		                   ? FoldedValue(groups[gstate.handed_out].second, sum_type)
-		                   : Value::BIGINT(groups[gstate.handed_out].second));
+		const auto &group = groups[gstate.handed_out];
+		// Each key goes back out in the type the aggregate gave it, not the
+		// int64 the engine counted in, and in the aggregate's own order.
+		for (idx_t key = 0; key < group_types.size(); key++) {
+			chunk.SetValue(key, produced, Value::Numeric(group_types[key], group.first[key]));
+		}
+		chunk.SetValue(group_types.size(), produced,
+		               aggregate == factorize::Aggregate::SUM ? FoldedValue(group.second, sum_type)
+		                                                      : Value::BIGINT(group.second));
 		gstate.handed_out++;
 		produced++;
 	}
@@ -205,6 +210,7 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 			}
 		} else if (gstate.error.empty()) {
 			gstate.total = factorize::CheckedCardinalityAdd(gstate.total, result.count);
+			gstate.tuples = factorize::CheckedCardinalityAdd(gstate.tuples, result.tuples);
 		}
 		completed = ++gstate.completed;
 	}
@@ -219,8 +225,16 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 			throw InvalidInputException("factorize: %s", gstate.error);
 		}
 		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, aggregate == factorize::Aggregate::SUM ? FoldedValue(gstate.total, sum_type)
-		                                                           : Value::BIGINT(gstate.total));
+		if (aggregate == factorize::Aggregate::SUM) {
+			// Nothing summed is NULL, not zero. The fold has no way to say so --
+			// an empty join and a join of zeroes both total zero -- so the tuple
+			// count decides it. Rows dropped for a NULL value are the same case:
+			// they contribute nothing, and if they were all there was, SQL's
+			// answer is NULL.
+			chunk.SetValue(0, 0, gstate.tuples == 0 ? Value(sum_type) : FoldedValue(gstate.total, sum_type));
+		} else {
+			chunk.SetValue(0, 0, Value::BIGINT(gstate.total));
+		}
 	}
 	// Not FINISHED: that would tell DuckDB this thread is done with the operator
 	// entirely, and with fewer threads scheduled than there are buckets the rest
