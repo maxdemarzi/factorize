@@ -1363,3 +1363,52 @@ prevent reproducing it. The type is now chosen once per query, and a run that
 took nothing over exits 3 rather than reporting success -- the same twelve
 queries now fire on five, and the counter passes as well as fails, which a
 control has to do to be one.
+
+## D30 — The §7.5 fallback can make a query fail that would otherwise succeed
+
+Found by `fuzz-modes-agree.py` on the first run in which it had ever actually
+exercised the operator (see D29). Not yet fixed.
+
+    CREATE TABLE f0 AS SELECT CAST(v0 AS SMALLINT) AS c0 FROM (VALUES (1), (NULL)) AS src(v0);
+    CREATE TABLE f1 AS SELECT CAST(v0 AS SMALLINT) AS c0, CAST(v1 AS SMALLINT) AS c1
+                      FROM (VALUES (0,1),(1,0),(1,1),(0,1),(0,1)) AS src(v0, v1);
+    CREATE TABLE f3 (c0 SMALLINT, c1 SMALLINT);          -- empty
+
+    SET factorize_mode='force';
+    SELECT t2.c0, sum(t0.c0) FROM f1 t0, f3 t1, f0 t2
+     WHERE t0.c1 = t1.c0 AND t0.c0 = t2.c0 GROUP BY t2.c0;
+
+    INTERNAL Error: Attempted to access index 0 within vector of size 0
+
+**What it takes.** Every one of these is necessary; removing any makes it pass:
+a grouped `sum` (plain `count(*)` is fine), a relation with no rows, and a NULL
+in the relation the grouping column comes from. `off` and `auto` both answer
+correctly -- `auto` because the gate declines at this size, which is why no test
+caught it.
+
+**Where.** Plan time, not run time: `EXPLAIN` alone triggers it, which is also
+why §7.5's run-time fallback cannot catch it. The throw is DuckDB's own, in
+`PhysicalHashJoin`'s constructor at `physical_hash_join.cpp:89`, reading
+`rhs_input_types[rhs_col]` where the right child's types are empty and the
+projection map still asks for column 0.
+
+**Why it is ours.** `SET factorize_fallback=false` makes the query work. The
+fallback plan is a snapshot of the logical plan taken when the rule fires,
+parked in a member that is not in `children`, and planned later by
+`LogicalFactorized::CreatePlan`. Optimizer passes that run after the rule
+therefore never reach it. Disabling either `statistics_propagation` or
+`filter_pushdown` avoids the crash, which is the prediction that diagnosis
+makes: an empty relation is exactly what those passes rewrite, and only the
+hidden copy keeps the pre-rewrite shape.
+
+So the feature built to stop an internal error reaching the user is, on this
+shape, the thing producing one. It is pre-existing -- a build from before
+today's merges fails identically -- and it needs no factorized execution to
+happen at all.
+
+**The fix is not local.** Making `fallback` a real child of `LogicalFactorized`
+would put it in front of the passes it is missing, and matches what the physical
+side already does with `children[0]`. That changes the member assignment in
+`optimizer_rule.cpp`, so it needs agreeing with whoever holds that file, and it
+needs checking that no later pass rewrites the fallback into something that is
+no longer the query the operator replaced.
