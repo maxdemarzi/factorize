@@ -1613,3 +1613,66 @@ number is why it survived every run this project has made.
 these guards protect both terms, so an overflow in one term yields a wrong
 difference with both halves looking plausible -- the failure mode the second
 session flagged when that feature landed and could not test for from inside it.
+
+## D33 — The first measurement on real TPC-DS data: the rule never fires
+
+Every coverage figure this project has quoted came from **23 empty tables** in
+**force** mode. Force bypasses the gate, so that set is what the matcher accepts,
+not what a user gets. Measured properly -- generated data at scale factor 1,
+2,880,404 `store_sales` rows, a release build, this machine:
+
+    auto  fires on   0 of 99
+    force fires on   1 of 99   (q96)
+
+Against the 5 of 99 that has been the headline. The number does not survive
+contact with data, because real statistics make DuckDB's optimizer produce
+different plans, so the matcher sees different shapes.
+
+**Verified before it was believed.** "0 fires" is indistinguishable from "the
+extension did not load", so a positive control ran first on the same binary: the
+shape `test/sql` asserts under `auto` fires. The measurement could have gone the
+other way.
+
+**The gate is right to decline the one query that reaches it.**
+
+    q96: gate says no: predicted 107ms against DuckDB's 67ms, under the 1.5x
+         margin; estimated 10K tuples in 911K records, compressed 0.0x
+
+10K tuples in 911K records is an f-representation *larger* than the flat result.
+There is no fan-out in that shape to exploit, and declining it is the gate doing
+its job rather than the gate being miscalibrated.
+
+**What blocks the other 98, and why fixing the top blocker delivers nothing.**
+On real data the matcher's declines are dominated by one cause:
+
+     45  compressed materialization is in the way
+     13  sum() of a computed expression
+      8  aggregate has grouping sets
+      8  aggregate is avg()
+      1  fires
+
+Forty-five is an upper bound, not a delivery. Disabling that pass -- which
+simulates handling it perfectly -- moves the numbers to **force 1, auto 0**.
+Every one of the 45 hits another blocker immediately behind it. This is the
++47-predicted/+2-delivered pattern from the coverage analyser, at feature scale:
+the largest blocker by count is worth zero queries.
+
+**And it revises D31's cost.** With that pass out of the way, 12 queries are
+blocked by D31's NULL guard (`sum over ss_ext_sales_price ... may contain NULL`).
+The measured cost of that guard is zero *today*, and that zero is conditional on
+compressed materialization blocking those queries first. Restoring the coverage
+it took would matter only in a world where the pass above it was already solved.
+
+**The conclusion for the backlog.** None of the remaining candidates changes this
+benchmark: outer/semi at the SQL surface was measured at 0 TPC-DS queries, `<>`
+at 0, and compressed materialization at 0 delivered. TPC-DS does not contain the
+shapes factorization exploits, and where it contains one, the fan-out is not
+there. That is a fact about the benchmark, not a verdict on the technique -- but
+it means no coverage work on this corpus can be justified by this corpus.
+
+> A benchmark that cannot exercise a feature cannot justify building more of it,
+> and cannot condemn it either.
+
+Scope, stated so it is not read as more: one machine, scale factor 1, one build,
+one benchmark. The honest answer to "are the queries that fire faster on real
+data" is that at sf=1 there are none to time.
