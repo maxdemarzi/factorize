@@ -85,7 +85,19 @@ def make_query(rng, tables):
         # everything between; occasionally attach twice, which produces cycles.
         left_alias, _, left_cols = aliases[rng.randrange(i)]
         right_alias, _, right_cols = aliases[i]
-        predicates.append(f"{left_alias}.{rng.choice(left_cols)} = {right_alias}.{rng.choice(right_cols)}")
+        if len(left_cols) > 1 and len(right_cols) > 1 and rng.random() < 0.35:
+            # Attach on both columns at once: a composite key, which is a
+            # different planner path from a cycle. Its keys have to land on one
+            # f-tree NODE rather than merely share an equivalence class, and
+            # that check simulates the tree it is planning -- the most intricate
+            # thing in BuildPlan and, left to the random extra edge below, the
+            # least exercised. Two predicates between one pair turned up in 21
+            # of 400 generated queries before this, of which only the third that
+            # fire reached the check at all.
+            predicates.append(f"{left_alias}.{left_cols[0]} = {right_alias}.{right_cols[0]}")
+            predicates.append(f"{left_alias}.{left_cols[1]} = {right_alias}.{right_cols[1]}")
+        else:
+            predicates.append(f"{left_alias}.{rng.choice(left_cols)} = {right_alias}.{rng.choice(right_cols)}")
     if len(aliases) > 2 and rng.random() < 0.35:
         a, _, a_cols = rng.choice(aliases)
         b, _, b_cols = rng.choice(aliases)

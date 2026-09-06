@@ -1319,6 +1319,73 @@ were inverted once and watched to fail, because an assertion nobody has seen
 fail is not yet a check. The implementation turned out to be right -- the point
 is that the suite could not have told us either way.
 
+**Five in one night, and the last two were ours after we had written this down.**
+Counting only signals that could not have gone red: a fuzzer whose queries all
+declined, so three modes agreed trivially; a soundness harness that printed 132
+wrong answers and returned 0; a matcher whose decline counts measured which
+check ran first; a fuzz wrapper reporting "0 seeds failing" from a loop where
+seven of ten seeds never ran, because a seed that does not run cannot fail; and
+a build reporting success with compile errors in its log. The last two were
+produced by the two of us within an hour of writing the entry above, by the two
+people who had just written it.
+
+That is the argument for structural guards rather than for care. Knowing the
+shape has not once prevented producing it. What works is a check that does not
+need anyone to remember it at the moment it matters:
+
+- the fired counter, which makes a vacuous run fail rather than pass;
+- counting `Expect(` sites against `HEAD`, which catches a refactor deleting
+  assertions;
+- stat-ing the binary before and after a measurement, which discards a result
+  taken while something else was rebuilding it;
+- requiring a summary line per unit of work, so a unit that never ran is named
+  rather than counted as passing;
+- reading exit status from the process that did the work, never from a pipeline.
+
+Each of those is one line and none of them asks anyone to notice anything.
+
+**A sixth, and not the same kind.** `$?` does not survive
+`wsl.exe -- bash -lc "..."`. The outer Git Bash expands it before the inner
+shell ever sees it, so it reads 0 whatever happened:
+
+    wsl.exe -- bash -lc "false; echo EXIT=$?"   ->  EXIT=0
+    wsl.exe -- bash -lc "true;  echo EXIT=$?"   ->  EXIT=0
+
+Escaping it does not help and neither does single-quoting the `-lc` argument.
+Every `BUILD-EXIT=` and `exit=` printed that way tonight was a constant. What
+works is a script file, where the status is taken by the shell that ran the
+command rather than interpolated by the one that did not:
+
+    wsl.exe -- bash -lc "bash /path/run.sh false"   ->  INNER-STATUS=1
+
+The five above were checks we wrote that could not go red. This is a channel
+that silently replaces a measurement with a constant, and no care on either side
+of it would have revealed that -- it surfaced only because build artefacts were
+older than the edits that should have produced them. Found by the second
+session; it explains its own `BUILD-EXIT=0` on a failed build, which was never
+`make`'s doing.
+
+Two claims of ours were re-checked through a script file afterwards and both
+stand: `wsl-build.sh` does propagate a failed build, because `time` is a bash
+keyword that passes the status through (`time false` -> 1, `time (exit 7)` -> 7,
+a failing `make` -> 2); and the unittest binary does exit 0 when its filter
+matches no test, which is what `duckdb-regression.sh` now treats as a failure.
+The builds behind D30 and D31 were never in doubt for a better reason than
+their exit status: both logs contain no `error:` line, and both fixes were
+checked by running the repro and by running the regression section against the
+build that has the bug.
+
+> Verifying a result through the channel that produced it is not verification.
+> Both sessions were saved here by having read a *content* check beside every
+> status -- assertion counts, plan files, actual query output -- which is habit
+> rather than judgement.
+
+A note on the shared checkout, which produced two of the five. Two sessions
+divided the source files between them and divided neither the git index nor the
+build outputs. A commit picked up the other's staged files; a build emptied the
+binary a measurement was reading. Both are the same omission: a file-level
+division says nothing about the artefacts both sides read and write.
+
 `duckdb-regression.sh` took the unittest binary's exit status, which is **0 when
 a filter matches no test**. Its default suites are DuckDB's own paths, so a
 version bump moving one of them would have turned the engine-regression run --
@@ -1485,6 +1552,21 @@ that sum is the whole answer. `region.grouped || region.aggregates.size() > 1`.
 A lone `sum` over a nullable column still runs, which is the common case; adding
 any second aggregate declines it on the statistics as the grouped path already
 did.
+
+**What that costs, measured on both sides.** Locally: `count(*), sum(nullable)`
+declines, `count(*), sum(non-nullable)` fires, a lone `sum` over a nullable
+column fires, and an all-NULL sum still returns NULL rather than 0 -- all four
+asserted in the suite, so the cost is a checked fact rather than a sentence. On
+TPC-DS, measured by the second session, the cost is currently **zero**: all five
+previously-firing queries still fire with identical takeover counts, q77's six
+regions included, so the declined shape was not among what the rule was already
+reaching.
+
+That measurement had to be asked for. A decline is invisible to the differential
+that found the bug -- `off` and `force` agree perfectly when `force` is not
+running -- so trading correctness for coverage here would have shown up as a
+clean run either way. The guard is a coverage decision as much as a correctness
+one, and neither of our harnesses can see the coverage half.
 
 > A justification that is sound about one part of the answer will happily be
 > written next to a condition that governs all of it.
