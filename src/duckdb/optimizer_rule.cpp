@@ -695,19 +695,28 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			bound.column_types.push_back(value_type);
 		}
 		const auto local = static_cast<size_t>(bound.LocalIndex(physical));
-		if (region.grouped && local >= join_columns[found->second]) {
-			// Ungrouped, a row whose summed value is NULL can be dropped: it
-			// contributes NULL to the sum either way. Grouped, it cannot -- a
-			// group whose every row is NULL here is still a row of the answer,
-			// with a NULL sum, and dropping those rows deletes the group.
+		const bool row_matters_elsewhere = region.grouped || region.aggregates.size() > 1;
+		if (row_matters_elsewhere && local >= join_columns[found->second]) {
+			// A row whose summed value is NULL may be dropped only when this sum
+			// is the whole answer, because it contributes NULL to its own sum
+			// either way. It may not be dropped when anything else in the query
+			// needs the row to exist: a count(*) comes back one short, and a sum
+			// over another column loses that row's contribution to it. Grouped,
+			// it may never be dropped -- a group whose every row is NULL here is
+			// still a row of the answer, with a NULL sum.
+			//
+			// This read `region.grouped` alone, and `count(*), sum(x)` over a
+			// nullable x silently returned one row short (D31). The reasoning
+			// written here was sound about the sum and was applied to the query.
 			//
 			// Declined up front on the statistics, so the common case stays a
 			// decline that DuckDB answers rather than an error; the run-time
 			// guard below it is for the rows the statistics do not cover.
 			auto statistics = get.GetTable()->GetStatistics(context, column_index.GetPrimaryIndex());
 			if (!statistics || statistics->CanHaveNull()) {
-				return Decline(region, "grouped sum over " + definition.Name() +
-				                           ", which may contain NULL and would drop a group entirely");
+				return Decline(region, "sum over " + definition.Name() + ", which may contain NULL and would " +
+				                           (region.grouped ? "drop a group entirely"
+				                                           : "drop the row from the query's other aggregates"));
 			}
 			bound.no_null_columns.push_back(static_cast<idx_t>(local));
 		}

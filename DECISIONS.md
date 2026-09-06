@@ -1374,6 +1374,7 @@ exercised the operator (see D29). Not yet fixed.
                       FROM (VALUES (0,1),(1,0),(1,1),(0,1),(0,1)) AS src(v0, v1);
     CREATE TABLE f3 (c0 SMALLINT, c1 SMALLINT);          -- empty
 
+    SET disabled_optimizers='compressed_materialization';   -- REQUIRED, see below
     SET factorize_mode='force';
     SELECT t2.c0, sum(t0.c0) FROM f1 t0, f3 t1, f0 t2
      WHERE t0.c1 = t1.c0 AND t0.c0 = t2.c0 GROUP BY t2.c0;
@@ -1406,9 +1407,59 @@ shape, the thing producing one. It is pre-existing -- a build from before
 today's merges fails identically -- and it needs no factorized execution to
 happen at all.
 
+**User-reachability is open, and this entry first claimed otherwise.** The
+`disabled_optimizers` line above is required, and was missing from the first
+version of this entry; the second session could not reproduce it without that
+line and said so. Without it the rule declines with compressed materialization
+in the way, so no fallback is built and nothing goes stale. This entry then said
+"a shape like this on tables big enough for the gate to say yes would reach a
+user", which was never measured. What is now measured: the rule *can* fire on a
+grouped sum with compressed materialization left on -- a group key whose range is
+too wide to compress escapes it -- so that pass is not an absolute barrier. But
+no construction has yet produced the crash with it enabled. Firing is reachable;
+this crash is not yet known to be. Recorded as conjecture until someone builds
+the shape.
+
 **The fix is not local.** Making `fallback` a real child of `LogicalFactorized`
 would put it in front of the passes it is missing, and matches what the physical
 side already does with `children[0]`. That changes the member assignment in
 `optimizer_rule.cpp`, so it needs agreeing with whoever holds that file, and it
 needs checking that no later pass rewrites the fallback into something that is
 no longer the query the operator replaced.
+
+## D31 — A NULL in a summed column silently dropped the row from `count(*)`
+
+The same fuzzer run that produced D30 produced a wrong answer, which is worse.
+All four seeds failed; this is the shape behind the fourth.
+
+    CREATE TABLE t AS SELECT * FROM (VALUES (NULL::INTEGER, 0), (0, 1), (0, 1)) AS v(c0, c1);
+    SET factorize_mode='force';
+    SELECT count(*), sum(a.c0) FROM t a, t b WHERE a.c1 = b.c1;
+    -- 4, and the answer is 5
+
+`count(*)` alone agrees. `sum(a.c0)` alone agrees. `count(*)` with a sum over a
+*non-nullable* column agrees. Only the combination is wrong, and it is wrong
+silently, in `auto` as well as `force` whenever the gate says yes.
+
+**The cause is a correct sentence applied to the wrong scope.** Binding a summed
+column, `optimizer_rule.cpp` guarded NULLs only when `region.grouped`, over this
+reasoning: *ungrouped, a row whose summed value is NULL can be dropped, it
+contributes NULL to the sum either way.* That is true of the sum. It is false of
+everything else in the query. `storage_source.cpp` drops any row with a NULL in
+any column the region reads, so adding the summed column to the scan makes the
+NULL row vanish from `count(*)` too -- and from any second sum, which loses that
+row's contribution.
+
+**The fix** is the condition, not the reasoning: a row may be dropped only when
+that sum is the whole answer. `region.grouped || region.aggregates.size() > 1`.
+A lone `sum` over a nullable column still runs, which is the common case; adding
+any second aggregate declines it on the statistics as the grouped path already
+did.
+
+> A justification that is sound about one part of the answer will happily be
+> written next to a condition that governs all of it.
+
+Both D30 and D31 were found by the first fuzzer run that ever exercised the
+operator, which is the entire argument for the positive control in D29: this
+tool reported "0 disagreements" for its whole life, and the first run that could
+have disagreed did, four times out of four seeds.

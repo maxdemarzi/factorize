@@ -1800,3 +1800,66 @@ SELECT count(*) FROM ck_two_a, ck_two_b
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# A NULL in a summed column used to take the row out of count(*) as well.
+#
+# The scan drops any row with a NULL in a column the region reads, and binding
+# a sum adds its column to the scan, so `count(*), sum(x)` over a nullable x
+# came back one row short -- silently, and in 'auto' too whenever the gate said
+# yes. The NULL guard was written for grouped queries over reasoning that is
+# true of the sum alone: a row whose summed value is NULL contributes NULL to
+# that sum either way. It contributes a row to every other aggregate (D31).
+#-----------------------------------------------------------------------------
+statement ok
+CREATE TABLE d31 AS SELECT * FROM (VALUES (NULL::INTEGER, 0::INTEGER), (0::INTEGER, 1::INTEGER),
+                                          (0::INTEGER, 1::INTEGER)) AS v(c0, c1);
+
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT count(*), sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1;
+----
+5	0
+
+# What the fix costs, asserted rather than described: a second aggregate over a
+# nullable summed column now declines. Paired with the case below, so this is a
+# statement about this shape and not about the rule having stopped working.
+query II
+EXPLAIN SELECT count(*), sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+# A lone sum over the same nullable column is still taken over. Dropping those
+# rows cannot change a sum that is the whole answer -- and it is what makes an
+# all-NULL sum come back NULL instead of 0, since every row drops and an empty
+# join is what carries that distinction.
+query II
+EXPLAIN SELECT sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query I
+SELECT sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1 AND a.c0 IS NULL;
+----
+NULL
+
+# And a non-nullable summed column still fires beside a count, so the guard is
+# on the NULLs rather than on there being two aggregates.
+statement ok
+CREATE TABLE d31_clean AS SELECT * FROM (VALUES (2::INTEGER, 0::INTEGER), (3::INTEGER, 1::INTEGER),
+                                               (4::INTEGER, 1::INTEGER)) AS v(c0, c1);
+
+query II
+EXPLAIN SELECT count(*), sum(a.c0) FROM d31_clean a, d31_clean b WHERE a.c1 = b.c1;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query II
+SELECT count(*), sum(a.c0) FROM d31_clean a, d31_clean b WHERE a.c1 = b.c1;
+----
+5	16
+
+statement ok
+SET factorize_mode = 'off';
