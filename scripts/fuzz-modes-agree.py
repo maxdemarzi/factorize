@@ -212,6 +212,15 @@ def main():
         # function. With the pass left on, every grouped query would be
         # declined and this would compare stock DuckDB against itself.
         script += "SET disabled_optimizers='compressed_materialization';\n"
+        # 'auto' is in here for the answer and not for the gate. These tables are
+        # 0 to 13 rows, so the gate declines every one of them: measured at 0 of 14
+        # generated queries taken over under 'auto' against 3 of 14 under 'force'.
+        # This arm therefore compares a declining gate against 'off', which is worth
+        # something and is not what three modes looks like it covers. The case where
+        # the gate says yes and the answer still has to match is in
+        # test/sql/factorized_optimizer.test on tables of 8000 rows, where it can be
+        # asserted instead of hoped for. Growing the tables here until the gate bites
+        # would cost more per iteration than that coverage is worth having twice.
         for index, mode in enumerate(("off", "force", "auto")):
             if index:
                 script += f"SELECT '{SEPARATOR}';\n"
