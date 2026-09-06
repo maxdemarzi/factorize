@@ -23,10 +23,19 @@ namespace {
 //! than inheriting one, so anything that runs the engine on a thread it did not
 //! set up has to set the limit there too.
 thread_local size_t g_memory_limit = 0;
+thread_local size_t g_estimate_budget = 0;
 }
 
 void SetGlobalMemoryLimit(size_t bytes) {
 	g_memory_limit = bytes;
+}
+
+void SetGlobalEstimateBudget(size_t bytes) {
+	g_estimate_budget = bytes;
+}
+
+size_t GetGlobalEstimateBudget() {
+	return g_estimate_budget;
 }
 
 size_t GetGlobalMemoryLimit() {
@@ -38,6 +47,7 @@ FactorizedRelation::FactorizedRelation(FTree tree_p, AttributeTypes types_p)
 	layout = std::make_unique<Layout>(Layout::FromFTree(tree, types));
 	frep = std::make_unique<FRepresentation>(*layout);
 	frep->SetMemoryLimit(g_memory_limit);
+	frep->SetEstimateBudget(g_estimate_budget);
 }
 
 FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const AttributeTypes &types,

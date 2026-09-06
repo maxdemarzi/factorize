@@ -196,6 +196,12 @@ int64_t FactorizedCountJoin(const FactorizedRelation &build, const FactorizedRel
 void SetGlobalMemoryLimit(size_t bytes);
 size_t GetGlobalMemoryLimit();
 
+//! Budget from the gate's own size estimate; 0 = none. Per thread, like the
+//! memory cap. Exceeding it throws a plain exception rather than
+//! MemoryLimitExceeded, so it is answered by abandoning rather than by slicing.
+void SetGlobalEstimateBudget(size_t bytes);
+size_t GetGlobalEstimateBudget();
+
 //! Builds a flat, single-node relation from columnar input. This is the
 //! trivial f-representation of section 4.2.1.
 FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const AttributeTypes &types,

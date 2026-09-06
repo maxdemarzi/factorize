@@ -979,7 +979,8 @@ static idx_t MemoryBudget(ClientContext &context) {
 
 //! Whether factorizing this region is predicted to beat the stock plan.
 static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, const vector<BoundRelation> &relations,
-                       const factorize::QueryGraph &graph, const factorize::Plan &plan, string &reason) {
+                       const factorize::QueryGraph &graph, const factorize::Plan &plan, string &reason,
+                       double &predicted_bytes) {
 	CatalogStats stats(context, region, relations);
 	factorize::CostThresholds thresholds;
 	thresholds.margin = DoubleSetting(context, "factorize_min_gain", thresholds.margin);
@@ -991,6 +992,7 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// BuildPlan has already refused anything that cannot be arranged as a tree.
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	reason = estimate.reason;
+	predicted_bytes = estimate.bytes;
 	return estimate.fire;
 }
 
@@ -1015,10 +1017,11 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 				region.decline = plan.reason;
 			} else {
 				string gate_reason;
+				double predicted_bytes = 0;
 				// FORCE skips this and only this: the matcher's refusals are
 				// about what the engine can compute at all, while the gate is
 				// about whether computing it that way is a good idea.
-				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason);
+				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason, predicted_bytes);
 				if (!fire) {
 					region.decline = "gate says no: " + gate_reason;
 				} else {
@@ -1039,6 +1042,18 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 						// it, because the operators above were bound to that.
 						replacement->aggregate_types.push_back(
 						    entry.kind == factorize::Aggregate::SUM ? entry.type : LogicalType::BIGINT);
+					}
+					// Hold the operator to the size the gate bet on. The gate is a
+					// prediction and predictions are wrong; this bounds how wrong.
+					// A representation that outgrows the estimate by this factor
+					// means the decision rested on a number that is not true, and
+					// finishing the query only spends longer being wrong (D34).
+					// Zero disables the check and restores the old behaviour.
+					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
+					if (slack > 0 && predicted_bytes > 0) {
+						const double budget = predicted_bytes * slack;
+						replacement->estimate_budget_bytes =
+						    budget >= 9e18 ? 0 : static_cast<idx_t>(budget) + 1024 * 1024;
 					}
 					replacement->estimated_cardinality = 1;
 					replacement->ResolveOperatorTypes();
@@ -1119,6 +1134,22 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	config.AddExtensionOption("factorize_min_gain",
 	                          "Fire only when factorizing is predicted to beat the stock plan by this factor",
 	                          LogicalType::DOUBLE, Value::DOUBLE(1.5));
+	// How far past its own size estimate the representation may grow before the
+	// operator abandons and lets the replaced plan answer. The gate is a
+	// prediction; this bounds the cost of it being wrong. 0 disables.
+	//
+	// 2 is measured rather than chosen. On the CE corpus the estimate is either
+	// close (the three queries that win are within 2.5x, one of them over) or
+	// hopeless (12x to 205x low, on every query that loses), with nothing in
+	// between -- so a tight bound costs the winners nothing and catches every
+	// observed misprediction. Measured at slack 1/2/4/8, the wins do not move at
+	// all (0.49-0.53s for hetio_acyclic_222_16 at every setting) while the worst
+	// loser goes 8.6s / 10.2s / 13.7s / 22.2s. 1 is better still on the losers;
+	// 2 keeps a margin for ordinary estimate noise on a query that would win.
+	config.AddExtensionOption("factorize_estimate_slack",
+	                          "Abandon to the stock plan if the f-representation outgrows the gate's "
+	                          "size estimate by more than this factor (0 disables)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(2.0));
 	config.AddExtensionOption("factorize_min_work_ms",
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",

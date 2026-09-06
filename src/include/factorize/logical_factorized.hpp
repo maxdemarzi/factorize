@@ -65,6 +65,9 @@ public:
 	//! executor deliberately does not schedule -- it costs nothing unless the
 	//! factorized path throws, and then it is already there to run.
 	unique_ptr<LogicalOperator> fallback;
+
+	//! Bytes the gate predicted, times a slack factor; 0 = unbounded.
+	idx_t estimate_budget_bytes = 0;
 	//! The join order, decided when the region was matched. Ordering at match
 	//! time is what lets an unorderable graph be a decline instead of a query
 	//! that fails partway through executing.

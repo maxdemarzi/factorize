@@ -148,6 +148,23 @@ public:
 		memory_limit = bytes;
 	}
 
+	//! The size the gate BET this representation would be, times a margin; 0 = none.
+	//!
+	//! Different in kind from the memory limit above, and deliberately not the
+	//! same exception. Exceeding memory means "this machine cannot hold it",
+	//! which slicing answers by making several smaller passes. Exceeding this
+	//! means "the estimate the decision rested on was wrong", which slicing
+	//! cannot answer at all: the query was taken over because it was predicted
+	//! to be cheap, and it is not. The only sound answer is to abandon and let
+	//! the plan we replaced run, which is what section 7.5's fallback is for.
+	//!
+	//! Measured need: on watdiv star joins the record estimate was low by up to
+	//! 205x, and the queries ran 45x to 163x slower than the plan they replaced
+	//! (D34). No refit of the cost coefficients can fix a wrong input to them.
+	void SetEstimateBudget(size_t bytes) {
+		estimate_budget = bytes;
+	}
+
 	//===------------------------------------------------------------------===//
 	// Construction
 	//===------------------------------------------------------------------===//
@@ -343,6 +360,7 @@ private:
 	//! Armed by PruneEmptySubtrees(); makes iteration skip zero-size records.
 	bool prune_empty = false;
 	size_t memory_limit = 0;
+	size_t estimate_budget = 0;
 	uint32_t next_root_capacity = 8;
 	size_t roots = 0;
 	size_t records = 0;

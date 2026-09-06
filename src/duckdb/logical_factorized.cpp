@@ -115,6 +115,7 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 		// executor's schedule, so nothing here runs unless it is asked to.
 		factorized.children.push_back(planner.CreatePlan(*fallback));
 	}
+	factorized.estimate_budget_bytes = estimate_budget_bytes;
 	factorized.grouped = grouped;
 	factorized.group_types = group_types;
 	factorized.group_keys = group_keys;

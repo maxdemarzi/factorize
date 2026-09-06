@@ -20,6 +20,14 @@ OverflowSegment *FRepresentation::AllocateSegment(uint32_t capacity, uint32_t re
 	if (memory_limit != 0 && arena.BytesAllocated() + bytes > memory_limit) {
 		throw MemoryLimitExceeded("f-representation exceeded its memory limit");
 	}
+	// Deliberately NOT MemoryLimitExceeded: that one means slice and try again,
+	// and slicing a query the gate mispredicted only spends longer being wrong.
+	// A plain exception reaches the operator as a failed result, which throws,
+	// which the fallback catches and answers with the plan we replaced.
+	if (estimate_budget != 0 && arena.BytesAllocated() + bytes > estimate_budget) {
+		throw std::runtime_error("the f-representation grew past the size the gate predicted for it, so the "
+		                         "decision to factorize this query rested on an estimate that is wrong");
+	}
 	auto *segment = reinterpret_cast<OverflowSegment *>(arena.Allocate(bytes));
 	segment->next = nullptr;
 	segment->count = 0;

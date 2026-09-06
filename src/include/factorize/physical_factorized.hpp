@@ -39,6 +39,8 @@ public:
 	factorize::QueryGraph graph;
 	factorize::Plan plan;
 	//! Set for `GROUP BY g1, ..., gn`: one row per group rather than one row.
+	//! Bytes the gate predicted, times a slack factor; 0 = unbounded.
+	idx_t estimate_budget_bytes = 0;
 	bool grouped = false;
 	//! One per key, in the aggregate's order, which is the answer's order.
 	vector<LogicalType> group_types;

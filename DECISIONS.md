@@ -1676,3 +1676,110 @@ it means no coverage work on this corpus can be justified by this corpus.
 Scope, stated so it is not read as more: one machine, scale factor 1, one build,
 one benchmark. The honest answer to "are the queries that fire faster on real
 data" is that at sf=1 there are none to time.
+
+## D34 — The first speed measurement: 3 wins, 8 losses, and the gate cannot tell them apart
+
+D33 found that TPC-DS never fires, so there was nothing to time. The CE corpus
+(graph joins, already downloaded, 5.3 GB of source data) is the opposite case:
+**force fires on 119 of 119** and the gate lets **12** through. Those 12 are the
+first queries this project has ever timed against stock DuckDB on real data.
+
+    query                          expected      off s   auto s   ratio
+    epinions_acyclic_215_12       132265073       0.65     0.11     5.8x   win
+    hetio_acyclic_222_16          815717690       3.43     0.53     6.5x   win
+    epinions_acyclic_215_04        93418738       0.73     0.20     3.7x   win
+    hetio_acyclic_205_00          337331612       0.38     0.44     0.9x
+    watdiv_acyclic_210_15          12177467       0.11     1.64    0.07x
+    watdiv_acyclic_215_17            531172       0.12     2.08    0.06x
+    watdiv_acyclic_216_10         170447782       0.85    10.31    0.08x
+    watdiv_acyclic_217_01         483756743       1.62    11.19    0.14x
+    watdiv_acyclic_201_10         167849271       0.25    27.96   0.009x
+    watdiv_acyclic_206_16          39891620       0.16    26.16   0.006x
+    watdiv_acyclic_212_05         178516440       1.31    59.11   0.022x
+    yago_acyclic_Chain_12_17              2       0.11     0.23     0.5x
+
+Every answer matches `off`. The correctness work holds. The speed does not: the
+gate exists to decline losses and it accepted eight, the worst of them **163x
+slower** than doing nothing.
+
+**Counting a 815-million-tuple join in 0.53s against DuckDB's 3.43s is the paper's
+claim working.** So is 5.8x on epinions. The technique is not the problem.
+
+**Two separable causes, both measured.** On `watdiv_acyclic_206_16`, a
+seven-relation star:
+
+    stock DuckDB          0.189 s
+    ours, fallback ON    20.070 s
+    ours, fallback OFF   10.352 s
+
+The 7.5 fallback costs a clean **2x** whenever the operator runs, because the
+attached child makes the operator serial (`ParallelSource` returns
+`children.empty()`), and it is on by default. That is a real cost of a
+correctness feature and it was never measured against anything but a synthetic
+grid.
+
+Underneath it, the engine is still **55x** slower than DuckDB on that shape. The
+losers are all wide stars on one hub column; the winners are chains and mixed
+shapes. Whatever the cause, it is not the gate's fault and not the fallback's.
+
+**What the gate got wrong is narrower than it looks.** Its coefficients were
+fitted on synthetic uniform data by `calibrate-synthetic.py`, and F18 already
+recorded that our flat estimate is weakest there. This is the first evidence
+that the fit does not transfer: it is not mildly optimistic, it is wrong by two
+orders of magnitude on a shape family it never saw.
+
+> A cost model fitted on shapes you generate can only be as good as your
+> imagination of what shapes exist. Ours had never imagined watdiv.
+
+Scope: one machine, one build, `ce_runnable.psv` (119 queries), minimum of two
+runs per mode, results compared for equality on every query.
+
+### The fix: bound the bet, because the prophecy cannot be improved here
+
+Refitting the coefficients was the obvious move and it is wrong. The gate
+predicted **228ms** for `watdiv_acyclic_212_05`, which ran for **59,110ms**, and
+the reason is not the coefficients but their input:
+
+    query              est records    ACTUAL records     error
+    watdiv_212_05            589 K       121,021,261     205x under
+    watdiv_206_16              3 M        69,985,962      23x under
+    watdiv_201_10              3 M        37,192,978      12x under
+    epinions_215_04          235 K           224,042     about right
+    hetio_222_16               2 M           872,178     over, by 2.3x
+
+No curve fit repairs a 205x error in the number being fed to the curve. It is
+cardinality estimation on skewed graph stars.
+
+So the gate now passes the size it predicted to the operator, and the
+representation is held to it times `factorize_estimate_slack`. Outgrowing the
+budget means the decision rested on a number that is not true, so the operator
+throws, §7.5's fallback catches it, and the plan we replaced answers. The throw
+is deliberately **not** `MemoryLimitExceeded`: that means "this machine cannot
+hold it", which slicing answers correctly, whereas this means "the estimate was
+wrong", which slicing answers by spending longer being wrong.
+
+**The default is measured, not chosen.** Slack 1/2/4/8 against the corpus: the
+wins do not move at all (`hetio_acyclic_222_16` is 0.509 / 0.534 / 0.535 / 0.490
+against 3.5s for DuckDB) while the worst loser runs 8.6 / 10.2 / 13.7 / 22.2.
+The estimate is either close (every win within 2.5x, one of them over) or
+hopeless (12x-205x low, every loss), with nothing in between -- so a tight bound
+costs the winners nothing. 2 keeps a margin for ordinary noise on a query that
+would win.
+
+**Measured effect, all 12 re-timed:**
+
+    worst single slowdown      163x  ->   86x
+    total across the 8 losses  139s  ->   62s
+    the three wins              3.7x, 5.8x, 6.5x  ->  3.9x, 6.1x, 6.8x
+    answers                    identical to `off` on all 12, before and after
+
+**It is a bound, not a repair, and the residue is two things this does not
+touch.** With the fallback disabled entirely the engine is still **55x** slower
+than DuckDB on `watdiv_acyclic_206_16`, so no gate setting can recover that
+shape. And the fallback runs serially, because `ParallelSource` returns
+`children.empty()` to stop worker starvation, so the recovery path competes
+against DuckDB on eight threads. A user running watdiv-shaped stars still loses,
+by 86x instead of 163x.
+
+> A cost model that cannot be trusted can still be made survivable. Bounding the
+> loss needs no better estimate than the one that is already wrong.
