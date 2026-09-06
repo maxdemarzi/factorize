@@ -13,6 +13,20 @@ LogicalFactorized::LogicalFactorized(idx_t table_index_p, vector<BoundRelation> 
 }
 
 void LogicalFactorized::ResolveTypes() {
+	// The fallback is resolved here because nothing else will. DuckDB resolves
+	// types by walking `children` from the plan root, and the fallback is a
+	// whole plan parked beside them rather than one of them, so the pass that
+	// gives every operator its types reaches every node except that subtree.
+	// Binding resolution does reach it, because ResolveColumnBindings visits it
+	// by hand -- so the fallback was arriving at the physical planner with its
+	// bindings resolved and its types not, and a node whose types were empty
+	// took DuckDB's own PhysicalHashJoin constructor off the end of a vector
+	// (D30). Resolving here rather than in CreatePlan keeps the order DuckDB
+	// uses for everything else: types first, then bindings, then planning.
+	if (fallback) {
+		fallback->ResolveOperatorTypes();
+	}
+
 	// The sealed island emits one scalar, or -- when the query groups -- one
 	// group key beside it. It never becomes a tuple stream.
 	//

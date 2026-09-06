@@ -1863,3 +1863,53 @@ SELECT count(*), sum(a.c0) FROM d31_clean a, d31_clean b WHERE a.c1 = b.c1;
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# The fallback plan reached the physical planner with its types unresolved.
+#
+# DuckDB resolves types by walking `children` from the plan root. The fallback
+# is a whole plan parked beside `children` rather than one of them, so that pass
+# reached every operator except that subtree -- while binding resolution did
+# reach it, because ResolveColumnBindings visits it by hand. A node with empty
+# types then took DuckDB's own PhysicalHashJoin constructor off the end of a
+# vector. EXPLAIN alone was enough, so this was plan time, which is also why
+# §7.5's run-time fallback could not catch it: the feature meant to keep an
+# internal error away from users was producing one (D30).
+#
+# compressed_materialization has to be off for the rule to fire here at all,
+# which is why the shape reached a fuzzer and not a user.
+#-----------------------------------------------------------------------------
+statement ok
+CREATE TABLE d30_f0 AS SELECT * FROM (VALUES (1::SMALLINT), (NULL::SMALLINT)) AS v(c0);
+
+statement ok
+CREATE TABLE d30_f1 AS SELECT * FROM (VALUES (0::SMALLINT, 1::SMALLINT), (1::SMALLINT, 0::SMALLINT),
+                                             (1::SMALLINT, 1::SMALLINT), (0::SMALLINT, 1::SMALLINT),
+                                             (0::SMALLINT, 1::SMALLINT)) AS v(c0, c1);
+
+statement ok
+CREATE TABLE d30_f3 (c0 SMALLINT, c1 SMALLINT);
+
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+statement ok
+SET factorize_mode = 'force';
+
+# It has to still FIRE, or this tests a decline rather than the fallback.
+query II
+EXPLAIN SELECT t2.c0, sum(t0.c0) FROM d30_f1 t0, d30_f3 t1, d30_f0 t2
+ WHERE t0.c1 = t1.c0 AND t0.c0 = t2.c0 GROUP BY t2.c0;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query II
+SELECT t2.c0, sum(t0.c0) FROM d30_f1 t0, d30_f3 t1, d30_f0 t2
+ WHERE t0.c1 = t1.c0 AND t0.c0 = t2.c0 GROUP BY t2.c0;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+SET factorize_mode = 'off';

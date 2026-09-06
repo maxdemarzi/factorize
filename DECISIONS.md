@@ -1367,7 +1367,7 @@ control has to do to be one.
 ## D30 — The §7.5 fallback can make a query fail that would otherwise succeed
 
 Found by `fuzz-modes-agree.py` on the first run in which it had ever actually
-exercised the operator (see D29). Not yet fixed.
+exercised the operator (see D29). Fixed; the cause is at the end of the entry.
 
     CREATE TABLE f0 AS SELECT CAST(v0 AS SMALLINT) AS c0 FROM (VALUES (1), (NULL)) AS src(v0);
     CREATE TABLE f1 AS SELECT CAST(v0 AS SMALLINT) AS c0, CAST(v1 AS SMALLINT) AS c1
@@ -1420,12 +1420,42 @@ no construction has yet produced the crash with it enabled. Firing is reachable;
 this crash is not yet known to be. Recorded as conjecture until someone builds
 the shape.
 
-**The fix is not local.** Making `fallback` a real child of `LogicalFactorized`
-would put it in front of the passes it is missing, and matches what the physical
-side already does with `children[0]`. That changes the member assignment in
-`optimizer_rule.cpp`, so it needs agreeing with whoever holds that file, and it
-needs checking that no later pass rewrites the fallback into something that is
-no longer the query the operator replaced.
+**The fix is three lines, and the diagnosis above is what made it look bigger.**
+"Passes running after the rule never reach it" is true and is not the cause.
+DuckDB resolves types in one pass at the start of physical planning:
+
+    void LogicalOperator::ResolveOperatorTypes() {
+        types.clear();
+        for (auto &child : children) child->ResolveOperatorTypes();
+        ResolveTypes();
+    }
+
+`PhysicalPlanGenerator::ResolveAndPlan` calls that on the plan root, and it
+walks `children`. The fallback is parked beside `children` rather than in them,
+so it is the one subtree the pass never reaches -- while binding resolution
+*does* reach it, because `ResolveColumnBindings` visits it by hand. The fallback
+arrived at the physical planner with its bindings resolved and its types not,
+and a node with empty types is what walked off the end of that vector.
+
+So `LogicalFactorized::ResolveTypes` now calls `fallback->ResolveOperatorTypes()`
+itself, which also restores the order DuckDB uses everywhere else: types, then
+bindings, then planning.
+
+The fix first proposed here was to make `fallback` a real child, which would
+have handed the subtree to every later pass and then required proving that none
+of them rewrites it into something other than the query it replaced -- a hazard
+invented by the fix rather than found in the bug. Reading
+`ResolveOperatorTypes` before writing the change is what replaced a design
+change and an open question with three lines and none.
+
+> A diagnosis can be true, predictive, and still not name the cause. This one
+> predicted the `statistics_propagation` and `filter_pushdown` results
+> correctly, which is exactly what made it convincing.
+
+Regression test in `test/sql/factorized_optimizer.test`, which asserts the query
+still FIRES before asserting its answer -- a decline would pass the answer check
+while testing nothing. Validated by running the section against the build that
+has the bug: it fails there and passes here.
 
 ## D31 — A NULL in a summed column silently dropped the row from `count(*)`
 
