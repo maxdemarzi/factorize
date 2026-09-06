@@ -46,16 +46,43 @@ namespace factorize {
 //! extensions, and this project's CI builds a plain-MSVC Windows target
 //! (`windows_amd64`, distinct from `windows_amd64_mingw`) that does not
 //! support them.
+//! These guard sums as well as counts, and a sum can be negative. Written for
+//! cardinalities, both of them were undefined behaviour on a negative operand:
+//! `max - b` overflows for b < 0, and the multiply's `max / a` has the wrong
+//! sign for a < 0, so the comparison it feeds means nothing. UBSan caught it the
+//! moment a negative value was summed -- and the core suite has run under UBSan
+//! all along, so the sanitizer was never the missing part. The inputs were: no
+//! generator produced a negative value and no SQL test summed one, so the one
+//! check that would have failed was never given anything to fail on.
 inline int64_t CheckedCardinalityAdd(int64_t a, int64_t b) {
-	if (a > std::numeric_limits<int64_t>::max() - b) {
-		throw std::runtime_error("factorized count exceeds the representable range (int64 overflow)");
+	if (b > 0 && a > std::numeric_limits<int64_t>::max() - b) {
+		throw std::runtime_error("factorized count or sum exceeds the representable range (int64 overflow)");
+	}
+	if (b < 0 && a < std::numeric_limits<int64_t>::min() - b) {
+		throw std::runtime_error("factorized count or sum exceeds the representable range (int64 overflow)");
 	}
 	return a + b;
 }
 
 inline int64_t CheckedCardinalityMul(int64_t a, int64_t b) {
-	if (a != 0 && b > std::numeric_limits<int64_t>::max() / a) {
-		throw std::runtime_error("factorized count exceeds the representable range (int64 overflow)");
+	if (a == 0 || b == 0) {
+		return 0;
+	}
+	// -1 is separated out because INT64_MIN / -1 overflows, so it cannot be used
+	// as the divisor in the range tests below.
+	if (a == -1 || b == -1) {
+		const int64_t other = a == -1 ? b : a;
+		if (other == std::numeric_limits<int64_t>::min()) {
+			throw std::runtime_error("factorized count or sum exceeds the representable range (int64 overflow)");
+		}
+		return -other;
+	}
+	const bool overflows = a > 0 ? (b > 0 ? a > std::numeric_limits<int64_t>::max() / b
+	                                      : b < std::numeric_limits<int64_t>::min() / a)
+	                             : (b > 0 ? a < std::numeric_limits<int64_t>::min() / b
+	                                      : a < std::numeric_limits<int64_t>::max() / b);
+	if (overflows) {
+		throw std::runtime_error("factorized count or sum exceeds the representable range (int64 overflow)");
 	}
 	return a * b;
 }

@@ -52,7 +52,13 @@ def make_table(rng, name, column_type):
         cells = []
         for _ in range(columns):
             # NULLs are the case that desynchronised a relation's columns once.
-            cells.append("NULL" if rng.random() < 0.15 else str(rng.randrange(domain)))
+            # Values straddle zero. They did not, and a sum of negative values was
+            # undefined behaviour in the overflow guard for as long as this file has
+            # existed: the guard was written for cardinalities, which cannot be
+            # negative, and is used for sums, which can. The core suite runs under
+            # UBSan, so the check was always there -- nothing ever handed it a
+            # negative number to fail on.
+            cells.append("NULL" if rng.random() < 0.15 else str(rng.randrange(-domain, domain)))
         values.append("(" + ", ".join(cells) + ")")
     # Name the VALUES columns rather than relying on the generated names, which
     # differ between DuckDB versions and silently made an earlier version of

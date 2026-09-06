@@ -297,6 +297,47 @@ static void TestGroupOnDeepKey() {
 //! contribution is its slot's sum times how many tuples the rest make. Getting
 //! that weight wrong is invisible on a two-relation join, where it is 1 -- so
 //! this checks against enumeration, which cannot be fooled by it.
+//! Sums of negative values.
+//!
+//! The overflow guards in frep.hpp are used for sums as well as counts, and a
+//! sum can be negative. Written for cardinalities, which cannot be, they were
+//! undefined behaviour on a negative operand: `max - b` overflows for b < 0.
+//! This suite has run under UBSan the whole time, so the sanitizer was never
+//! the missing part -- a negative number was. No generator produced one and no
+//! test summed one, so the check that would have failed was never given
+//! anything to fail on.
+static void TestNegativeSums() {
+	Group scope("a sum of negative values agrees with enumeration");
+
+	MemorySource source;
+	source.Add({{1, 1, 2}, {-5, -7, 3}}); // rel0: key, then the values to sum
+	source.Add({{1, 1, 2}});              // rel1: key, two rows for key 1
+
+	QueryGraph graph;
+	graph.column_counts = {2, 1};
+	graph.column_types = {{ValueType::INT64, ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}};
+	const auto plan = BuildPlan(graph);
+	Expect(plan.complete, "negative sums: plans (" + plan.reason + ")");
+	if (!plan.complete) {
+		return;
+	}
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "negative sums: materialize succeeds (" + materialized.error + ")");
+	int64_t by_hand = 0;
+	for (const auto &tuple : materialized.tuples) {
+		by_hand += tuple[1];
+	}
+	// (sum_relation, sum_column): relation 0's second column holds the values.
+	const auto folded = ExecuteSum(graph, plan, source, JoinMode::BOTTOM_INSERT, 0, 1);
+	Expect(folded.ok, "negative sums: fold succeeds (" + folded.error + ")");
+	Expect(folded.count == by_hand, "negative sums: fold gives " + std::to_string(folded.count) +
+	                                    ", enumeration gives " + std::to_string(by_hand));
+	// Without this the case could silently stop being about negatives.
+	Expect(by_hand < 0, "negative sums: the total is " + std::to_string(by_hand) + ", which must be negative");
+}
+
 static void TestSumMatchesEnumeration() {
 	Group scope("summing a column agrees with enumerating and adding up, at every position in the tree");
 
@@ -606,6 +647,8 @@ int main() {
 	TestGroupOnDeepKey();
 	std::printf("\n");
 	TestSumMatchesEnumeration();
+	std::printf("\n");
+	TestNegativeSums();
 	std::printf("\n");
 	TestSumIgnoresUnmatchedAndKeepsZeroGroups();
 	std::printf("\n");

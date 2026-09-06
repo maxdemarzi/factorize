@@ -1575,3 +1575,41 @@ Both D30 and D31 were found by the first fuzzer run that ever exercised the
 operator, which is the entire argument for the positive control in D29: this
 tool reported "0 disagreements" for its whole life, and the first run that could
 have disagreed did, four times out of four seeds.
+
+## D32 — The sanitizer was never missing; the input was
+
+Summing negative values was undefined behaviour:
+
+    frep.hpp:50: runtime error: signed integer overflow:
+                 9223372036854775807 - -5 cannot be represented in type 'long int'
+
+`CheckedCardinalityAdd` and `CheckedCardinalityMul` guard sums as well as counts.
+Written for cardinalities, which cannot be negative: `max - b` overflows for
+b < 0, and the multiply's `max / a` has the wrong sign for a < 0, so the
+comparison it feeds means nothing.
+
+**Why this is a different kind from the six in D29.** The core suite has run
+under asan and ubsan since it was written, exactly to catch this class. The
+check was present, correct, and wired up. It was simply never handed an input
+that would turn it: `fuzz-modes-agree.py` produced `rng.randrange(domain)`,
+which is never negative, and no SQL test summed a negative column. D29's
+instances are signals that could not have gone red. This one could have, and
+nothing ever asked it to.
+
+> Running under a sanitizer is a claim about what would be caught, not about
+> what was tried.
+
+**The fix is in two halves and the second is the durable one.** Both guards now
+cover the full int64 range, with -1 separated out because `INT64_MIN / -1`
+overflows and so cannot be used as a divisor -- still no `__builtin_*` and no
+`__int128`, so the plain-MSVC target (D4) is unaffected. Then the inputs: the
+fuzzer's values straddle zero, `test_enumerate.cpp` has a negative-sum group
+that runs under the sanitizers and asserts the total really is negative, and
+`factorized_optimizer.test` covers it at the SQL surface both grouped and
+ungrouped. The guards being wrong is the bug; nothing ever producing a negative
+number is why it survived every run this project has made.
+
+**It bears on `<>` too.** Inclusion-exclusion is a difference of two counts and
+these guards protect both terms, so an overflow in one term yields a wrong
+difference with both halves looking plausible -- the failure mode the second
+session flagged when that feature landed and could not test for from inside it.

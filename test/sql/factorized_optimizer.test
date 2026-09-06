@@ -1913,3 +1913,44 @@ RESET disabled_optimizers;
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# Sums of negative values.
+#
+# frep.hpp's overflow guards are used for sums as well as counts, and a sum can
+# be negative. Written for cardinalities, which cannot be, they were undefined
+# behaviour on a negative operand: `max - b` overflows for b < 0. The core suite
+# has run under UBSan since it existed, so the sanitizer was never the missing
+# part -- no generator produced a negative value and nothing here summed one, so
+# the check that would have failed was never handed anything to fail on (D32).
+#-----------------------------------------------------------------------------
+statement ok
+CREATE TABLE neg_a AS SELECT * FROM (VALUES (0::INTEGER, -5::INTEGER), (1::INTEGER, -7::INTEGER),
+                                            (0::INTEGER, 3::INTEGER)) AS v(k, x);
+
+statement ok
+CREATE TABLE neg_b AS SELECT * FROM (VALUES (0::INTEGER), (0::INTEGER), (1::INTEGER)) AS v(k);
+
+statement ok
+SET factorize_mode = 'force';
+
+# Fires, so this exercises the fold rather than a decline.
+query II
+EXPLAIN SELECT sum(a.x) FROM neg_a a, neg_b b WHERE a.k = b.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query I
+SELECT sum(a.x) FROM neg_a a, neg_b b WHERE a.k = b.k;
+----
+-11
+
+# Grouped, where the fold's Combine multiplies a negative sum by a count.
+query II
+SELECT a.k, sum(a.x) FROM neg_a a, neg_b b WHERE a.k = b.k GROUP BY a.k ORDER BY 1;
+----
+0	-4
+1	-7
+
+statement ok
+SET factorize_mode = 'off';
