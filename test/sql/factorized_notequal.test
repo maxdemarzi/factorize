@@ -1,0 +1,166 @@
+# name: test/sql/factorized_notequal.test
+# description: factorized_count() with a <> predicate, counted by inclusion-exclusion
+# group: [sql]
+
+require factorize
+
+# INTEGER rather than range(), deliberately. range() yields BIGINT, and the
+# second term's key is the equality column and the compared column packed
+# together -- two BIGINTs is 128 bits and is refused. A reader probing this
+# feature with range() would conclude it does not work.
+statement ok
+CREATE TABLE p AS SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30)) AS v(k, x);
+
+statement ok
+CREATE TABLE q AS SELECT * FROM (VALUES (1, 10), (1, 99), (2, 30)) AS v(k, y);
+
+statement ok
+ALTER TABLE p ALTER k TYPE INTEGER;
+
+statement ok
+ALTER TABLE p ALTER x TYPE INTEGER;
+
+statement ok
+ALTER TABLE q ALTER k TYPE INTEGER;
+
+statement ok
+ALTER TABLE q ALTER y TYPE INTEGER;
+
+# The oracle: DuckDB's own answer for the same join. The join on k alone gives
+# five pairs, two of which agree on the compared columns.
+query I
+SELECT count(*) FROM p, q WHERE p.k = q.k AND p.x <> q.y;
+----
+3
+
+query I
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k', 'p.x <> q.y']);
+----
+3
+
+# The equality term and the whole join, so the identity is visible rather than
+# implied: 5 pairs total, 2 agreeing, 3 differing.
+query I
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k']);
+----
+5
+
+query I
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k', 'p.x = q.y']);
+----
+2
+
+# Which column is compared has to survive parsing. Comparing the join key
+# instead would give 0, and comparing the wrong side's payload would give a
+# different number again -- so this asserts the parser picked the pair the
+# caller wrote, not merely that it picked a pair.
+query I
+SELECT count(*) FROM p, q WHERE p.k = q.k AND p.k <> q.k;
+----
+0
+
+query I
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k', 'p.k <> q.k']);
+----
+0
+
+# Whitespace around the operator is not significant.
+query I
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k', 'p.x<>q.y']);
+----
+3
+
+# `!=` is SQL's other spelling of the same predicate and must mean the same
+# thing. Before this was handled, the `=` inside `!=` split the string, the left
+# operand became `p.x !`, and the error said there was no column named `x !` --
+# which is wrong about the cause and reads as the feature being broken.
+query I
+SELECT count(*) FROM p, q WHERE p.k = q.k AND p.x != q.y;
+----
+3
+
+query I
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k', 'p.x != q.y']);
+----
+3
+
+# And it is refused in the entry points that cannot honour it, exactly as `<>`
+# is -- otherwise the spelling would decide whether a dropped predicate was
+# caught.
+statement error
+SELECT * FROM factorized_exists(['p', 'q'], ['p.k = q.k', 'p.x != q.y']);
+----
+only factorized_count supports <>
+
+# A three-relation shape, so the inequality is not always between the only two
+# relations there are.
+statement ok
+CREATE TABLE r AS SELECT * FROM (VALUES (1), (2)) AS v(k);
+
+statement ok
+ALTER TABLE r ALTER k TYPE INTEGER;
+
+query I
+SELECT count(*) FROM p, q, r WHERE p.k = q.k AND q.k = r.k AND p.x <> q.y;
+----
+3
+
+query I
+SELECT * FROM factorized_count(['p', 'q', 'r'], ['p.k = q.k', 'q.k = r.k', 'p.x <> q.y']);
+----
+3
+
+# Only factorized_count honours a <>. Every other entry point shares the same
+# parser, and one that accepted the predicate and ignored it would answer a
+# different query than was asked with no error anywhere -- so they refuse.
+statement error
+SELECT * FROM factorized_exists(['p', 'q'], ['p.k = q.k', 'p.x <> q.y']);
+----
+only factorized_count supports <>
+
+statement error
+SELECT * FROM factorized_stats(['p', 'q'], ['p.k = q.k', 'p.x <> q.y']);
+----
+only factorized_count supports <>
+
+statement error
+SELECT * FROM factorized_tuples(['p', 'q'], ['p.k = q.k', 'p.x <> q.y']);
+----
+only factorized_count supports <>
+
+statement error
+SELECT * FROM factorized_group_count(['p', 'q'], ['p.k = q.k', 'p.x <> q.y'], 'p.k');
+----
+only factorized_count supports <>
+
+# One inequality only. Two would need four terms rather than one subtraction,
+# and the identity this is built on stops being a single difference.
+statement error
+SELECT * FROM factorized_count(['p', 'q'], ['p.k = q.k', 'p.x <> q.y', 'p.x <> q.k']);
+----
+more than one <>
+
+# The second term joins on the equality key and the compared column together,
+# which is a composite key -- so it carries the 64-bit packed-key limit. Two
+# BIGINTs exceed it. This has to be a decline rather than a wrong answer, and
+# the message has to say which of the two terms could not be built.
+statement ok
+CREATE TABLE big AS SELECT * FROM (VALUES (1::BIGINT, 10::BIGINT), (2::BIGINT, 20::BIGINT)) AS v(k, x);
+
+statement ok
+CREATE TABLE big2 AS SELECT * FROM (VALUES (1::BIGINT, 10::BIGINT), (2::BIGINT, 99::BIGINT)) AS v(k, y);
+
+statement error
+SELECT * FROM factorized_count(['big', 'big2'], ['big.k = big2.k', 'big.x <> big2.y']);
+----
+equality term
+
+# Both terms have to be plannable, not just the first. A difference of two
+# counts is right only when both counts are, so a shape where the equality-only
+# term plans and the equality term does not must decline rather than return the
+# first term's answer. The two terms are plans over DIFFERENT graphs, and this
+# asserts the failure is attributed to the term that actually failed.
+statement error
+SELECT * FROM factorized_count(['p', 'q'], ['p.x <> q.y']);
+----
+factorized_count

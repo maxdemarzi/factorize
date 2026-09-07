@@ -22,6 +22,13 @@ struct FactorizedCountBindData : public TableFunctionData {
 	size_t limit = 0;
 	//! Which columns factorized_group_count groups on, in the order given.
 	vector<factorize::GroupKey> group_keys;
+	//! The single `<>` predicate, if the caller wrote one.
+	//!
+	//! Only factorized_count accepts it. Every other entry point refuses at bind
+	//! time rather than ignoring it: a dropped predicate is a wrong answer that
+	//! looks like a right one, and this parser has no way to apply it later.
+	bool has_not_equal = false;
+	factorize::NotEqualPredicate not_equal;
 };
 
 //! Splits on whitespace, so "yago2 a" and "yago2 AS a" both parse.
@@ -89,7 +96,7 @@ factorize::ValueType RequireIntegerKey(const LogicalType &type, const string &al
 }
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<string> &names, bool allow_not_equal = false) {
 	auto result = make_uniq<FactorizedCountBindData>();
 
 	// Two lists, and whatever the caller adds after them: factorized_tuples
@@ -137,15 +144,40 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		idx_t left_column, right_column;
 	};
 	vector<RawEdge> edges;
+	RawEdge not_equal_edge {};
 	for (auto &entry : joins) {
 		const auto text = StringValue::Get(entry);
-		const auto equals = text.find('=');
+		// `<>` is counted by inclusion-exclusion (core/plan.hpp): the pairs that
+		// differ are the pairs that exist minus the pairs that agree, and both
+		// are ordinary equi-join counts. Exactly one is supported -- n of them
+		// needs 2^n terms, and the identity stops being one subtraction.
+		// `!=` is the same predicate spelled the other way, and both are two
+		// characters, so everything below treats them identically. Without this
+		// the `=` inside `!=` is what splits the string, the left operand
+		// becomes `a.x !`, and the user is told there is no column named `x !` --
+		// wrong about the cause and confusing enough to be worked around rather
+		// than reported.
+		auto differs = text.find("<>");
+		if (differs == string::npos) {
+			differs = text.find("!=");
+		}
+		if (differs != string::npos) {
+			if (!allow_not_equal) {
+				throw BinderException("'%s' is not an equality; only factorized_count supports <>", text);
+			}
+			if (result->has_not_equal) {
+				throw BinderException("factorized_count: more than one <> is not supported, in '%s'", text);
+			}
+			result->has_not_equal = true;
+		}
+		const auto equals = differs != string::npos ? differs : text.find('=');
 		if (equals == string::npos) {
 			throw BinderException("factorized_count: '%s' is not an equality", text);
 		}
+		const auto right_from = differs != string::npos ? equals + 2 : equals + 1;
 		RawEdge edge {};
 		for (int side = 0; side < 2; side++) {
-			const auto operand = Trim(side == 0 ? text.substr(0, equals) : text.substr(equals + 1));
+			const auto operand = Trim(side == 0 ? text.substr(0, equals) : text.substr(right_from));
 			const auto dot = operand.rfind('.');
 			if (dot == string::npos) {
 				throw BinderException("factorized_count: '%s' must be <relation>.<column>", operand);
@@ -174,6 +206,12 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			(side == 0 ? edge.left_relation : edge.right_relation) = relation;
 			(side == 0 ? edge.left_column : edge.right_column) = physical;
 		}
+		if (differs != string::npos) {
+			// Held aside: it is not an edge of the join graph, and adding it as
+			// one would compute the opposite of what was asked.
+			not_equal_edge = edge;
+			continue;
+		}
 		edges.push_back(edge);
 	}
 
@@ -191,6 +229,14 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		predicate.right_relation = edge.right_relation;
 		predicate.right_column = result->relations[edge.right_relation].LocalIndex(edge.right_column);
 		result->graph.predicates.push_back(predicate);
+	}
+	if (result->has_not_equal) {
+		result->not_equal.left_relation = not_equal_edge.left_relation;
+		result->not_equal.left_column =
+		    result->relations[not_equal_edge.left_relation].LocalIndex(not_equal_edge.left_column);
+		result->not_equal.right_relation = not_equal_edge.right_relation;
+		result->not_equal.right_column =
+		    result->relations[not_equal_edge.right_relation].LocalIndex(not_equal_edge.right_column);
 	}
 
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -237,6 +283,24 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
 	                            : config.options.maximum_memory;
 	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+
+	if (bind_data.has_not_equal) {
+		// Inclusion-exclusion runs two plans over two different graphs, so it
+		// builds them itself rather than taking one.
+		StorageSource neq_source(context, bind_data.relations);
+		const auto neq = factorize::ExecuteCountNotEqual(bind_data.graph, bind_data.not_equal, neq_source,
+		                                                 factorize::JoinMode::BOTTOM_INSERT);
+		if (!neq.ok) {
+			throw InvalidInputException("%s: %s", name, neq.error);
+		}
+		output.SetCardinality(1);
+		if (EXISTS) {
+			output.SetValue(0, 0, Value::BOOLEAN(neq.count > 0));
+		} else {
+			output.SetValue(0, 0, Value::BIGINT(neq.count));
+		}
+		return;
+	}
 
 	const auto plan = factorize::BuildPlan(bind_data.graph);
 	if (!plan.complete) {
@@ -307,6 +371,13 @@ void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(result.records)));
 	output.SetValue(2, 0, Value::BIGINT(static_cast<int64_t>(result.bytes)));
 	output.SetValue(3, 0, Value::BIGINT(static_cast<int64_t>(result.slices)));
+}
+
+//! The one entry point that accepts a `<>`, which is why it has a bind of its
+//! own rather than sharing the default.
+unique_ptr<FunctionData> BindCount(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, vector<string> &names) {
+	return Bind(context, input, return_types, names, /* allow_not_equal */ true);
 }
 
 unique_ptr<FunctionData> BindStats(ClientContext &context, TableFunctionBindInput &input,
@@ -543,7 +614,7 @@ void RegisterFactorizedCount(ExtensionLoader &loader) {
 
 	TableFunction function("factorized_count",
 	                       {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
-	                       ExecuteQuestion<false>, Bind, InitGlobal);
+	                       ExecuteQuestion<false>, BindCount, InitGlobal);
 	loader.RegisterFunction(function);
 }
 
