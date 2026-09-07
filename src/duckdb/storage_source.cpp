@@ -230,7 +230,33 @@ void StorageSource::Load(size_t relation) {
 		scan_column(physical);
 	}
 
-	held.assign(bound.columns.size(), {});
+	// Cleared, not reassigned, and reserved to the table's cardinality.
+	//
+	// `held.assign(n, {})` destroyed these vectors and handed their pages back
+	// on every relation, so each scan re-grew from zero through push_back's
+	// doubling and faulted in every page again. That cost is invisible per row
+	// and enormous in aggregate: scanning a 4.5M-row relation took 3.9s while a
+	// 3.3M-row one right after it took 0.011s, because the second one happened
+	// to fit in the block the first had just released. Reversing the order
+	// moved the cost, which is what showed it was the allocation and not the
+	// table. DuckDB reads the same column with sum() in 0.010s.
+	//
+	// clear() keeps the capacity, so a second relation of similar width reuses
+	// the pages instead of faulting them in again, and the reserve below means
+	// the first one does not grow through 23 reallocations to get there.
+	if (held.size() != bound.columns.size()) {
+		held.assign(bound.columns.size(), {});
+	} else {
+		for (auto &column : held) {
+			column.clear();
+		}
+	}
+	const auto expected_rows = storage.GetTotalRows();
+	if (expected_rows > 0) {
+		for (auto &column : held) {
+			column.reserve(expected_rows);
+		}
+	}
 
 	// The parallel entry points, which is what DuckDB's own sequential scan uses
 	// -- not DataTable::InitializeScan, which asserts on a table that has no row

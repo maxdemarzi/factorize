@@ -1977,3 +1977,76 @@ while stock DuckDB read the same table in 4ms.
 > A harness that defaults to the sanitizer build measures the sanitizer. The
 > calibration scripts guarded against that and said so; the timing runs never
 > had a default to guard, because nothing in the repo does timing.
+
+## D36 — The scan gave its buffers back after every relation
+
+D35 fixed a representation that was 1035x too large and bought 2.17x. The query
+was still 72x slower than DuckDB, and the reason turned out to have nothing to
+do with factorization.
+
+**The measurement that found it.** Timing `source.Columns` and `MakeScan` per
+relation, on the query D35 could not rescue:
+
+    [scan] relation 0  rows 4,491,142   Columns 3.855s   MakeScan 0.040s
+    [scan] relation 4  rows 3,289,307   Columns 0.011s   MakeScan 0.032s
+
+Two tables of comparable size, **350x apart**, in the same query, warm. DuckDB
+reads the same column with `sum()` in 0.010s.
+
+**The experiment that identified it.** Listing the relations in a different
+order moved the cost instead of leaving it with the table:
+
+    651 listed first    651 = 7.183s    644 = 0.015s
+    644 listed first    644 = 3.973s    651 = 3.233s
+
+With 651 (36 MB of int64) scanned first, 644 (26 MB) afterwards is free -- it
+reuses the block 651 just released. Reverse them and both pay, because 651 needs
+more than 644 freed. A cost that follows allocation order rather than the data
+is an allocation cost, and that ruled out the table, its compression and its
+values in one run.
+
+**The cause is one line.** `StorageSource::Load` began with
+
+    held.assign(bound.columns.size(), {});
+
+which destroys the column vectors and hands their pages back on *every*
+relation. Each scan then re-grew from zero through `push_back`'s doubling --
+about 23 reallocations for 4.5M rows -- and faulted in every page again. Fixed
+by clearing (which keeps capacity) and reserving to the table's cardinality.
+
+    watdiv_acyclic_206_16       before    after
+    relation 0 scan             3.855s    0.016s     240x
+    factorized_count total      3.970s    0.165s      24x
+
+**Both fixes together, against HEAD, release build, warmed, answers identical:**
+
+    query                HEAD    +D35     +D36    DuckDB    total
+    watdiv_206_16       9.110   4.192    0.621     0.083    14.7x
+    watdiv_201_10       6.153   4.053    0.651     0.170     9.5x
+    watdiv_212_05       6.707   4.337    0.897     1.351     7.5x  -> a win
+    watdiv_215_17       1.293   0.190    0.201     0.019     6.4x
+    watdiv_216_10       5.150   5.262    1.333     0.746     3.9x
+    watdiv_210_15       0.741   0.667    0.304     0.020     2.4x
+    hetio_222_16        0.398   0.175    0.184     3.485     2.2x
+    hetio_205_00        0.246   0.175    0.130     0.293     1.9x
+    watdiv_217_01       7.684   6.406    7.173     1.455     1.07x
+
+`watdiv_acyclic_206_16` goes from **127x slower than DuckDB to 7.5x**, and the
+gate's record on this corpus from 4 wins / 8 losses to 5 / 7.
+
+**Why this hid D35.** While every query paid seconds in the scan, no
+improvement to the representation could show up: shrinking the f-representation
+1035x moved the total from 9.1s to 4.2s because 3.9s of what remained was
+`held.assign`. The two bugs were independent, and the larger one was invisible
+in every metric the project collects -- record counts, bytes, compression ratio
+-- because it is not in the representation at all.
+
+> Two of the three numbers this project reports about a query describe the
+> representation. The thing that made this query slow never touched it.
+
+**And it is a reminder about inference.** The first diagnosis here was
+"the cost does not scale with rows scanned, so it is not the scan". The premise
+was correct and the conclusion was backwards: it did not scale with rows because
+it scaled with *first allocation of a given size*, which is a scan cost that is
+insensitive to row count. Instrumenting took one 46-second build and settled in
+one run what three rounds of reasoning had got wrong.
