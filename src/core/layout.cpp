@@ -49,7 +49,8 @@ void Flatten(const FNode &node, std::vector<const FNode *> &nodes, std::vector<s
 
 } // namespace
 
-Layout Layout::FromFTree(const FTree &tree, const std::vector<std::pair<AttributeId, ValueType>> &types) {
+Layout Layout::FromFTree(const FTree &tree, const std::vector<std::pair<AttributeId, ValueType>> &types,
+                         bool with_weights) {
 	std::map<AttributeId, ValueType> type_of;
 	for (auto &entry : types) {
 		type_of[entry.first] = entry.second;
@@ -82,6 +83,15 @@ Layout Layout::FromFTree(const FTree &tree, const std::vector<std::pair<Attribut
 		uint32_t offset = 0;
 		level.size_offset = offset;
 		offset += static_cast<uint32_t>(sizeof(uint64_t));
+
+		// The multiplicity sits beside the size cache because every traversal
+		// that reads one reads the other -- but only where one can exist. It
+		// costs 16 bytes a record after alignment, so reserving it on a
+		// relation that groups nothing is pure loss.
+		if (with_weights) {
+			level.weight_offset = offset;
+			offset += static_cast<uint32_t>(sizeof(uint64_t));
+		}
 
 		// Payload, widest first, so no padding is needed between columns.
 		std::vector<std::pair<AttributeId, ValueType>> columns;

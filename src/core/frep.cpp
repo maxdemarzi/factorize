@@ -139,6 +139,35 @@ int64_t FRepresentation::GetValue(Record record, AttributeId attribute) const {
 	return 0;
 }
 
+int64_t FRepresentation::GetWeight(Record record) const {
+	const auto &level = layout->Level(record.Level());
+	if (level.weight_offset == 0) {
+		// No field on this level, so nothing here was ever grouped.
+		return 1;
+	}
+	uint64_t stored;
+	std::memcpy(&stored, record.Data() + level.weight_offset, sizeof(stored));
+	return static_cast<int64_t>(stored) + 1;
+}
+
+void FRepresentation::SetWeight(Record record, int64_t weight) {
+	if (weight < 1) {
+		throw std::runtime_error("a record's multiplicity must be at least 1");
+	}
+	const auto &level = layout->Level(record.Level());
+	if (level.weight_offset == 0) {
+		// Weighing a record on a layout that reserved no room for it would
+		// scribble over the size cache. The caller decided not to reserve the
+		// field, so it must not now weigh anything.
+		throw std::runtime_error("this level has no multiplicity field; the layout was built without weights");
+	}
+	const uint64_t stored = static_cast<uint64_t>(weight) - 1;
+	std::memcpy(record.Data() + level.weight_offset, &stored, sizeof(stored));
+	if (weight > 1) {
+		has_weights = true;
+	}
+}
+
 uint32_t FRepresentation::ChildCount(Record parent, size_t slot_index) const {
 	const auto &slot = layout->Level(parent.Level()).slots[slot_index];
 	return HeaderOf(parent, slot)->count;
@@ -158,7 +187,11 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 		return static_cast<int64_t>(cached - 1);
 	}
 
-	int64_t size = 1;
+	// The record's own multiplicity, not 1: it stands for that many identical
+	// tuples, and each of them takes the whole cross product of the children
+	// below. Every record built without grouping weighs 1 and this is the
+	// paper's plain traversal.
+	int64_t size = has_weights ? GetWeight(record) : 1;
 	for (size_t slot_index = 0; slot_index < level.slots.size(); slot_index++) {
 		// Siblings are a Cartesian product, so slots multiply; the children
 		// within one slot are alternatives, so they sum.

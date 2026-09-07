@@ -42,21 +42,244 @@ size_t GetGlobalMemoryLimit() {
 	return g_memory_limit;
 }
 
-FactorizedRelation::FactorizedRelation(FTree tree_p, AttributeTypes types_p)
+FactorizedRelation::FactorizedRelation(FTree tree_p, AttributeTypes types_p, bool with_weights)
     : tree(std::move(tree_p)), types(std::move(types_p)) {
-	layout = std::make_unique<Layout>(Layout::FromFTree(tree, types));
+	layout = std::make_unique<Layout>(Layout::FromFTree(tree, types, with_weights));
 	frep = std::make_unique<FRepresentation>(*layout);
 	frep->SetMemoryLimit(g_memory_limit);
 	frep->SetEstimateBudget(g_estimate_budget);
 }
+
+namespace {
+
+//! Hash of one row across every scanned column.
+//!
+//! Order-sensitive on purpose: mixing each column into the running hash means
+//! two rows holding the same values in different columns land apart, which a
+//! commutative combine like xor or addition would not do.
+uint64_t HashRow(const std::vector<std::vector<int64_t>> &columns, size_t row) {
+	uint64_t hash = 0;
+	for (const auto &column : columns) {
+		hash = HashKey(hash ^ static_cast<uint64_t>(column[row]));
+	}
+	return hash;
+}
+
+bool RowsEqual(const std::vector<std::vector<int64_t>> &columns, size_t a, size_t b) {
+	for (const auto &column : columns) {
+		if (column[a] != column[b]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Rows read before judging whether grouping is worth it.
+const size_t kSampleRows = 1u << 16;
+//! Group only when at most this percentage of the sampled rows were distinct.
+const size_t kGroupBelowPercent = 90;
+
+//! Roughly what percentage of a prefix of the rows are distinct.
+//!
+//! Approximate on purpose: it compares hashes rather than values, so a
+//! collision undercounts distinct rows and biases the answer towards grouping.
+//! Being wrong here costs a hash pass or some memory, never an answer -- the
+//! multiplicity is a property of each record, so grouping is optional row by
+//! row.
+//!
+//! A prefix rather than a spread sample because the rows arrive as vectors
+//! already in storage order and this has to be cheap. It is fooled by a
+//! relation whose duplicates all sit at one end, which costs a wrong guess and
+//! nothing else.
+size_t DistinctPercentOfSample(const std::vector<std::vector<int64_t>> &columns, size_t rows) {
+	const size_t sample = rows < kSampleRows ? rows : kSampleRows;
+	if (sample == 0 || columns.empty()) {
+		return 100;
+	}
+	size_t capacity = 16;
+	while (capacity < sample * 2) {
+		capacity *= 2;
+	}
+	std::vector<uint64_t> seen(capacity, 0);
+	std::vector<char> used(capacity, 0);
+	const size_t mask = capacity - 1;
+	size_t distinct = 0;
+	for (size_t row = 0; row < sample; row++) {
+		const uint64_t hash = HashRow(columns, row);
+		size_t at = hash & mask;
+		while (used[at] && seen[at] != hash) {
+			at = (at + 1) & mask;
+		}
+		if (!used[at]) {
+			used[at] = 1;
+			seen[at] = hash;
+			distinct++;
+		}
+	}
+	return distinct * 100 / sample;
+}
+
+//! Collapses a scan's identical rows into one record apiece, tallied.
+//!
+//! A relation is a bag, and this engine scans only the columns a query's joins
+//! mention (the DuckDB binder projects the rest away before the graph is even
+//! built). Projecting a table onto its join columns is exactly what turns
+//! distinct rows into identical ones -- `watdiv1052651` has 4,491,142 rows over
+//! 39,781 distinct values of `s` -- and one record per row means every later
+//! join re-pairs all 113 copies of a value instead of pairing it once. That is
+//! multiplication where the shape called for addition, and it is what made a
+//! seven-relation star hold 69,985,962 records for an answer of 39,891,620
+//! (DECISIONS.md D35).
+//!
+//! Open addressing rather than the ChainingHashTable next door, which collects
+//! entries and links them in Finalize(): grouping has to answer "have I seen
+//! this row" while it is still reading, and that table cannot be probed until
+//! it is closed.
+//!
+//! A match is confirmed by comparing the row's values, never by the hash alone.
+//! The hash only says where to look. KeyReader above may compare packed keys
+//! directly because it refuses anything wider than 64 bits; a scan has no such
+//! cap, so trusting a hash here would silently merge two different rows and
+//! undercount every query over the relation.
+class RowGrouper {
+public:
+	//! `budget` caps what the table itself may occupy; 0 means uncapped. The
+	//! table is heap, not arena, so the representation's own memory limit does
+	//! not see it -- and the shape that defeats the sample below (dense
+	//! duplicates early, distinct rows later) is exactly the one that would
+	//! grow it to one entry per row behind that limit's back.
+	RowGrouper(const std::vector<std::vector<int64_t>> &columns, size_t rows, size_t budget)
+	    : columns(columns), budget(budget) {
+		size_t capacity = 16;
+		while (capacity < kMaxInitialSlots && capacity < rows * 2) {
+			capacity *= 2;
+		}
+		slots.assign(capacity, Slot());
+		mask = capacity - 1;
+	}
+
+	bool Active() const {
+		return active;
+	}
+
+	//! The record already standing for a row identical to `row`, or null -- in
+	//! which case the caller makes one and hands it to Added().
+	Byte *Find(size_t row, uint64_t hash) {
+		probe = hash & mask;
+		while (slots[probe].data) {
+			if (slots[probe].hash == hash && RowsEqual(columns, slots[probe].row, row)) {
+				return slots[probe].data;
+			}
+			probe = (probe + 1) & mask;
+		}
+		return nullptr;
+	}
+
+	//! Takes the group Find() just failed to find; `probe` still points at the
+	//! empty slot it stopped on.
+	void Added(size_t row, uint64_t hash, Byte *data) {
+		slots[probe] = Slot {data, hash, row};
+		groups++;
+		Seen();
+		// Only while still grouping: Seen() may have just freed the table, and
+		// growing an empty one underflows its mask.
+		if (active && groups * 10 > slots.size() * 7) {
+			Grow();
+		}
+	}
+
+	//! Takes a hit, which changes no slot.
+	void Matched() {
+		Seen();
+	}
+
+	//! Stops grouping and releases the table. Public because MakeScan may
+	//! decide against grouping before it reads a single row.
+	void Abandon() {
+		active = false;
+		std::vector<Slot>().swap(slots);
+	}
+
+private:
+	struct Slot {
+		Byte *data = nullptr;
+		uint64_t hash = 0;
+		size_t row = 0;
+	};
+
+	//! Where the table starts, so a scan of ten rows does not allocate for a
+	//! million. It grows from here on demand.
+	static const size_t kMaxInitialSlots = 1024;
+
+	void Grow() {
+		if (budget != 0 && slots.size() * 2 * sizeof(Slot) > budget) {
+			// Refusing to grow would leave the table full and every probe
+			// walking it, so this abandons rather than caps.
+			Abandon();
+			return;
+		}
+		std::vector<Slot> bigger(slots.size() * 2);
+		const size_t bigger_mask = bigger.size() - 1;
+		for (const auto &slot : slots) {
+			if (!slot.data) {
+				continue;
+			}
+			size_t at = slot.hash & bigger_mask;
+			while (bigger[at].data) {
+				at = (at + 1) & bigger_mask;
+			}
+			bigger[at] = slot;
+		}
+		slots.swap(bigger);
+		mask = bigger_mask;
+	}
+
+	//! Grouping is an optimization, and a relation whose rows are already
+	//! distinct pays for it and gets nothing: a table as large as the input, to
+	//! hold one entry per row. So it is abandoned once the rows read so far are
+	//! nearly all distinct, which bounds what the attempt can cost to the
+	//! sample.
+	//!
+	//! Abandoning is safe at any point precisely because the weights are a
+	//! property of each record and not of the relation: what is already grouped
+	//! stays grouped, every row after it gets a record of its own, and the two
+	//! together denote the same bag either way. That is why this can be a
+	//! guess -- being wrong costs time, never an answer.
+	void Seen() {
+		seen++;
+		if (seen != kSampleRows) {
+			return;
+		}
+		if (groups * 100 > seen * kGroupBelowPercent) {
+			Abandon();
+		}
+	}
+
+	const std::vector<std::vector<int64_t>> &columns;
+	size_t budget = 0;
+	std::vector<Slot> slots;
+	size_t mask = 0;
+	size_t probe = 0;
+	size_t groups = 0;
+	size_t seen = 0;
+	bool active = true;
+};
+
+} // namespace
 
 FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const AttributeTypes &types,
                             const std::vector<std::vector<int64_t>> &columns) {
 	if (columns.size() != attributes.size()) {
 		throw std::runtime_error("MakeScan: one column per attribute expected");
 	}
-	FactorizedRelation relation(FTree::Scan(attributes), types);
 	const size_t rows = columns.empty() ? 0 : columns[0].size();
+	// Decided before the relation exists, because the layout fixes whether a
+	// record has room for a multiplicity at all, and that room is not free:
+	// records align to 16 bytes, so the field costs 16 of them. Reserving it on
+	// a relation whose rows are already distinct measured +40% memory for
+	// nothing (DECISIONS.md D35).
+	const bool group = DistinctPercentOfSample(columns, rows) <= kGroupBelowPercent;
+	FactorizedRelation relation(FTree::Scan(attributes), types, group);
 	// One caller (table_function.cpp) used to build `columns` by filtering NULLs
 	// independently per column, which desynchronizes rows the moment one column
 	// has a NULL and a sibling doesn't -- a relation's several columns must
@@ -88,8 +311,7 @@ FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const At
 		}
 	}
 	auto &rep = relation.Rep();
-	for (size_t row = 0; row < rows; row++) {
-		auto record = rep.AppendRoot();
+	auto write = [&](Record record, size_t row) {
 		for (size_t c = 0; c < attributes.size(); c++) {
 			const auto payload = payload_of[c];
 			if (level.payload[payload].type == ValueType::INT32) {
@@ -98,6 +320,31 @@ FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const At
 				rep.SetInt64(record, payload, columns[c][row]);
 			}
 		}
+	};
+
+	// Identical rows become one record that counts them. Roots come out in
+	// first-occurrence order: the input's order, with each row's later
+	// duplicates pulled up to the first of them.
+	RowGrouper grouper(columns, group ? rows : 0, g_memory_limit == 0 ? 0 : g_memory_limit / 8);
+	if (!group) {
+		grouper.Abandon();
+	}
+	for (size_t row = 0; row < rows; row++) {
+		if (grouper.Active()) {
+			const uint64_t hash = HashRow(columns, row);
+			if (auto *seen = grouper.Find(row, hash)) {
+				const Record record(0, seen);
+				rep.SetWeight(record, CheckedCardinalityAdd(rep.GetWeight(record), 1));
+				grouper.Matched();
+				continue;
+			}
+			auto record = rep.AppendRoot();
+			write(record, row);
+			grouper.Added(row, hash, record.Data());
+			continue;
+		}
+		auto record = rep.AppendRoot();
+		write(record, row);
 	}
 	return relation;
 }
@@ -231,6 +478,14 @@ std::vector<int32_t> PlanParents(const MaterializePlan &plan) {
 void MaterializeLower(const MaterializePlan &plan, uint32_t plan_index, const std::vector<bool> &on_key_path,
                       const FRepresentation &input, FlattenContext &ctx, FRepresentation &output, Record target) {
 	CopyPayload(plan, plan_index, input, ctx, output, target);
+	// The lower side builds its records here rather than through
+	// MaterializeSubtree, so it needs the multiplicity carried over too --
+	// otherwise a materialized join silently drops every duplicate the scan
+	// grouped, and disagrees with the fused count over the same inputs.
+	const int64_t weight = WeightOf(plan, plan_index, input, ctx);
+	if (weight != 1) {
+		output.SetWeight(target, weight);
+	}
 	for (const auto &child : plan.Level(plan_index).children) {
 		const uint32_t child_plan = child.first;
 		const uint32_t slot = child.second;
@@ -300,7 +555,9 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 		}
 	}
 
-	FactorizedRelation result(merge.tree, out_types);
+	// The output can only carry multiplicities if one of the inputs already
+	// does; a join never invents them.
+	FactorizedRelation result(merge.tree, out_types, upper.Rep().HasWeights() || lower.Rep().HasWeights());
 	auto &out = result.Rep();
 
 	std::vector<bool> upper_owned(merge.side.size(), false);
@@ -437,7 +694,9 @@ struct LowerSizeCounter {
 	FlattenContext &ctx;
 
 	int64_t Of(uint32_t plan_index) {
-		int64_t size = 1;
+		// The multiplicity the output record would have carried, had one been
+		// built. This walk exists precisely because it is not.
+		int64_t size = WeightOf(plan, plan_index, input, ctx);
 		for (const auto &child : plan.Level(plan_index).children) {
 			int64_t slot_total = 0;
 			if (on_key_path[child.first]) {
@@ -495,7 +754,7 @@ struct OutputCounter {
 
 	int64_t Of(uint32_t plan_index) {
 		const auto &level = plan.Level(plan_index);
-		int64_t size = 1;
+		int64_t size = WeightOf(plan, plan_index, input, ctx);
 		for (const auto &child : level.children) {
 			int64_t slot_total = 0;
 			IterateLevel(plan, child.first, input, ctx, 0,

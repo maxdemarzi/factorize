@@ -156,7 +156,17 @@ static void EnumerateRecord(const FRepresentation &rep, Record record, std::map<
 		restore.emplace_back(value.attribute, assignment.count(value.attribute) > 0);
 		assignment[value.attribute] = rep.GetValue(record, value.attribute);
 	}
-	EnumerateSlots(rep, record, 0, assignment, emit);
+	// A record stands for as many identical tuples as its multiplicity says, so
+	// decoding it means spelling out each of them. This walker is the
+	// representation's *decoder*, not the oracle -- the oracle is FlatJoin over
+	// the raw input rows, which knows nothing about how any of this is stored --
+	// so teaching it the format is not teaching it the answer. Without this it
+	// silently reads a grouped relation as though it were a set, and every
+	// comparison below fails against a flat join that counted the duplicates.
+	const int64_t weight = rep.GetWeight(record);
+	for (int64_t copy = 0; copy < weight; copy++) {
+		EnumerateSlots(rep, record, 0, assignment, emit);
+	}
 	for (const auto &entry : restore) {
 		if (!entry.second) {
 			assignment.erase(entry.first);
@@ -835,6 +845,93 @@ static void TestCompositeKeyWidth() {
 	}
 }
 
+//! A scan of duplicated rows costs one record per distinct row, not one per
+//! row, and the joins above it inherit that.
+//!
+//! This is the *size* claim, and it is the one that regresses silently. Every
+//! count below is right either way -- the ungrouped representation denotes the
+//! same relation, it just spends 500,000 records saying what 12 say here. So
+//! the assertions are on RecordCount() and on the weights themselves, with the
+//! count checked beside them to show the smaller representation still means the
+//! same thing. Asserting only the count would pass with the grouping deleted.
+//!
+//! The numbers are chosen so a regression fails rather than hangs: ungrouped,
+//! this shape builds about 510,200 records, which is slow but finishes.
+static void TestGroupedScans() {
+	Group scope("a star over duplicated keys costs records per distinct value, not per row");
+
+	std::printf("Grouped scans over duplicated keys\n");
+	const int relations = 3;
+	const int distinct = 4;
+	const int rows = 200; // fifty rows per distinct value
+
+	AttributeTypes types;
+	for (int i = 0; i < relations; i++) {
+		types.emplace_back(static_cast<AttributeId>(i), ValueType::INT32);
+	}
+	std::vector<std::vector<int64_t>> keys(static_cast<size_t>(relations));
+	for (int i = 0; i < relations; i++) {
+		for (int r = 0; r < rows; r++) {
+			keys[static_cast<size_t>(i)].push_back(r % distinct);
+		}
+	}
+
+	// Sum over the join value of the product of its multiplicities -- the flat
+	// answer, computed from the inputs rather than from the engine.
+	int64_t oracle = 0;
+	for (int value = 0; value < distinct; value++) {
+		int64_t product = 1;
+		for (int i = 0; i < relations; i++) {
+			int64_t occurrences = 0;
+			for (auto key : keys[static_cast<size_t>(i)]) {
+				if (key == value) {
+					occurrences++;
+				}
+			}
+			product *= occurrences;
+		}
+		oracle += product;
+	}
+
+	auto scan = [&](int i) {
+		return MakeScan({static_cast<AttributeId>(i)}, types, {keys[static_cast<size_t>(i)]});
+	};
+
+	FactorizedRelation accumulated = scan(0);
+	const auto scanned = accumulated.Rep().RecordCount();
+	Expect(scanned == static_cast<size_t>(distinct), std::to_string(rows) + " rows over " +
+	                                                     std::to_string(distinct) + " distinct values scan to " +
+	                                                     std::to_string(distinct) + " records, got " +
+	                                                     std::to_string(scanned));
+
+	// The multiplicity is where the dropped rows went; without it the relation
+	// would be a set and every count over it would be too small.
+	int64_t weighed = 0;
+	accumulated.Rep().ForEachRoot([&](Record root) { weighed += accumulated.Rep().GetWeight(root); });
+	Expect(weighed == rows, "the records' multiplicities total the " + std::to_string(rows) +
+	                            " rows scanned, got " + std::to_string(weighed));
+
+	for (int i = 1; i < relations; i++) {
+		JoinKeys join_keys;
+		join_keys.build = {static_cast<AttributeId>(i)};
+		join_keys.probe = {static_cast<AttributeId>(0)};
+		accumulated = FactorizedJoin(scan(i), accumulated, join_keys, JoinMode::BOTTOM_INSERT);
+	}
+
+	const auto count = accumulated.Count();
+	Expect(count == oracle,
+	       "the grouped star counts " + std::to_string(oracle) + ", got " + std::to_string(count));
+
+	// One record per distinct value per level is 12 here. The bound is loose
+	// enough not to pin the representation's internals and tight enough that
+	// per-row records (about 510,200) cannot pass it.
+	const auto records = accumulated.Rep().RecordCount();
+	const size_t bound = static_cast<size_t>(distinct * relations * 2);
+	Expect(records <= bound, "the joined star holds at most " + std::to_string(bound) + " records, got " +
+	                             std::to_string(records));
+	scope.Detail(" (" + std::to_string(records) + " records for " + std::to_string(count) + " tuples)");
+}
+
 int main() {
 	std::printf("factorize core: joins\n\n");
 	TestDifferential();
@@ -854,6 +951,8 @@ int main() {
 	TestMemoryLimitCoversBuildSide();
 	std::printf("\n");
 	TestCompositeKeyWidth();
+	std::printf("\n");
+	TestGroupedScans();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

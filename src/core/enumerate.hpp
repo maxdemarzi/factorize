@@ -106,7 +106,17 @@ struct TupleWalker {
 				}
 			}
 		}
-		EnumerateSlots(record, 0, next);
+		// A grouped record stands for several identical tuples, and enumeration
+		// is the one consumer that has to spell each of them out: the folds get
+		// the multiplicity through the arithmetic, but a caller asking for the
+		// tuples themselves asked for all of them.
+		const int64_t weight = rep.HasWeights() ? rep.GetWeight(record) : 1;
+		for (int64_t copy = 0; copy < weight; copy++) {
+			if (stopped) {
+				return;
+			}
+			EnumerateSlots(record, 0, next);
+		}
 	}
 
 	//! The cross product over one record's child slots. A slot with no children

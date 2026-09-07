@@ -83,6 +83,18 @@ struct LevelLayout {
 	//! the f-representation multiplying child subtree sizes, so this field is
 	//! what makes count(*) cost O(|f-rep|) instead of O(|flat result|).
 	uint32_t size_offset = 0;
+	//! Offset of the record's multiplicity: how many identical tuples it stands
+	//! for. See FRepresentation::GetWeight for why it is stored biased by one.
+	//!
+	//! Zero means the level has no such field, and every record on it stands
+	//! for exactly one tuple. Zero is unambiguous because offset 0 is always
+	//! the size cache, so no real multiplicity can live there.
+	//!
+	//! It is left out wherever it cannot be used, because it is not free:
+	//! records align to 16 bytes, so the 8-byte field costs 16, and on a
+	//! relation whose rows are already distinct that measured **+40% memory**
+	//! for nothing (DECISIONS.md D35).
+	uint32_t weight_offset = 0;
 	std::vector<ValueDesc> payload;
 	std::vector<SlotDesc> slots;
 	//! Set for the insertion point of a bottom-insert: many threads append to
@@ -109,7 +121,11 @@ class Layout {
 public:
 	//! Derives the layout from a finished f-tree. `types` supplies the value
 	//! type of every attribute mentioned in the tree.
-	static Layout FromFTree(const FTree &tree, const std::vector<std::pair<AttributeId, ValueType>> &types);
+	//! `with_weights` reserves the per-record multiplicity field. Pass it only
+	//! when something can actually weigh a record: a scan that has decided to
+	//! group, or a join whose inputs already carry weights.
+	static Layout FromFTree(const FTree &tree, const std::vector<std::pair<AttributeId, ValueType>> &types,
+	                        bool with_weights = false);
 
 	const LevelLayout &Level(LevelId level) const {
 		return levels[level];

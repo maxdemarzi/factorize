@@ -1169,6 +1169,9 @@ private:
 	//! so far, carrying its own value if the summed column lives here.
 	Fold Own(Record record) const {
 		Fold fold;
+		// Its multiplicity, so a grouped record contributes the tuples it
+		// stands for rather than one of them.
+		fold.count = rep.HasWeights() ? rep.GetWeight(record) : 1;
 		const auto &level = rep.GetLayout().Level(record.Level());
 		for (size_t i = 0; i < aggregates.size(); i++) {
 			if (aggregates[i].kind != Aggregate::SUM) {
@@ -1176,7 +1179,9 @@ private:
 			}
 			for (const auto &entry : level.payload) {
 				if (entry.attribute == sum_attributes[i]) {
-					fold.sums[i] = rep.GetValue(record, sum_attributes[i]);
+					// Each of the tuples this record stands for carries the
+					// value, so the sum is the value that many times.
+					fold.sums[i] = CheckedCardinalityMul(rep.GetValue(record, sum_attributes[i]), fold.count);
 					break;
 				}
 			}

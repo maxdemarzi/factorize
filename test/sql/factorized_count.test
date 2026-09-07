@@ -26,6 +26,37 @@ SELECT * FROM factorized_count(['a', 'b', 'c'], ['a.s = b.s', 'b.s = c.s']);
 ----
 10000
 
+#
+# Grouping: identical scanned rows cost one record between them.
+#
+# Only `s` is scanned -- no predicate mentions `d` -- so each relation's 100
+# rows collapse onto its 10 distinct values. One record per row makes the
+# materialized join 1,100 records; one per distinct value makes it 20. The
+# count is 10,000 either way, which is precisely why this asserts the size:
+# deleting the grouping changes no answer in this file, only how much gets
+# built to reach it.
+#
+query I
+SELECT records < 100 FROM factorized_stats(['a', 'b', 'c'], ['a.s = b.s', 'b.s = c.s']);
+----
+true
+
+# Rows group only when every scanned column agrees. This grid holds each (s,d)
+# pair exactly once, so a self-join on both columns matches every row with
+# itself and nothing else: a grouper that collapsed on `s` alone would keep one
+# `d` per group and answer something other than 100.
+#
+# INTEGER rather than the BIGINT `range()` hands out, because two 64-bit key
+# columns exceed the packed key and would be refused at bind time -- the query
+# would fail for a reason that has nothing to do with what it is testing.
+statement ok
+CREATE TABLE grid AS SELECT (i // 10)::INTEGER AS s, (i % 10)::INTEGER AS d FROM range(100) t(i);
+
+query I
+SELECT * FROM factorized_count(['grid x', 'grid y'], ['x.s = y.s', 'x.d = y.d']);
+----
+100
+
 # A chain, where the second join is on the other column. Nothing is
 # independent here, so this is the shape factorization does not help -- but it
 # still has to be right. a.d is 0..99 and b.s is i%10, so the ten a-rows with

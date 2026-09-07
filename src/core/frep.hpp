@@ -194,6 +194,43 @@ public:
 	int64_t GetValue(Record record, AttributeId attribute) const;
 
 	//===------------------------------------------------------------------===//
+	// Multiplicity
+	//===------------------------------------------------------------------===//
+
+	//! How many identical tuples this record stands for; 1 unless it was built
+	//! by grouping.
+	//!
+	//! A relation is a bag, and a scan projected onto its join columns turns
+	//! every distinct combination of them into as many identical records as the
+	//! table had rows. Those records are indistinguishable to every operation
+	//! here -- they carry the same values, have no children, and no later join
+	//! can tell them apart -- so keeping one of them and counting the rest is
+	//! the same relation in less space. The count is that tally.
+	//!
+	//! Stored biased by one, because the arena hands back zeroed memory: a
+	//! record nobody has weighed reads as 1, which is what every representation
+	//! built before this existed means. That is what makes the field free to
+	//! add -- no constructor has to write it, and no existing caller changes.
+	int64_t GetWeight(Record record) const;
+
+	//! Whether any record here was ever weighed above 1.
+	//!
+	//! The counting walks ask for a record's multiplicity once per visit, and
+	//! on a query that iterates hundreds of millions of times that is a load
+	//! and a loop over the plan level's sources where there used to be a
+	//! constant 1. This is what keeps the feature free for every query that
+	//! groups nothing: one bool, checked before any of it.
+	bool HasWeights() const {
+		return has_weights;
+	}
+
+	//! Sets the multiplicity. Must be at least 1: a record standing for no
+	//! tuples is spelled by pruning it, not by weighing it zero, and the two
+	//! are not interchangeable -- SubtreeSize memoizes a zero as "not yet
+	//! computed" and would recompute it forever.
+	void SetWeight(Record record, int64_t weight);
+
+	//===------------------------------------------------------------------===//
 	// Traversal
 	//===------------------------------------------------------------------===//
 
@@ -359,6 +396,8 @@ private:
 	OverflowSegment *root_tail = nullptr;
 	//! Armed by PruneEmptySubtrees(); makes iteration skip zero-size records.
 	bool prune_empty = false;
+	//! Set by SetWeight; see HasWeights.
+	bool has_weights = false;
 	size_t memory_limit = 0;
 	size_t estimate_budget = 0;
 	uint32_t next_root_capacity = 8;

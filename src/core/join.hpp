@@ -50,7 +50,10 @@ using AttributeTypes = std::vector<std::pair<AttributeId, ValueType>>;
 //! move either.
 class FactorizedRelation {
 public:
-	FactorizedRelation(FTree tree, AttributeTypes types);
+	//! `with_weights` reserves room for per-record multiplicities. Off by
+	//! default: the field costs 16 bytes a record after alignment, so it is
+	//! reserved only where something can actually set it.
+	FactorizedRelation(FTree tree, AttributeTypes types, bool with_weights = false);
 
 	const FTree &Tree() const {
 		return tree;

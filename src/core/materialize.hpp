@@ -168,6 +168,30 @@ inline void CopyPayload(const MaterializePlan &plan, uint32_t plan_index, const 
 	}
 }
 
+//! The multiplicity of the output record for one plan level: the product of
+//! the multiplicities of the input records it stands for.
+//!
+//! A merged output node (section 4.6) draws from several input nodes at once
+//! and its records are their combinations, so a pairing of two inputs standing
+//! for 3 and 5 identical tuples stands for 15. Where nothing was grouped every
+//! factor is 1, which is why this is invisible to representations built before
+//! multiplicities existed.
+inline int64_t WeightOf(const MaterializePlan &plan, uint32_t plan_index, const FRepresentation &input,
+                        const FlattenContext &ctx) {
+	// Nothing here was ever grouped, so every factor is 1 and the loop below
+	// would only prove it. This runs inside the two counting walks, once per
+	// visited combination, so it has to cost nothing when it has nothing to do.
+	if (!input.HasWeights()) {
+		return 1;
+	}
+	const auto &level = plan.Level(plan_index);
+	int64_t weight = 1;
+	for (size_t i = 0; i < level.sources.size(); i++) {
+		weight = CheckedCardinalityMul(weight, input.GetWeight(ctx[level.ctx_offset + i]));
+	}
+	return weight;
+}
+
 //===--------------------------------------------------------------------===//
 // Construction
 //===--------------------------------------------------------------------===//
@@ -183,6 +207,12 @@ void MaterializeSubtree(const MaterializePlan &plan, uint32_t plan_index, const 
                         FlattenContext &ctx, FRepresentation &output, Record target, int32_t stop_at_output_level,
                         OnStop &&on_stop) {
 	CopyPayload(plan, plan_index, input, ctx, output, target);
+	// Left alone when it is 1: the arena already zeroed the record, which reads
+	// as 1, so an ungrouped query does not pay a store per record for this.
+	const int64_t weight = WeightOf(plan, plan_index, input, ctx);
+	if (weight != 1) {
+		output.SetWeight(target, weight);
+	}
 	const auto &level = plan.Level(plan_index);
 	for (const auto &child : level.children) {
 		const uint32_t child_plan = child.first;

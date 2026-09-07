@@ -1783,3 +1783,197 @@ by 86x instead of 163x.
 
 > A cost model that cannot be trusted can still be made survivable. Bounding the
 > loss needs no better estimate than the one that is already wrong.
+
+## D35 — The star was never factorized: a scan held one record per row
+
+D34 bounded the losses without repairing them, and said so: with the fallback
+disabled entirely the engine was still **55x** slower than DuckDB on
+`watdiv_acyclic_206_16`, a seven-relation star, so no gate setting could reach
+that shape. This is what that was.
+
+**The measurement that located it.** `factorized_stats` reports what the
+representation actually held:
+
+    records        69,985,962
+    bytes                1.96 GB
+    inputs          8,202,775 rows across 7 relations
+    answer         39,891,620 tuples
+
+A correctly factorized star holds one root per matching key plus the rows that
+survive beneath it. Here that is 1,118 matching values of `s` plus 186,126
+surviving rows: **187,244 records**. We were building **374x** that -- and 1.75x
+more records than the flat answer has tuples. On the paper's flagship shape the
+engine was doing worse than materializing the answer.
+
+**The cause is one line, and it is not the join.** `FTree::Scan` builds the
+trivial single-node f-tree and `MakeScan` fills it with one record per input
+row. That is exactly section 4.2.1 and it is correct -- but this engine scans
+only the columns a query's joins mention, because the binder projects the rest
+away before the graph exists (`table_function.cpp` fills `bound.columns` from
+the predicates alone). Projecting `watdiv1052651` onto `s` turns 4,491,142 rows
+into 4,491,142 records over **39,781 distinct values**, and every later join
+then re-pairs all 113 copies of a value instead of pairing the value once. The
+projection that makes the scan cheap is what makes the representation
+quadratic.
+
+> Factorization removes the redundancy *between* relations. It does nothing
+> about the redundancy a projection creates *inside* one, and this engine
+> created that redundancy itself.
+
+**Confirmed by prediction, not by inspection.** The nesting model says the
+materialized records are the running prefix products, so it can be checked
+against the engine before changing anything:
+
+    relations   predicted                                  measured
+    2           4,491,142  (the scan, unpruned)            4,491,142
+    3           4,491,142 + 3,139,902 = 7,631,044          7,631,044
+
+Both exact, which is what turned "the star looks unfactorized" into "the scan
+holds one record per row".
+
+**The fix: a record carries how many identical tuples it stands for.**
+Identical scanned rows collapse into one record with a multiplicity, and
+`SubtreeSize` seeds from that instead of from 1. `SubtreeSum` then needed no
+change at all, because it already derives everything from `SubtreeSize` --
+`others = count / slot_count` carries the multiplicity through the combination
+rule without knowing it exists.
+
+The group-by fold did need it, and for the opposite reason: it builds its own
+semiring pairs rather than reading `SubtreeSize`, so a record's own contribution
+had to become `(weight, value * weight)` instead of `(1, value)`. The rule that
+falls out is: anything deriving from `SubtreeSize` was already correct, and
+anything computing its own size beside it was not. That is what picks out the
+four sites in the join -- the two counters that size a subtree from the plan
+without building it, and the two materializers that build one.
+
+The field is stored **biased by one**, so a zeroed record reads as weight 1.
+The arena already hands back zeroed memory, which means every representation
+built before this existed keeps its exact former meaning, no constructor writes
+the field, and the ungrouped path pays neither a store nor a branch.
+
+**Rejected: fixing the join order instead.** Ordering the star by ascending
+relation size predicts 918,744 records against the measured 69,985,962 -- a
+genuine 76x, for a much smaller change. It was rejected because it is a
+heuristic that needs plan-time cardinalities this project has already measured
+as wrong by 205x (D34), and because it treats the symptom: with grouped scans
+every level is bounded by *distinct values* rather than by a product of row
+counts, which makes the order nearly irrelevant instead of critical.
+
+**Grouping is abandoned when it does not pay.** A relation whose rows are
+already distinct would buy a hash table the size of its input and get nothing,
+so after 65,536 rows the grouper checks whether it is earning its keep and drops
+the table if the rows so far are more than 90% distinct; it also abandons rather
+than grow past a budget, since the table is heap and the representation's own
+memory limit cannot see it. Abandoning is safe at any point *because the
+multiplicity is a property of each record and not of the relation*: what is
+already grouped stays grouped, every row after it gets a record of its own, and
+the two together denote the same bag. That is what lets the decision be a guess
+-- being wrong costs time, never an answer.
+
+**What it cost to get right.** Two things had to learn about multiplicity, and
+both were found by tests rather than by reading:
+
+- `MaterializeLower` builds the lower side's records on its own rather than
+  through `MaterializeSubtree`, and copying the payload without the weight made
+  a materialized join disagree with the fused count over the same inputs. The
+  existing `fused count == materialize-then-count` differential caught it on the
+  first run. The sweep that would have found it without a test is `grep
+  CopyPayload`, which lists every site that builds a record: there are exactly
+  two.
+- `test_join.cpp` carries its own reference decoder, separate from
+  `core/enumerate.hpp`, and it read a grouped relation as though it were a set.
+  Teaching it the format is not teaching it the answer -- the oracle is
+  `FlatJoin` over the raw input rows, which knows nothing about how any of this
+  is stored.
+
+**The abandonment rule, checked against the corpus rather than reasoned about.**
+Distinct values among the first 65,536 rows of each relation in
+`watdiv_acyclic_206_16`:
+
+    relation          rows      distinct in sample     grouping
+    watdiv1052651    4,491,142        0.9%             kept
+    watdiv1052644    3,289,307        2.3%             kept
+    watdiv1052642      152,275       13.3%             kept
+    watdiv1052650       69,970      100.0%             abandoned
+    watdiv1052643      100,000      100.0%             abandoned
+    watdiv1052645       59,784      (under the sample) kept, gains nothing
+    watdiv1052646       40,297      (under the sample) kept, gains nothing
+
+It keeps exactly the two relations holding 7.78M of the 8.2M rows, and drops the
+table on the ones where there was nothing to collapse. The two below the sample
+size pay a hash pass for no gain, which is ~100K rows and not worth a second
+heuristic to avoid.
+
+### What it actually bought, measured against HEAD
+
+Same build configuration, same harness, a discarded warm-up in each mode, only
+the code differing. `auto` seconds, with stock DuckDB alongside:
+
+    query                HEAD    mine   effect     DuckDB
+    watdiv_206_16       9.110   4.192   2.17x       0.058
+    watdiv_215_17       1.293   0.190   6.8x        0.019
+    hetio_222_16        0.398   0.175   2.27x       3.230
+    watdiv_212_05       6.707   4.337   1.55x       0.991
+    watdiv_201_10       6.153   4.053   1.52x       0.178
+    hetio_205_00        0.246   0.175   1.41x       0.288
+    watdiv_217_01       7.684   6.406   1.20x       1.409
+    watdiv_210_15       0.741   0.667   1.11x       0.018
+    epinions_215_04     0.114   0.102   1.12x       0.667
+    epinions_215_12     0.032   0.034   noise       0.579
+    watdiv_216_10       5.150   5.262   noise       0.748
+    yago_Chain_12_17    0.132   0.152   noise       0.029
+
+Faster on 9 of 12, slower on none beyond noise, every answer identical to
+`factorize_mode='off'`.
+
+**And it does not close the gap.** On `watdiv_acyclic_206_16` the representation
+is now 1035x smaller and 341x lighter, and that bought **2.17x**: 127x slower
+than DuckDB before, 72x slower after.
+
+> The representation was genuinely broken -- worse than materializing the answer
+> -- and fixing it was worth doing on its own. But it was never what made this
+> query slow, and the record counts said so all along: 70M records was a bug,
+> and 67K records is still 4.2 seconds.
+
+**Where the remaining 72x lives, measured rather than guessed.** The core is not
+the bottleneck: the standalone harness ran this query with the *old* 70M-record
+representation in 6.8s, faster than the DuckDB path manages with the 67K one.
+Timing prefixes puts the cost on the scan and not on the join -- a query touching
+the 4.49M-row relation costs the same whether it scans 4.5M rows or 9M -- and
+`StorageSource` is why: it materializes every input column into
+`std::vector<int64_t>`, row at a time, single-threaded, before the engine starts.
+DuckDB scans, joins seven relations and counts in 0.058s, vectorized and
+parallel. That is an architectural difference, not a tuning one.
+
+### The measurements this project has been quoting were taken under sanitizers
+
+`build/relassert` compiles with `-fsanitize=address -fsanitize=undefined` (456 of
+521 objects, DuckDB's own code included), and the corpus scripts default to it --
+`run-ce-extension.sh`, `cross-check-optimizer.sh`, `cross-check-duckdb.sh`,
+`run-duckdb-ce.sh` all carry `DUCKDB="${DUCKDB:-build/relassert/duckdb}"`. For
+those it is the right default: they check answers, and assertions plus
+sanitizers are exactly what one wants there.
+
+The two calibration scripts already knew better and take `build/release`,
+saying why in a header comment. So this is not a blind spot everywhere -- it is
+a blind spot in *timing*, where nothing enforced the distinction.
+
+D34 records only "one build" without naming it, so what follows is inference,
+not a fact I can show: its `auto` figure for `watdiv_acyclic_206_16` is 26.16s,
+which sits beside the 22.5s this session measured on relassert and nowhere near
+the 9.1s the same pre-change code measures on release.
+
+Both sides are instrumented, so the comparison is not meaningless -- but ASan
+taxes row-at-a-time code far more than vectorized code, which is precisely the
+axis these two engines differ on. The same query measures 127x on release and
+was reported as 55x on relassert. It also made the scan look like the whole
+story: under ASan `factorized_count` spent 21.5s where release spends 4.2s,
+while stock DuckDB read the same table in 4ms.
+
+    build        wall (full)   binary     sanitized objects
+    relassert       12m 09s    2.57 GB          456 / 521
+    release          2m 54s      52 MB                  0
+
+> A harness that defaults to the sanitizer build measures the sanitizer. The
+> calibration scripts guarded against that and said so; the timing runs never
+> had a default to guard, because nothing in the repo does timing.
