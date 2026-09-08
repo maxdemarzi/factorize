@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "../../src/core/join.hpp"
 #include "../../src/core/plan.hpp"
 
 #include <cstdio>
@@ -393,6 +394,102 @@ static void TestExistsAgreesWithCount() {
 	Expect(none.count == 0, "exists: a join with no tuples must answer no");
 }
 
+//! The gate is a prediction; this is a measurement, and they disagree.
+//!
+//! Two graphs of the same shape and size, differing only in how the keys
+//! repeat: a chain of unique keys, where every record stands for one tuple and
+//! factorizing is pure overhead, and a star where each record stands for
+//! hundreds. Both are accepted with the check off. With the floor set, exactly
+//! the first is abandoned -- and abandoned as a plain failure rather than as a
+//! memory problem, since slicing a query that is not compressing only makes
+//! several smaller copies of the same mistake (D37).
+static void TestCompressionFloorAbandons() {
+	Group scope("a join that does not compress is abandoned, one that does is not");
+
+	// Chain: keys are unique, so the join is a permutation and the whole
+	// representation holds one tuple per record or worse.
+	MemorySource chain_source;
+	std::vector<int64_t> unique;
+	for (int64_t v = 0; v < 2000; v++) {
+		unique.push_back(v);
+	}
+	chain_source.Add({unique});
+	chain_source.Add({unique});
+	chain_source.Add({unique});
+	QueryGraph chain;
+	chain.column_counts = {1, 1, 1};
+	chain.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	chain.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}};
+
+	// Star: one centre value per group, twenty partners in each of three arms,
+	// so a group of 61 records stands for 8000 tuples.
+	MemorySource star_source;
+	std::vector<int64_t> centres;
+	std::vector<int64_t> arm;
+	for (int64_t v = 0; v < 100; v++) {
+		centres.push_back(v);
+		for (int i = 0; i < 20; i++) {
+			arm.push_back(v);
+		}
+	}
+	star_source.Add({centres});
+	star_source.Add({arm});
+	star_source.Add({arm});
+	star_source.Add({arm});
+	QueryGraph star;
+	star.column_counts = {1, 1, 1, 1};
+	star.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	star.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}, Predicate {0, 0, 3, 0}};
+
+	const auto chain_plan = BuildPlan(chain);
+	const auto star_plan = BuildPlan(star);
+
+	SetGlobalMinCompression(0);
+	const auto chain_off = ExecuteCount(chain, chain_plan, chain_source, JoinMode::BOTTOM_INSERT);
+	const auto star_off = ExecuteCount(star, star_plan, star_source, JoinMode::BOTTOM_INSERT);
+	Expect(chain_off.ok, "compression floor: the chain answers with the check off (" + chain_off.error + ")");
+	Expect(star_off.ok, "compression floor: the star answers with the check off (" + star_off.error + ")");
+	Expect(chain_off.count == 2000, "compression floor: chain counts 2000, got " + std::to_string(chain_off.count));
+	Expect(star_off.count == 100 * 20 * 20 * 20,
+	       "compression floor: star counts 800000, got " + std::to_string(star_off.count));
+
+	// Every intermediate join is measured, and the numbers are the ones the
+	// representation actually holds rather than anything predicted.
+	// n relations means n-1 joins, of which the last is fused into the count and
+	// materializes nothing -- so n-2 steps, and a two-relation query has none.
+	Expect(chain_off.steps.size() == chain_plan.steps.size() - 2,
+	       "compression floor: one step recorded per materialized join, got " +
+	           std::to_string(chain_off.steps.size()));
+	for (const auto &step : chain_off.steps) {
+		Expect(step.live > 0 && step.tuples > 0, "compression floor: a step reports what it built");
+		Expect(step.Compression() < 2.0,
+		       "compression floor: a chain of unique keys barely compresses, got " +
+		           std::to_string(step.Compression()));
+	}
+	for (const auto &step : star_off.steps) {
+		Expect(step.Compression() > 2.0, "compression floor: the star compresses, got " +
+		                                     std::to_string(step.Compression()));
+	}
+
+	// The same two queries with the floor between them.
+	SetGlobalMinCompression(2.0);
+	const auto chain_on = ExecuteCountWithinMemory(chain, chain_plan, chain_source, JoinMode::BOTTOM_INSERT);
+	const auto star_on = ExecuteCountWithinMemory(star, star_plan, star_source, JoinMode::BOTTOM_INSERT);
+	SetGlobalMinCompression(0);
+
+	Expect(!chain_on.ok, "compression floor: the chain is abandoned");
+	Expect(!chain_on.out_of_memory,
+	       "compression floor: abandoning is not a memory problem, so it must not be retried by slicing");
+	Expect(chain_on.error.find("compression") != std::string::npos,
+	       "compression floor: the error says what was measured, got '" + chain_on.error + "'");
+	Expect(chain_on.slices == 1, "compression floor: the chain was not sliced, it ran " +
+	                                 std::to_string(chain_on.slices) + " slices");
+	Expect(star_on.ok, "compression floor: the star still answers (" + star_on.error + ")");
+	Expect(star_on.count == star_off.count, "compression floor: the star's count is unchanged, " +
+	                                            std::to_string(star_on.count) + " against " +
+	                                            std::to_string(star_off.count));
+}
+
 int main() {
 	std::printf("factorize core: plan\n\n");
 	TestInt32Baseline();
@@ -414,6 +511,8 @@ int main() {
 	TestOutOfMemoryFallsBackToSlices();
 	std::printf("\n");
 	TestExistsAgreesWithCount();
+	std::printf("\n");
+	TestCompressionFloorAbandons();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

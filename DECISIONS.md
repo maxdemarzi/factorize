@@ -2050,3 +2050,105 @@ was correct and the conclusion was backwards: it did not scale with rows because
 it scaled with *first allocation of a given size*, which is a scan cost that is
 insensitive to row count. Instrumenting took one 46-second build and settled in
 one run what three rounds of reasoning had got wrong.
+
+## D37 — Stop predicting: measure the compression, and abandon when it is not there
+
+Every number the gate consults is computed before the query runs. D34 showed
+each of them wrong by orders of magnitude on exactly the queries that lose, and
+the research that followed showed why no better estimate is available: pessimistic
+degree-sequence bounds are valid but a median 240,064× too loose, cardinality is
+the wrong objective (the plans with fewer tuples cost 5× more records), and the
+f-tree's own structural exponents rank real instances at +0.11 against speedup.
+Then a sweep of `factorize_min_work_ms` — the one existing floor — found that
+**every** setting of it left the corpus slower than turning factorization off:
+24.33s at best against a 21.66s stock baseline.
+
+The one statistic that did correlate with winning (+0.77 within the fired set)
+was measured compression, which is not knowable in advance. So this stops trying
+to know it in advance.
+
+**The mechanism.** After each materialized join, `ExecuteCount` reads two numbers
+off the representation it just built — the tuples it denotes and the live records
+it took — and abandons when their ratio is below a floor. Abandoning throws a
+plain exception, which reaches the operator as a failed result and is answered by
+the §7.5 fallback running the plan that was replaced. That is the same route D34's
+estimate budget takes, and deliberately *not* `MemoryLimitExceeded`: slicing a
+query that is not compressing makes several smaller copies of the same mistake.
+
+It is close to free. `FactorizedJoin` already ends in `PruneEmptySubtrees`, which
+computes every subtree size, so the tuple count is a sum over memoized roots
+rather than a traversal. Measured end to end, an abandoned query costs the stock
+plan plus **4–75 ms**.
+
+**The first calibration was measured on the wrong plan.** `factorized_steps` —
+added here, one row per join — builds its plan from the table function's relation
+list. The optimizer builds a different join order from bound SQL, and per-step
+compression is a property of that order, not of the query. Calibrated against the
+table function, the floor came out at 2.5; run through the operator it abandoned
+four of the five wins. The operator was then asked what *it* measures, by running
+with the fallback off and reading the failing step out of the error message:
+
+    query                min compression   verdict   at stake
+    watdiv_216_10              0.230        loss      0.59 s
+    yago_Chain_12_17           0.292        loss      0.13 s
+    watdiv_217_01              0.403        loss      5.81 s
+    watdiv_210_15              0.438        loss      0.25 s
+    hetio_205_00               0.476        WIN       0.16 s
+    epinions_215_04            0.742        WIN       0.58 s
+    hetio_222_16               0.845        WIN       3.23 s
+    epinions_215_12            1.484        WIN       0.56 s
+    watdiv_215_17             48            loss      0.18 s
+    watdiv_206_16             56            loss      0.54 s
+    watdiv_212_05            535            WIN       0.25 s
+    watdiv_201_10           1311            loss      0.44 s
+
+Compression below 1 is normal at an early join, which is the part that is not
+intuitive: records grow by a *sum* over joins while tuples grow by a *product*,
+and the product has not overtaken yet. A floor set where the word "compression"
+suggests it should be abandons everything.
+
+**The floor is swept, not fitted.** The five lowest values are all losses and the
+next four all wins, so a threshold in (0.438, 0.476) separates this sample
+exactly — a 9% gap against 4% run-to-run variation, which is a coincidence to
+measure past rather than a rule. Seven floors, timed end to end over the 12
+queries the gate fires on, corpus totals by substitution (a declined query runs
+the stock plan whichever floor is set):
+
+    floor   fired s   corpus s   vs stock   worst regression
+      0      11.251     24.70      0.88x    watdiv_217_01  +5.42 s
+      0.3    12.015     25.46      0.85x    watdiv_217_01  +5.40 s
+      0.45    6.277     19.72      1.10x    watdiv_216_10  +1.06 s
+      0.6     5.232     18.68      1.16x    watdiv_206_16  +0.55 s
+      0.8     5.897     19.34      1.12x    watdiv_206_16  +0.53 s
+      1.0     8.756     22.20      0.98x    watdiv_206_16  +0.54 s
+      2.5     9.508     22.95      0.94x    watdiv_206_16  +0.54 s
+
+0 wrong answers across all 96 runs. The whole window [0.45, 0.8] beats stock, so
+**0.6** is a plateau rather than a spike, and it is that window's geometric
+centre. It abandons `watdiv_217_01` (6.820s → 1.478s against a 1.398s stock
+plan), `watdiv_216_10`, `watdiv_210_15` and `yago_Chain_12_17`; it forfeits
+`hetio_205_00`, a 0.16-second win; and it leaves every win worth more than that
+alone.
+
+> **`factorize_mode='auto'` is net-positive on this corpus for the first time:
+> 18.68s against 21.66s stock, where firing without the check costs 24.70s.**
+
+**What it does not fix.** Three losses survive at any floor —
+`watdiv_201_10`, `watdiv_206_16`, `watdiv_215_17` — and they compress at 1311×,
+56× and 48×. Factorization is working perfectly on them; there was simply nothing
+to win, their stock plans taking 0.165s, 0.060s and 0.018s. That is the job of
+`factorize_min_work_ms`, which cannot do it because it predicts. The two checks
+are complementary and only one of them has stopped guessing.
+
+**Inert under `force`.** Small fixtures barely compress — 200 keys times 10 rows
+is 0.9 tuples per record — so a floor that applied under `force` would quietly
+turn the whole SQL suite into a test of the fallback: every answer still correct,
+every assertion still passing, and the factorized path never once run. `force`
+means "run it whatever we think of the idea", and this is a thing we think of the
+idea.
+
+**And one bug found on the way.** The four table functions set the memory cap and
+left the estimate budget as an earlier query on the same thread had it — these
+limits are thread-local, and `factorized_count` could therefore abandon against a
+prediction made for a different query entirely. `SetGlobalLimits` now takes all
+three together, which is what makes the omission impossible to write again.

@@ -188,8 +188,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 	{
 		lock_guard<mutex> guard(gstate.lock);
 		if (!gstate.groups) {
-			factorize::SetGlobalMemoryLimit(gstate.memory_per_slice);
-			factorize::SetGlobalEstimateBudget(estimate_budget_bytes);
+			factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression);
 			SharedRelations source(client, relations);
 			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
 			                                        group_keys, aggregates);
@@ -410,8 +409,7 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	// Set per thread, because the cap is per thread. A worker that never sets it
 	// would run uncapped, which is what thread-local storage trades away for
 	// having no data race.
-	factorize::SetGlobalMemoryLimit(gstate.memory_per_slice);
-	factorize::SetGlobalEstimateBudget(estimate_budget_bytes);
+	factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression);
 
 	// Read the inputs once, however many threads want them. Every bucket has to
 	// look at every row to find its own, so a private scan per thread would

@@ -438,6 +438,50 @@ std::vector<CostStep> BuildCostSteps(const QueryGraph &graph, const Plan &plan, 
 	return steps;
 }
 
+namespace {
+
+//! What one materialized join left behind.
+StepStats MeasureStep(size_t relation, const FactorizedRelation &accumulated) {
+	StepStats step;
+	step.relation = relation;
+	step.records = accumulated.Rep().RecordCount();
+	step.live = accumulated.Rep().LiveRecordCount();
+	step.bytes = accumulated.Rep().BytesAllocated();
+	// The join has just pruned, which computes every subtree size, so this
+	// walks the roots over a warm cache rather than the representation.
+	step.tuples = accumulated.Count();
+	return step;
+}
+
+//! Abandons the query when the join that just ran did not compress.
+//!
+//! The gate that chose this plan predicted; this measures. Compression below
+//! the floor means the representation is holding roughly a record per tuple,
+//! which is a hash join built out of the wrong parts -- DuckDB's is tuned and
+//! ours is not, so the remaining joins can only lose ground. Stopping here
+//! throws away the steps already run, and that is the trade: those steps are
+//! bounded by what has happened, while finishing is bounded by nothing.
+//!
+//! Deliberately not MemoryLimitExceeded. Slicing a query that is not
+//! compressing makes several smaller copies of the same mistake.
+void CheckCompression(const StepStats &step, size_t step_index, size_t total_steps) {
+	const double floor = GetGlobalMinCompression();
+	if (floor <= 0 || step.live == 0) {
+		return;
+	}
+	const double achieved = step.Compression();
+	if (achieved >= floor) {
+		return;
+	}
+	throw std::runtime_error("join " + std::to_string(step_index) + " of " + std::to_string(total_steps - 1) +
+	                         " left " + std::to_string(step.live) + " records standing for " +
+	                         std::to_string(step.tuples) + " tuples, a compression of " +
+	                         std::to_string(achieved) + " against a floor of " + std::to_string(floor) +
+	                         ", so factorizing this query is not paying for itself");
+}
+
+} // namespace
+
 ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                            PathStrategy strategy) {
 	ExecuteResult result;
@@ -518,6 +562,10 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 				} else {
 					accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy);
 				}
+			}
+			if (!last_join) {
+				result.steps.push_back(MeasureStep(step.relation, accumulated));
+				CheckCompression(result.steps.back(), i, plan.steps.size());
 			}
 			// Applied by the join just issued, so substitutable from here on and
 			// not before -- the same order BuildPlan validated the graph under.
@@ -739,6 +787,7 @@ ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan 
 		int64_t total = 0;
 		size_t records = 0;
 		size_t bytes = 0;
+		std::vector<StepStats> steps;
 		bool fits = true;
 		for (size_t part = 0; part < factor && fits; part++) {
 			auto piece = ExecuteCountSlice(graph, plan, source, mode, slice + part * slices, finer, strategy);
@@ -753,6 +802,9 @@ ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan 
 			total = CheckedCardinalityAdd(total, piece.count);
 			records = records > piece.records ? records : piece.records;
 			bytes = bytes > piece.bytes ? bytes : piece.bytes;
+			if (steps.empty()) {
+				steps = std::move(piece.steps);
+			}
 		}
 		if (fits) {
 			ExecuteResult refined;
@@ -761,6 +813,7 @@ ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan 
 			refined.records = records;
 			refined.bytes = bytes;
 			refined.slices = finer;
+			refined.steps = std::move(steps);
 			return refined;
 		}
 	}
@@ -787,6 +840,12 @@ ExecuteResult ExecuteCountSliced(const QueryGraph &graph, const Plan &plan, Rela
 		// The largest slice is what had to fit, so that is what is reported.
 		records = records > part.records ? records : part.records;
 		bytes = bytes > part.bytes ? bytes : part.bytes;
+		if (result.steps.empty()) {
+			// From one slice, not from all of them: per-step numbers do not add
+			// up across slices the way a count does, and one bucket's shape is
+			// what the compression check inside it actually saw.
+			result.steps = std::move(part.steps);
+		}
 	}
 	result.ok = true;
 	result.count = total;
@@ -862,6 +921,12 @@ BuiltRelation BuildRepresentation(const QueryGraph &graph, const Plan &plan, Rel
 				keys.build = accumulated_keys;
 				keys.probe = new_keys;
 				accumulated = FactorizedJoin(accumulated, make(step.relation), keys, mode, strategy);
+			}
+			// Every join here materializes -- nothing is fused, that is what
+			// this function is for -- so the last one is checked like the rest
+			// except that there is nothing left to save by abandoning after it.
+			if (i + 1 < plan.steps.size()) {
+				CheckCompression(MeasureStep(step.relation, accumulated), i, plan.steps.size());
 			}
 			// After the join, for the same reason as everywhere else: an equality
 			// becomes substitutable when a join has made it true, not when a

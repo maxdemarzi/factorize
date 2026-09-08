@@ -205,6 +205,30 @@ size_t GetGlobalMemoryLimit();
 void SetGlobalEstimateBudget(size_t bytes);
 size_t GetGlobalEstimateBudget();
 
+//! Least compression a materialized join must have achieved for the plan to
+//! carry on; 0 = no check. Per thread, like the two caps above.
+//!
+//! Different in kind from both of them, and the difference is the point. The
+//! memory cap asks "does this fit", the estimate budget asks "was the gate's
+//! prediction right"; this asks "is factorizing this query working", and
+//! answers it from what the representation actually holds rather than from any
+//! number decided before the query ran. Falling below it throws a plain
+//! exception, so it abandons to the replaced plan (section 7.5) exactly as the
+//! estimate budget does -- the two share a mechanism and differ only in what
+//! they consult (D37).
+void SetGlobalMinCompression(double tuples_per_record);
+double GetGlobalMinCompression();
+
+//! Sets all three at once, because they are thread-local and a caller that
+//! sets one and inherits another gets a limit no query asked for.
+//!
+//! That is not hypothetical: the table functions set the memory cap and left
+//! the estimate budget as an earlier query on the same thread had it, so
+//! `factorized_count` could abandon against a prediction made for a different
+//! query entirely. Taking all three together is what makes the omission
+//! impossible to write.
+void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression);
+
 //! Builds a flat, single-node relation from columnar input. This is the
 //! trivial f-representation of section 4.2.1.
 FactorizedRelation MakeScan(const std::vector<AttributeId> &attributes, const AttributeTypes &types,

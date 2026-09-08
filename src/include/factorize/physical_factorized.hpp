@@ -41,6 +41,9 @@ public:
 	//! Set for `GROUP BY g1, ..., gn`: one row per group rather than one row.
 	//! Bytes the gate predicted, times a slack factor; 0 = unbounded.
 	idx_t estimate_budget_bytes = 0;
+	//! Least compression a materialized join must reach for the plan to carry
+	//! on; 0 = no check. Measured after the join rather than predicted before it.
+	double min_compression = 0;
 	bool grouped = false;
 	//! One per key, in the aggregate's order, which is the answer's order.
 	vector<LogicalType> group_types;

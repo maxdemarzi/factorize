@@ -1954,3 +1954,137 @@ SELECT a.k, sum(a.x) FROM neg_a a, neg_b b WHERE a.k = b.k GROUP BY a.k ORDER BY
 
 statement ok
 SET factorize_mode = 'off';
+
+#-----------------------------------------------------------------------------
+# The compression floor: abandon a plan the representation is not paying for
+#
+# The gate predicts before the query runs, and on the CE corpus every number it
+# can predict is wrong by orders of magnitude on the queries that lose (D34).
+# This check consults nothing predicted: after each materialized join it reads
+# the tuples the representation denotes and the records it took to denote them,
+# and abandons when that ratio is too small to be worth the machinery. Below
+# the floor the plan is doing a hash join out of the wrong parts.
+#
+# Written in 'auto' with the other two gate thresholds opened up, because the
+# floor is deliberately inert under 'force' -- see the rule for why.
+#-----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE cmp_a AS SELECT i AS k, i AS j FROM range(4000) t(i);
+
+statement ok
+CREATE TABLE cmp_b AS SELECT i AS k, i AS j FROM range(4000) t(i);
+
+statement ok
+CREATE TABLE cmp_c AS SELECT i AS k, i AS j FROM range(4000) t(i);
+
+statement ok
+CREATE TABLE cmp_d AS SELECT i AS k FROM range(4000) t(i);
+
+statement ok
+SET factorize_mode = 'auto';
+
+statement ok
+SET factorize_min_gain = 0.0;
+
+statement ok
+SET factorize_min_work_ms = 0.0;
+
+statement ok
+SET factorize_estimate_slack = 0.0;
+
+statement ok
+SET factorize_min_compression = 0.0;
+
+# A chain of unique keys: 4000 tuples held in more than 4000 records, so
+# factorizing it can only ever cost more than not. It answers, and it fires.
+query II
+EXPLAIN SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+query I
+SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+4000
+
+# The floor turned on. The answer must not move: abandoning runs the plan that
+# was replaced, and §7.5 exists so that the user cannot tell the difference in
+# anything but time.
+statement ok
+SET factorize_min_compression = 1000.0;
+
+query I
+SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+4000
+
+# ...and the operator is still in the plan, because the floor is a run-time
+# measurement and nothing about it is knowable while the plan is being made.
+query II
+EXPLAIN SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# What rules out the two counts above having simply agreed because nothing
+# fired: with the fallback off there is nothing to catch the abandonment, so
+# the same query has to fail, and fail saying what it measured.
+statement ok
+SET factorize_fallback = false;
+
+statement error
+SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+compression
+
+# A floor the query clears changes nothing. The steps below measure 0.5 and
+# 0.333, so 0.3 is under both -- which is what makes this a test of the
+# comparison rather than of the setting being read at all. 0.5 would not do:
+# it clears the first join exactly and abandons at the second.
+#
+# Still with the fallback off, which is what distinguishes "cleared the floor"
+# from "abandoned and the stock plan answered": the count is 4000 either way,
+# and only the absence of an error says which happened.
+statement ok
+SET factorize_min_compression = 0.3;
+
+query I
+SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+4000
+
+statement ok
+SET factorize_fallback = true;
+
+# Per-join numbers, which is where the floor was calibrated from. Three joins,
+# the last fused into the count, so two rows -- and compression is tuples over
+# live records rather than anything the gate guessed.
+query IIII
+SELECT step, live, tuples, tuples::DOUBLE / live = compression
+  FROM factorized_steps(['cmp_a', 'cmp_b', 'cmp_c', 'cmp_d'],
+                        ['cmp_a.j = cmp_b.k', 'cmp_b.j = cmp_c.k', 'cmp_c.j = cmp_d.k'])
+ ORDER BY step;
+----
+1	8000	4000	true
+2	12000	4000	true
+
+statement ok
+SET factorize_min_compression = 0.6;
+
+statement ok
+SET factorize_min_gain = 1.5;
+
+statement ok
+SET factorize_min_work_ms = 10.0;
+
+statement ok
+SET factorize_estimate_slack = 2.0;
+
+statement ok
+SET factorize_mode = 'off';

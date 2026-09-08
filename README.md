@@ -153,6 +153,25 @@ Measured on 194 CE queries with both engines timed:
 
 Five-fold cross-validation reproduces this exactly, so it is not overfit.
 
+And then it was, on data the fit had not seen. On the CE corpus every prediction
+the gate can make is wrong by orders of magnitude on exactly the queries that
+lose, and no setting of any threshold repaired it — swept end to end, firing
+under the gate left the corpus **slower than not factorizing at all**. What
+worked was to stop predicting: after each join the operator reads the tuples the
+representation denotes against the records holding them, and abandons to the
+stock plan when that ratio is below `factorize_min_compression`. It costs 4–75ms
+when it fires, because the join has already computed every subtree size.
+
+| | corpus, 119 queries | vs stock |
+|---|---|---|
+| factorize off | 21.66 s | — |
+| auto, no run-time check | 24.70 s | 0.88× |
+| **auto + compression floor** | **18.68 s** | **1.16×** |
+
+The worst single regression falls from +5.42s to +0.55s. DECISIONS D37 has the
+calibration, including the first attempt at it being measured against the wrong
+join order and getting the threshold four times too high.
+
 ## Read FINDINGS.md
 
 [FINDINGS.md](FINDINGS.md) is the substance of the project — what was measured,
@@ -172,7 +191,8 @@ Also worth knowing before trusting any number here:
   supported way to replace them.
 - **O12 / F19** — flat estimation over-predicts on uniform data by up to 84×.
   Three fixes were measured and rejected; it needs a joint-presence sketch or a
-  runtime bail-out, not a better decision rule.
+  runtime bail-out, not a better decision rule. The run-time bail-out is now
+  built and is what makes the table above come out the right way round (D37).
 - Benchmarks come from one laptop, not the paper's 64-core Xeon.
 
 ## Building and testing

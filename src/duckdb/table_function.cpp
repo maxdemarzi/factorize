@@ -282,7 +282,9 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
 	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
 	                            : config.options.maximum_memory;
-	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+	// All three together: these are thread-local, and an earlier query on this
+	// thread may have left a budget behind that has nothing to do with this one.
+	factorize::SetGlobalLimits(static_cast<size_t>(available / 2), 0, 0);
 
 	if (bind_data.has_not_equal) {
 		// Inclusion-exclusion runs two plans over two different graphs, so it
@@ -354,7 +356,9 @@ void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
 	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
 	                            : config.options.maximum_memory;
-	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+	// All three together: these are thread-local, and an earlier query on this
+	// thread may have left a budget behind that has nothing to do with this one.
+	factorize::SetGlobalLimits(static_cast<size_t>(available / 2), 0, 0);
 
 	const auto plan = factorize::BuildPlan(bind_data.graph);
 	if (!plan.complete) {
@@ -373,6 +377,55 @@ void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	output.SetValue(3, 0, Value::BIGINT(static_cast<int64_t>(result.slices)));
 }
 
+//! `factorized_steps(tables, joins)`: one row per materialized join, saying
+//! what the representation held after it.
+//!
+//! `factorized_stats` reports where a query ended up; this reports how it got
+//! there, which is the only form in which "the plan was fine until join six"
+//! is expressible. It is also how the compression floor was calibrated: the
+//! floor is a number about a single step, and nothing else could see one.
+//!
+//! Deliberately unsliced and uncapped by compression: a diagnostic that
+//! abandons partway through is not a diagnostic.
+void ExecuteSteps(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+	auto &bind_data = data.bind_data->Cast<FactorizedCountBindData>();
+
+	const auto &config = DBConfig::GetConfig(context);
+	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
+	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
+	                            : config.options.maximum_memory;
+	factorize::SetGlobalLimits(static_cast<size_t>(available / 2), 0, 0);
+
+	const auto plan = factorize::BuildPlan(bind_data.graph);
+	if (!plan.complete) {
+		throw InvalidInputException("factorized_steps: %s", plan.reason);
+	}
+	StorageSource source(context, bind_data.relations);
+	const auto result =
+	    factorize::ExecuteCountWithinMemory(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
+	if (!result.ok) {
+		throw InvalidInputException("factorized_steps: %s", result.error);
+	}
+	idx_t row = 0;
+	for (const auto &step : result.steps) {
+		output.SetValue(0, row, Value::BIGINT(static_cast<int64_t>(row + 1)));
+		output.SetValue(1, row, Value::BIGINT(static_cast<int64_t>(step.relation)));
+		output.SetValue(2, row, Value::BIGINT(static_cast<int64_t>(step.records)));
+		output.SetValue(3, row, Value::BIGINT(static_cast<int64_t>(step.live)));
+		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(step.bytes)));
+		output.SetValue(5, row, Value::BIGINT(step.tuples));
+		output.SetValue(6, row, Value::DOUBLE(step.Compression()));
+		row++;
+	}
+	output.SetCardinality(row);
+}
+
 //! The one entry point that accepts a `<>`, which is why it has a bind of its
 //! own rather than sharing the default.
 unique_ptr<FunctionData> BindCount(ClientContext &context, TableFunctionBindInput &input,
@@ -389,6 +442,20 @@ unique_ptr<FunctionData> BindStats(ClientContext &context, TableFunctionBindInpu
 		return_types.emplace_back(LogicalType::BIGINT);
 		names.emplace_back(name);
 	}
+	return result;
+}
+
+unique_ptr<FunctionData> BindSteps(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = Bind(context, input, return_types, names);
+	return_types.clear();
+	names.clear();
+	for (const char *name : {"step", "relation", "records", "live", "bytes", "tuples"}) {
+		return_types.emplace_back(LogicalType::BIGINT);
+		names.emplace_back(name);
+	}
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("compression");
 	return result;
 }
 
@@ -498,7 +565,9 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 		const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
 		                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
 		                            : config.options.maximum_memory;
-		factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+		// All three together: these are thread-local, and an earlier query on this
+		// thread may have left a budget behind that has nothing to do with this one.
+		factorize::SetGlobalLimits(static_cast<size_t>(available / 2), 0, 0);
 
 		const auto plan = factorize::BuildPlan(bind_data.graph);
 		if (!plan.complete) {
@@ -542,7 +611,9 @@ void ExecuteTuples(ClientContext &context, TableFunctionInput &data, DataChunk &
 	const idx_t available = config.options.maximum_memory == DConstants::INVALID_INDEX
 	                            ? static_cast<idx_t>(4) * 1024 * 1024 * 1024
 	                            : config.options.maximum_memory;
-	factorize::SetGlobalMemoryLimit(static_cast<size_t>(available / 2));
+	// All three together: these are thread-local, and an earlier query on this
+	// thread may have left a budget behind that has nothing to do with this one.
+	factorize::SetGlobalLimits(static_cast<size_t>(available / 2), 0, 0);
 
 	const auto plan = factorize::BuildPlan(bind_data.graph);
 	if (!plan.complete) {
@@ -611,6 +682,14 @@ void RegisterFactorizedCount(ExtensionLoader &loader) {
 	                    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
 	                    ExecuteStats, BindStats, InitGlobal);
 	loader.RegisterFunction(stats);
+
+	// The same numbers per join rather than per query: where a plan stopped
+	// compressing, which is the question a single end-of-query row cannot
+	// answer and the one the compression floor is set from.
+	TableFunction steps("factorized_steps",
+	                    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},
+	                    ExecuteSteps, BindSteps, InitGlobal);
+	loader.RegisterFunction(steps);
 
 	TableFunction function("factorized_count",
 	                       {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)},

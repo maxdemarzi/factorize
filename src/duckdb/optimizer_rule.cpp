@@ -1049,6 +1049,22 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					// means the decision rested on a number that is not true, and
 					// finishing the query only spends longer being wrong (D34).
 					// Zero disables the check and restores the old behaviour.
+					// The same idea taken one step further: rather than hold the
+					// operator to a predicted *size*, hold it to a measured
+					// *compression*. The estimate budget still needs the gate's
+					// number to have been roughly right; this needs nothing
+					// predicted at all, which matters because the corpus says
+					// every prediction available here is wrong on the queries
+					// that lose (D37).
+					//
+					// Gated modes only. FORCE means "run the factorized path
+					// whatever we think of the idea", which is what every test
+					// in the suite relies on: small fixtures compress barely at
+					// all -- 200 keys times 10 rows is 0.9 tuples per record --
+					// so a floor that applied under FORCE would quietly turn the
+					// whole SQL suite into a test of the fallback, passing all
+					// the way and covering nothing (D25, D26 again).
+					replacement->min_compression = gated ? DoubleSetting(context, "factorize_min_compression", 0.6) : 0.0;
 					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
 					if (slack > 0 && predicted_bytes > 0) {
 						const double budget = predicted_bytes * slack;
@@ -1150,6 +1166,29 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Abandon to the stock plan if the f-representation outgrows the gate's "
 	                          "size estimate by more than this factor (0 disables)",
 	                          LogicalType::DOUBLE, Value::DOUBLE(2.0));
+	// The one check that consults no prediction. Every other number the gate
+	// uses -- join sizes, record counts, DuckDB's own cost -- is computed
+	// before the query runs, and on the CE corpus each has been wrong by orders
+	// of magnitude on exactly the queries that lose. This one is read off the
+	// representation after a join has built it, so it cannot be wrong about
+	// what happened; it can only be wrong about what happens next.
+	//
+	// 0.6 is measured end to end, not fitted to a threshold. Swept over the 12
+	// queries the gate fires on, every floor in [0.45, 0.8] beats the stock
+	// plan on total corpus time and 0.6 is the best of them: 18.68s against
+	// 21.66s stock, where firing without the check costs 24.70s. It abandons
+	// four losses -- including the 5.4s regression that no gate setting had
+	// ever caught -- and forfeits one 0.16s win (D37).
+	//
+	// Under 1, which is the part that is not intuitive: a record holding less
+	// than one tuple is normal early on, because records grow by a sum over
+	// joins while tuples grow by a product, and the product has not overtaken
+	// yet. A floor set where "compression" sounds like it should be abandons
+	// everything.
+	config.AddExtensionOption("factorize_min_compression",
+	                          "Abandon to the stock plan when a materialized join leaves fewer than this many "
+	                          "tuples per record, measured rather than predicted (0 disables)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(0.6));
 	config.AddExtensionOption("factorize_min_work_ms",
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",

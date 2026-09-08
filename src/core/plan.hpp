@@ -148,6 +148,31 @@ public:
 //! Describes `plan` to the gate.
 std::vector<CostStep> BuildCostSteps(const QueryGraph &graph, const Plan &plan, RelationSource &source);
 
+//! One materialized join's output, as measured rather than predicted.
+struct StepStats {
+	//! Which relation this step joined in.
+	size_t relation = 0;
+	//! Records the output holds, and how many of those still encode tuples.
+	//! The difference is what PruneEmptySubtrees skipped.
+	size_t records = 0;
+	size_t live = 0;
+	//! Bytes the arena had handed out by then.
+	size_t bytes = 0;
+	//! Flat tuples the output denotes. Nearly free to ask for: every join ends
+	//! by computing every subtree size, so this is a sum over already-memoized
+	//! roots rather than a second traversal.
+	int64_t tuples = 0;
+
+	//! Tuples per live record: how much the representation is actually saving.
+	//!
+	//! 1 means the join built one record per tuple, which is a hash join with
+	//! extra steps. This is the quantity the whole engine exists to make large,
+	//! and unlike everything the gate consults it is measured, not predicted.
+	double Compression() const {
+		return live == 0 ? 0.0 : static_cast<double>(tuples) / static_cast<double>(live);
+	}
+};
+
 struct ExecuteResult {
 	bool ok = false;
 	int64_t count = -1;
@@ -167,6 +192,14 @@ struct ExecuteResult {
 	//! the plan was a single fused count join, which never materializes.
 	size_t records = 0;
 	size_t bytes = 0;
+	//! What the accumulated representation held after each materialized join.
+	//!
+	//! One entry per join that builds a representation, so the fused final
+	//! count join contributes none: it never materializes anything to measure.
+	//! Kept because the useful question about a plan that went wrong is not how
+	//! big it ended but at which step it stopped compressing, and a single
+	//! end-of-query number cannot answer that (D37).
+	std::vector<StepStats> steps;
 };
 
 //! Runs `plan`, returning the count without materializing the final join.

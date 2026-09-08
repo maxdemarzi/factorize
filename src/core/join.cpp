@@ -24,6 +24,7 @@ namespace {
 //! set up has to set the limit there too.
 thread_local size_t g_memory_limit = 0;
 thread_local size_t g_estimate_budget = 0;
+thread_local double g_min_compression = 0;
 }
 
 void SetGlobalMemoryLimit(size_t bytes) {
@@ -36,6 +37,20 @@ void SetGlobalEstimateBudget(size_t bytes) {
 
 size_t GetGlobalEstimateBudget() {
 	return g_estimate_budget;
+}
+
+void SetGlobalMinCompression(double tuples_per_record) {
+	g_min_compression = tuples_per_record;
+}
+
+double GetGlobalMinCompression() {
+	return g_min_compression;
+}
+
+void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression) {
+	g_memory_limit = memory_bytes;
+	g_estimate_budget = estimate_budget_bytes;
+	g_min_compression = min_compression;
 }
 
 size_t GetGlobalMemoryLimit() {
