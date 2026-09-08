@@ -154,7 +154,7 @@ Measured on 194 CE queries with both engines timed:
 Five-fold cross-validation reproduces this exactly, so it is not overfit.
 
 And then it was, on data the fit had not seen. Firing under the gate left the
-corpus **slower than not factorizing at all** — 24.70s against a 21.66s stock
+corpus **slower than not factorizing at all** — 24.70s against a 22.17s stock
 baseline — and no setting of any threshold repaired it. Two rounds of trying to
 build a better decision rule (D37, D38) produced a run-time check that survives
 as a setting and a negative result that closes the question: no statistic of the
@@ -167,15 +167,25 @@ was read from the thread count while the operator was not allowed to use more
 than one thread, so a single thread made **eight full filtering passes over the
 input** for no parallelism at all.
 
+Fixing that, and then loosening the two thresholds that a systematically low
+cardinality estimate had been compounding:
+
 | | corpus, 119 queries | vs stock |
 |---|---|---|
-| factorize off | 21.66 s | — |
+| factorize off | 22.17 s | — |
 | auto, before | 24.70 s | 0.88× |
-| **auto, after** | **17.26 s** | **1.25×** |
+| **auto, now** | **16.12 s** | **1.38×** |
+| a gate with perfect knowledge | 10.98 s | 2.02× |
+| firing on every match | 524.73 s | 0.04× |
 
-`watdiv_217_01` went 6.820s → 1.502s and the worst regression is now +0.40s.
-DECISIONS D39 has it, D38 has the negative result, and both are worth reading
-for how long the symptom was mistaken for the disease.
+`watdiv_217_01` went 6.820s → 1.502s and the worst regression is now +0.32s.
+The gate fires on 15 of 119 where the engine wins 23, and the 5.1s still
+separating it from the oracle is the cardinality estimate rather than any
+threshold: DuckDB's predicted cost is dominated by result tuples and ours by
+records, records grow far more slowly, so under-estimating a skewed join shrinks
+DuckDB's side of the comparison much harder than ours and every such error
+argues against firing. DECISIONS D38–D40, and they are worth reading for how
+long the symptom was mistaken for the disease.
 
 ## Read FINDINGS.md
 
