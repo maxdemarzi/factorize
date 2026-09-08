@@ -142,12 +142,9 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	                            : config.options.maximum_memory;
 	const idx_t budget = available / 2;
 
-	// One bucket per thread this query is allowed. More buckets than that would
-	// only add passes over the input; fewer would leave threads idle. A
-	// single-threaded database gets exactly the old behaviour: one bucket
-	// covering everything.
 	// One bucket per thread this query is *allowed to use*, which is one when
-	// the operator is not a parallel source at all.
+	// the operator is not a parallel source at all. More buckets than that would
+	// only add passes over the input; fewer would leave threads idle.
 	//
 	// Reading NumberOfThreads() unconditionally was a 5x penalty on the default
 	// settings and it hid in plain sight, because both halves of it are correct
@@ -158,10 +155,11 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	// row to find its own, that is eight full filtering passes over the input
 	// for no parallelism whatsoever. Measured on a 7.8M-row two-relation join:
 	// 0.574s at eight buckets on one thread, 0.115s at one.
-	idx_t slices = ParallelSource() ? TaskScheduler::GetScheduler(context).NumberOfThreads() : 1;
-	if (slices < 1) {
-		slices = 1;
+	idx_t threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	if (threads < 1) {
+		threads = 1;
 	}
+	idx_t slices = ParallelSource() ? threads : 1;
 	if (!IsPlainCount()) {
 		// Everything but a single ungrouped count(*) runs on one thread.
 		//
@@ -178,7 +176,26 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 		// counting and is simply not written yet.
 		slices = 1;
 	}
-	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / slices));
+	// Divided by the *thread* count, not the bucket count, and they are no
+	// longer the same number.
+	//
+	// This bounds what one attempt may hold, and the two questions it used to
+	// answer at once have come apart: buckets exist for parallelism, while the
+	// bound exists because without it "the engine allocates until the kernel
+	// kills the process, taking the whole session with it". Dividing by
+	// `slices` once slices became 1 would raise that ceiling eightfold as a
+	// side effect of a parallelism fix -- and a safety limit written against an
+	// observed kernel kill should not move by accident. No failure was measured
+	// at the wider bound; this keeps peak memory exactly where it was so that
+	// relaxing it stays a separate decision with its own measurement.
+	//
+	// Nothing is lost by staying conservative here. A bucket that does not fit
+	// is sub-divided by ExecuteCountSliceWithinMemory's retry rather than
+	// refused, so the only effect of a tighter bound is that a query which
+	// genuinely needs more memory discovers it sooner and pays for the extra
+	// passes it actually needs -- instead of every query paying for eight it
+	// does not.
+	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / threads));
 }
 
 //! The fold's int64 total, in the type the aggregate was bound to.

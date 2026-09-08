@@ -2257,3 +2257,39 @@ model's coefficients against. They now over-estimate our cost in a known
 direction, which makes the gate decline queries it should fire on -- and the
 gate firing on only 12 of 119 queries is what made every calibration in D37 and
 D38 statistically hopeless in the first place.
+
+### D39a — What one bucket costs, and what it was hiding
+
+Two things were tied to the bucket count that should not have been.
+
+**The memory bound.** `budget / slices` bounds what one attempt may hold, and it
+exists because without it "the engine allocates until the kernel kills the
+process, taking the whole session with it". Once `slices` became 1 that ceiling
+rose eightfold as a side effect of a parallelism fix, and on the >1e9-tuple
+corpus two queries stopped reporting a limit and started returning nothing at
+all -- `hetio_210_07` and `hetio_216_15`, killed rather than declined. It now
+divides by the *thread* count, which keeps peak memory exactly where it was: a
+bucket that does not fit is sub-divided by ExecuteCountSliceWithinMemory's retry
+rather than refused, so the only cost of staying conservative is that a query
+which genuinely needs more discovers it sooner. Both queries answer or decline
+cleanly again.
+
+**The estimate budget, which was 8x lenient by accident.** D34's budget is an
+absolute whole-query number -- predicted bytes times a slack factor -- but with
+eight buckets each one only ever built about an eighth of the representation, so
+it was never really tested against it. With one bucket the comparison is the one
+D34 wrote: whole representation against whole-query prediction.
+
+That is the intended behaviour, and it costs exactly one query. Across the 248
+fired queries of the excluded regime, the count that hits a limit goes 4 -> 5,
+the newcomer being `hetio_225_00`. Its representation genuinely exceeds twice
+the predicted size, so the gate's prediction for it was wrong and D34 says
+abandon; it simply was not reachable before. The remedy is not a looser slack --
+it is a prediction worth holding the operator to, which is the next thing to
+work on.
+
+    excluded regime, 248 fired queries, shipped defaults
+      243  answer correctly
+        5  abandon on the D34 estimate budget or memory cap, then fall back to a
+           stock plan that does not finish inside 300s
+        0  wrong
