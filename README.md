@@ -28,11 +28,14 @@ off:  no answer in 180 seconds
 ```
 
 And what it is not worth: across the 119 CE queries whose results DuckDB *can*
-materialise, the gate fires on one of them, because for a `count(*)` DuckDB
-carries no payload columns through a join and counts empty tuples faster than
-this engine can build a representation. Geomean 1.06x, no query regressing.
-The gate exists to tell those two regimes apart, and the coefficients it uses
-were fitted on one machine — `scripts/refit-cost.py` re-fits them on yours.
+materialise, the engine is faster on 23 and the gate fires on 15, for **1.38×**
+on the corpus. Firing on every match instead would be **0.04×** — 524s against
+22s — because for a `count(*)` DuckDB carries no payload columns through a join
+and counts empty tuples faster than this engine can build a representation. The
+gate exists to tell those two regimes apart, and the coefficients it uses were
+fitted on one machine — `scripts/calibrate-synthetic.py` re-fits them on yours,
+with the caveat in its docstring that it generates uniform data and the gate's
+real difficulty is skew.
 
 | | state |
 |---|---|
@@ -49,7 +52,7 @@ CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
 v1.5.5.
 
 ```sql
-SET factorize_mode = 'force';        -- 'auto' is not wired to a gate yet
+SET factorize_mode = 'auto';         -- 'force' fires on every match, ignoring the gate
 SET factorize_explain = true;        -- say what was taken over, or why not
 SELECT count(*) FROM a, b, c WHERE a.x = b.x AND b.y = c.y;
 ```
