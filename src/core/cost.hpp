@@ -169,7 +169,23 @@ struct CostThresholds {
 	//! coefficients could not be re-fitted at all, only inherited.
 	EngineCost duckdb {0.0, 2.324e-5, 3.981e-6};
 	//! Fire only when we are predicted to beat DuckDB by this factor.
-	double margin = 1.5;
+	//!
+	//! 1.2 rather than 1.5, and the reason is not that the model got better.
+	//! Both sides of the comparison are driven by an estimated tuple count, and
+	//! on skewed data that estimate is low -- by 100x to 350x on the epinions
+	//! queries. It does not bias the comparison evenly: DuckDB's predicted cost
+	//! is dominated by *tuples* while ours is dominated by *records*, and
+	//! records grow far more slowly, so under-estimating cardinality shrinks
+	//! DuckDB's side much harder than ours. The error is therefore systematic
+	//! and always points the same way -- against firing.
+	//!
+	//! A wide margin compounds that. Measured over the 119-query corpus with
+	//! both engines timed, 1.5 leaves 17 wins on the table worth 5.4s, some of
+	//! them 92x. Narrowing to 1.2 adds three wins and no new losses; the worst
+	//! regression is unchanged at +0.32s. Checked, not tuned, against the 481
+	//! queries of the excluded regime, where firing more can only help because
+	//! DuckDB does not finish at all: 248 fired at 1.5 and 249 at 1.2 (D40).
+	double margin = 1.2;
 	//! Bytes an f-representation record occupies: a fixed header plus a slot
 	//! per relation. Measured across 857 CE queries -- median 47 bytes overall,
 	//! rising from 37 at three relations to 64 at twelve.
@@ -202,7 +218,20 @@ struct CostThresholds {
 	//! finishing in microseconds and our fixed costs -- scanning the inputs a
 	//! second time, building a representation -- are the entire runtime. The
 	//! plan (§5.3) asks for this floor in exactly these terms.
-	double min_duckdb_work_ms = 10.0;
+	//!
+	//! 5ms rather than 10, because at 10 the floor was rejecting on a number it
+	//! cannot read. It compares against DuckDB's *predicted* work, and that
+	//! prediction is 100x to 350x low on skewed joins: `epinions_202_12` was
+	//! declined for 2ms of predicted work against a stock plan that takes 739ms,
+	//! and `epinions_202_04` for 4ms against 481ms. Three such queries, worth
+	//! 1.7s, were turned down by a floor whose whole purpose is to spot queries
+	//! that are too small -- on queries that are not small at all.
+	//!
+	//! Not zero. The floor's intent is sound and a query DuckDB finishes in
+	//! microseconds really has nothing to win; 0, 1, 2 and 5 are indistinguishable
+	//! on both corpora, so 5 is the conservative member of a measured plateau
+	//! rather than the removal of a guard (D40).
+	double min_duckdb_work_ms = 5.0;
 };
 
 //! One observation for calibration: what a query cost an engine, and the two

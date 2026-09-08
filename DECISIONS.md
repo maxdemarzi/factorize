@@ -2252,11 +2252,25 @@ symptom of this bug.
 > compress.
 
 **What this invalidates.** Every timing this project has taken of the factorized
-path was taken with this tax in place, including the ones D34 fitted the cost
-model's coefficients against. They now over-estimate our cost in a known
-direction, which makes the gate decline queries it should fire on -- and the
-gate firing on only 12 of 119 queries is what made every calibration in D37 and
-D38 statistically hopeless in the first place.
+path was taken with this tax in place, including the ones the cost model's
+coefficients were fitted against -- `calibrate-synthetic.py` times under
+`force`, so it went through the operator and paid it.
+
+*Corrected.* This paragraph first claimed the coefficients therefore
+over-estimate our cost, so the gate must be declining queries it should fire on.
+Re-running the fit says the opposite -- `ours` comes back at
+`{0.653, 3.393e-5, 1.611e-4}` against the shipped `{0.109, 2.445e-5, 3.961e-5}`,
+which is *more* expensive on every term, and would make the gate fire less. The
+reasoning was sound and the direction was a guess; the guess was wrong.
+
+Two things are worth keeping from it. The synthetic grid tops out at 200,000
+rows, where the tax was small and the per-record term dominates, so it is not
+obviously measuring what changed. And the fit's own docstring says the data is
+uniform and "a fit from here describes the friendly case" -- which is exactly
+the regime where our per-record cost looks worst and the CE corpus's fan-out
+wins do not appear at all. Neither the old coefficients nor the new ones have
+been checked against what the engine now actually does on the corpus, and that
+measurement comes before any re-fit.
 
 ### D39a — What one bucket costs, and what it was hiding
 
@@ -2293,3 +2307,73 @@ work on.
         5  abandon on the D34 estimate budget or memory cap, then fall back to a
            stock plan that does not finish inside 300s
         0  wrong
+
+## D40 — The gate declines 17 wins, and the reason is one estimate pointing one way
+
+With the slicing tax gone (D39) the engine is several times faster on the
+scan-dominated path, so the first thing to establish was what it now wins.
+Forced against stock across all 119 runnable CE queries, both timed, 0 wrong:
+
+    the engine is faster on            23 of 119
+    the gate fires on                  12 of 119
+      of those, it wins                 6
+      wins it declines                 17
+
+    corpus total, stock              22.17 s     --
+    corpus total, gate as it stands  17.18 s   1.29x
+    corpus total, perfect gate       10.98 s   2.02x
+    corpus total, always fire       524.73 s   0.04x
+
+The gate is doing real work -- firing on everything is 24x *slower* than stock --
+but it leaves 5.4s on the table and takes only 0.8s of damage from the six it
+gets wrong. All 17 missed wins are epinions, with speedups up to 92x.
+
+**Why it declines them.** Two reasons, and they are one error:
+
+    epinions_202_04  "DuckDB's own work is 4ms, under the 10ms floor"   stock:  481ms
+    epinions_202_12  "DuckDB's own work is 2ms, under the 10ms floor"   stock:  739ms
+    epinions_216_00  "predicted 19ms against DuckDB's 12ms"             actual: 1063 vs 40ms
+
+DuckDB's predicted work is 100x to 350x low, because the estimated tuple count
+is low on skewed joins -- F13/F14 again. And the error is not symmetric.
+DuckDB's predicted cost is dominated by *tuples*; ours by *records*; records grow
+far more slowly. So under-estimating cardinality shrinks DuckDB's side of the
+comparison much harder than ours, and every such error points the same way:
+against firing.
+
+> The gate's failures are not noise around a correct model. They are a bias
+> with a direction, and the direction is always "decline".
+
+**What was tried and did not work.** Re-fitting the cost model.
+`calibrate-synthetic.py` returns `ours {0.653, 3.393e-5, 1.611e-4}` against the
+shipped `{0.109, 2.445e-5, 3.961e-5}` -- more expensive on every term, which
+would make the gate fire *less*. Its own docstring says why not to trust it here:
+the data is uniform and "a fit from here describes the friendly case", while
+every one of the 17 missed wins is skew. A fit taken where the problem is absent
+cannot measure the problem. (This also corrects a claim in D39.)
+
+**What did work: stop asking the biased number for so much.** If the estimate is
+systematically low, a wide margin compounds it. Sweeping both thresholds and
+scoring each configuration exactly against the measured off/force times:
+
+    work   gain  fires   total s  vs stock   wins  losses
+       5    1.5     12     17.18     1.29x      6       6     <- shipped
+       5    1.2     15     16.12     1.38x      9       6     <- new
+       5    1.0     17     16.96     1.31x     10       7
+      25    1.5     11     17.88     1.24x      5       6
+
+`min_gain` 1.5 -> 1.2 adds three wins and no new losses, with the worst
+regression unchanged at +0.32s. `min_work_ms` 10 -> 5 lets through the three the
+floor was rejecting on a prediction it cannot read; 0, 1, 2 and 5 are
+indistinguishable on both corpora, so 5 is the conservative member of a measured
+plateau rather than the removal of a guard.
+
+**Checked, not tuned, out of sample.** These were chosen on the 119-query
+corpus, which is how D37 went wrong. So they were then run against the 481
+queries of the excluded regime -- where firing more can only help, because
+DuckDB does not finish at all -- and the fired count goes 248 -> 249. Strictly
+more, never fewer.
+
+**What is left.** Thresholds recover 1.06s of the 6.2s between the shipped gate
+and a perfect one. The other 5.1s is the cardinality estimate, and no threshold
+reaches it. That remains the open problem it has been since F13.

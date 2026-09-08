@@ -1150,7 +1150,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// compression alone is right for all of them (DECISIONS D14).
 	config.AddExtensionOption("factorize_min_gain",
 	                          "Fire only when factorizing is predicted to beat the stock plan by this factor",
-	                          LogicalType::DOUBLE, Value::DOUBLE(1.5));
+	                          LogicalType::DOUBLE, Value::DOUBLE(1.2));
 	// How far past its own size estimate the representation may grow before the
 	// operator abandons and lets the replaced plan answer. The gate is a
 	// prediction; this bounds the cost of it being wrong. 0 disables.
@@ -1203,7 +1203,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	config.AddExtensionOption("factorize_min_work_ms",
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",
-	                          LogicalType::DOUBLE, Value::DOUBLE(10.0));
+	                          LogicalType::DOUBLE, Value::DOUBLE(5.0));
 	config.AddExtensionOption("factorize_explain",
 	                          "Print, per aggregate, whether the factorize rule took the plan over and why not",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
