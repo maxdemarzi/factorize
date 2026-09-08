@@ -2152,3 +2152,108 @@ left the estimate budget as an earlier query on the same thread had it — these
 limits are thread-local, and `factorized_count` could therefore abandon against a
 prediction made for a different query entirely. `SetGlobalLimits` now takes all
 three together, which is what makes the omission impossible to write again.
+
+## D38 — The compression floor is overfit, and a matched pair says why
+
+D37 swept `factorize_min_compression` end to end and shipped 0.6. The sweep was
+honest and the number was still wrong, because both the calibration and the
+evaluation used the same 12 queries -- the ones the gate happens to fire on in
+the 119-query runnable corpus.
+
+Run against the population it was not fitted on, it fails. The CE benchmark
+*disables* every query whose result exceeds 1e9 tuples; D15 says that regime is
+what this engine is actually for. Of the 481 disabled queries, 390 have their
+tables loaded and **248 fire**. With the floor at 0.6:
+
+    227  ran factorized
+     17  abandoned by the floor
+      4  hit the pre-existing estimate budget or memory cap
+
+Every one of the 17 is a query DuckDB does not finish inside 180 seconds, so
+each abandonment trades about a second for never. Their compressions:
+
+    0.378  0.379  0.381  0.391  0.458  0.500 x5  0.526  0.553  0.555
+    0.584  0.594  0.600  0.600
+
+`watdiv_217_01`, the +5.4s in-sample loss the floor existed to catch, sits at
+**0.403 -- inside that range**. There is no threshold that separates them.
+
+**The matched pair.** `watdiv_216_10` loses (0.598s stock, 0.998s factorized).
+`watdiv_216_01` is one of the 17: DuckDB cannot answer it at all. Their
+per-join traces:
+
+    216_10   comp 0.50 0.98 0.97 0.49 0.33 0.25   growth - 24.5 32.5 2.0 0.9 1.2
+    216_01   comp 0.50 0.33 1.00 0.50 0.33 0.25   growth - 23.5 32.6 2.0 1.2 -
+
+Indistinguishable on compression and on record growth; opposite verdicts. And
+record growth fares no better as a statistic in its own right: `watdiv_217_01`
+grows records 28.7x at its last join and must be abandoned, while
+`hetio_205_08` grows them 28.3x and must not.
+
+> No function of the representation's per-join statistics separates them,
+> because the two queries build nearly the same representation. What differs is
+> what the *stock* plan costs, and nothing on our side can see that.
+
+The default goes back to 0. The mechanism, the setting, the tests and
+`factorized_steps` stay -- a user who knows their workload can set it, and the
+abandonment path is exercised either way.
+
+**The instrument that should have existed first.** Per-join numbers were only
+ever observable through `factorized_steps`, which plans from a relation *list*
+rather than from bound SQL. That is a different join order, and per-join
+compression is a property of the order -- which is how D37's first calibration
+came out four times too high. The only other way to see the operator's own
+numbers was to make it fail and read the message. `factorize_explain` now prints
+them, and the matched pair above is the first thing it found.
+
+## D39 — Eight filtering passes over the input, on one thread, by default
+
+`watdiv_217_01` ran 6.820s against a 1.415s stock plan. D37 built a whole
+run-time gate to abandon it. The actual cause was one line.
+
+    idx_t slices = TaskScheduler::GetScheduler(context).NumberOfThreads();
+
+`ParallelSource()` returns `children.empty()`, and the operator carries the §7.5
+fallback as a child whenever `factorize_fallback` is on -- which is the default,
+because a source that may have to drive the fallback's pipeline cannot be
+parallel (D30). So the slice count was set from the thread count while the
+operator was not allowed to use more than one thread. One thread then executed
+all eight buckets in sequence, and since every bucket has to look at every row
+to find its own, that is **eight full filtering passes over the input for no
+parallelism whatsoever**.
+
+Both halves are correct on their own, which is why it survived. It was found by
+stack sampling under gdb, which put 21 of 30 working samples in
+`SlicedSource::Columns` and two in the storage scan it wraps.
+
+    two relations, 7.78M rows, forced
+    8 buckets on 1 thread (default)   0.574s
+    8 buckets, fallback off, parallel 0.121s
+    1 bucket  on 1 thread             0.115s
+
+The fix is to read the thread count only when the operator is actually a
+parallel source. The 12 queries the gate fires on, re-timed:
+
+    query                  stock    before    after   speedup   was
+    epinions_215_04        0.612    0.109     0.023    26.6x    5.6x
+    epinions_215_12        0.581    0.036     0.018    32.3x   16.1x
+    hetio_222_16           3.298    0.184     0.135    24.4x   17.5x
+    hetio_205_00           0.298    0.128     0.038     7.8x    2.3x
+    watdiv_212_05          1.020    0.884     0.519     2.0x    1.2x
+    watdiv_201_10          0.177    0.608     0.180     1.0x    0.29x
+    watdiv_217_01          1.415    6.820     1.502     0.9x    0.21x
+
+Corpus total 21.66s stock, 17.26s with `auto` -- **1.25x, and with the
+compression floor switched off**. D37's floor bought 1.16x by abandoning the
+symptom of this bug.
+
+> The +5.4s regression that justified building a run-time gate was eight
+> redundant passes over a column, not a bad join order and not a failure to
+> compress.
+
+**What this invalidates.** Every timing this project has taken of the factorized
+path was taken with this tax in place, including the ones D34 fitted the cost
+model's coefficients against. They now over-estimate our cost in a known
+direction, which makes the gate decline queries it should fire on -- and the
+gate firing on only 12 of 119 queries is what made every calibration in D37 and
+D38 statistically hopeless in the first place.

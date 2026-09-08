@@ -117,6 +117,7 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	}
 	factorized.estimate_budget_bytes = estimate_budget_bytes;
 	factorized.min_compression = min_compression;
+	factorized.explain_steps = explain_steps;
 	factorized.grouped = grouped;
 	factorized.group_types = group_types;
 	factorized.group_keys = group_keys;

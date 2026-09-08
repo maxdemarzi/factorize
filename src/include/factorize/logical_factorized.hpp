@@ -71,6 +71,8 @@ public:
 	//! Least compression a materialized join must reach for the plan to carry
 	//! on; 0 = no check. Measured after the join rather than predicted before it.
 	double min_compression = 0;
+	//! Print what each materialized join left behind, for factorize_explain.
+	bool explain_steps = false;
 	//! The join order, decided when the region was matched. Ordering at match
 	//! time is what lets an unorderable graph be a decline instead of a query
 	//! that fails partway through executing.

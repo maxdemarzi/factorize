@@ -1064,7 +1064,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					// so a floor that applied under FORCE would quietly turn the
 					// whole SQL suite into a test of the fallback, passing all
 					// the way and covering nothing (D25, D26 again).
-					replacement->min_compression = gated ? DoubleSetting(context, "factorize_min_compression", 0.6) : 0.0;
+					replacement->min_compression = gated ? DoubleSetting(context, "factorize_min_compression", 0.0) : 0.0;
+					replacement->explain_steps = explain;
 					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
 					if (slack > 0 && predicted_bytes > 0) {
 						const double budget = predicted_bytes * slack;
@@ -1173,12 +1174,22 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// representation after a join has built it, so it cannot be wrong about
 	// what happened; it can only be wrong about what happens next.
 	//
-	// 0.6 is measured end to end, not fitted to a threshold. Swept over the 12
-	// queries the gate fires on, every floor in [0.45, 0.8] beats the stock
-	// plan on total corpus time and 0.6 is the best of them: 18.68s against
-	// 21.66s stock, where firing without the check costs 24.70s. It abandons
-	// four losses -- including the 5.4s regression that no gate setting had
-	// ever caught -- and forfeits one 0.16s win (D37).
+	// Off by default, and that is a measurement rather than caution.
+	//
+	// Swept over the 12 queries the gate fires on, 0.6 was the best floor and a
+	// real improvement: 18.68s against 21.66s stock, where firing with no
+	// run-time check costs 24.70s. Then it was run against the 248 queries the
+	// CE benchmark *disables* for exceeding 1e9 result tuples -- the regime D15
+	// says this engine is actually for, and the one no floor had ever seen. It
+	// abandoned 17 of them. Every one is a query DuckDB does not finish inside
+	// 180 seconds, so each abandonment trades about a second for never.
+	//
+	// Their compressions run 0.378 to 0.600, and the in-sample loss the floor
+	// was worth catching -- watdiv_217_01, +5.4s -- sits at 0.403, inside that
+	// range. So no threshold on compression alone separates them, and the 0.6
+	// that looked so clean was a 6%-wide coincidence in a sample of twelve
+	// (D38). The mechanism stays, exposed and tested; the number does not,
+	// until a rule exists that survives the population it was not fitted on.
 	//
 	// Under 1, which is the part that is not intuitive: a record holding less
 	// than one tuple is normal early on, because records grow by a sum over
@@ -1188,7 +1199,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	config.AddExtensionOption("factorize_min_compression",
 	                          "Abandon to the stock plan when a materialized join leaves fewer than this many "
 	                          "tuples per record, measured rather than predicted (0 disables)",
-	                          LogicalType::DOUBLE, Value::DOUBLE(0.6));
+	                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
 	config.AddExtensionOption("factorize_min_work_ms",
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",

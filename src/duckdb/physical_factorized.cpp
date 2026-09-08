@@ -146,7 +146,19 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	// only add passes over the input; fewer would leave threads idle. A
 	// single-threaded database gets exactly the old behaviour: one bucket
 	// covering everything.
-	idx_t slices = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	// One bucket per thread this query is *allowed to use*, which is one when
+	// the operator is not a parallel source at all.
+	//
+	// Reading NumberOfThreads() unconditionally was a 5x penalty on the default
+	// settings and it hid in plain sight, because both halves of it are correct
+	// on their own. Carrying the §7.5 fallback makes ParallelSource() false
+	// (D30): a source that may have to drive the fallback's pipeline cannot be
+	// parallel. So with the fallback on -- the default -- one thread executed
+	// all eight buckets in sequence, and since every bucket has to look at every
+	// row to find its own, that is eight full filtering passes over the input
+	// for no parallelism whatsoever. Measured on a 7.8M-row two-relation join:
+	// 0.574s at eight buckets on one thread, 0.115s at one.
+	idx_t slices = ParallelSource() ? TaskScheduler::GetScheduler(context).NumberOfThreads() : 1;
 	if (slices < 1) {
 		slices = 1;
 	}
@@ -174,6 +186,34 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 //! For a DECIMAL the total is already in units of the scale -- the stored
 //! integers were summed and the scale never moved -- so it is reapplied here,
 //! once, by constructing the value rather than by dividing.
+//! What each materialized join left behind, under the plan the rule built.
+//!
+//! This exists because its absence cost three separate wrong conclusions. The
+//! per-step numbers were only ever observable through `factorized_steps`, which
+//! plans from a relation *list* rather than from bound SQL -- a different join
+//! order, and per-step compression is a property of the order. A floor
+//! calibrated against it came out four times too high, and the only other way
+//! to see the operator's own numbers was to make it fail and read the message.
+//!
+//! Per slice, and said so: a bucket is a fraction of the data, and averaging
+//! the buckets would invent a query none of them ran.
+static void PrintSteps(const factorize::ExecuteResult &result, idx_t slice) {
+	string line = "[factorize] slice " + to_string(slice) + ": ";
+	if (result.steps.empty()) {
+		line += "no materialized joins (the only join was fused into the count)";
+	}
+	for (const auto &step : result.steps) {
+		line += StringUtil::Format("[%llu: %llu recs %llu live %lld tuples %.3fx] ",
+		                           static_cast<uint64_t>(step.relation), static_cast<uint64_t>(step.records),
+		                           static_cast<uint64_t>(step.live), static_cast<long long>(step.tuples),
+		                           step.Compression());
+	}
+	if (!result.ok) {
+		line += "-> " + result.error;
+	}
+	Printer::Print(line);
+}
+
 static Value FoldedValue(int64_t total, const LogicalType &type) {
 	if (type.id() == LogicalTypeId::DECIMAL) {
 		return Value::DECIMAL(hugeint_t(total), DecimalType::GetWidth(type), DecimalType::GetScale(type));
@@ -432,6 +472,9 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	const auto result = factorize::ExecuteCountSliceWithinMemory(graph, plan, source,
 	                                                             factorize::JoinMode::BOTTOM_INSERT, slice,
 	                                                             gstate.slices);
+	if (explain_steps) {
+		PrintSteps(result, slice);
+	}
 
 	idx_t completed;
 	{

@@ -610,7 +610,31 @@ public:
 			return columns;
 		}
 		const auto &keys = columns[static_cast<size_t>(key_column[relation])];
-		held.assign(columns.size(), {});
+		// Cleared and reserved, never re-assigned. `held.assign(n, {})` freed
+		// these buffers on every relation, so each one re-grew from nothing
+		// through push_back's doubling and faulted in every page again -- the
+		// D36 bug, in the second place it was written and the more expensive of
+		// the two: this runs once per relation *per slice*, so on eight threads
+		// the whole input was re-allocated eight times over. Stack sampling put
+		// 21 of 30 working samples right here while the storage scan it wraps
+		// got two.
+		//
+		// The reserve is the expected share, not the whole relation: the point
+		// of a bucket is that it holds about 1/slices of the rows, and reserving
+		// for all of them would commit `slices` times the memory the slicing was
+		// asked for. A bucket that runs over grows once, from a capacity that is
+		// already close.
+		if (held.size() != columns.size()) {
+			held.assign(columns.size(), {});
+		} else {
+			for (auto &column : held) {
+				column.clear();
+			}
+		}
+		const size_t share = slices == 0 ? keys.size() : keys.size() / slices + 1;
+		for (auto &column : held) {
+			column.reserve(share);
+		}
 		for (size_t row = 0; row < keys.size(); row++) {
 			if (HashKey(static_cast<uint64_t>(keys[row])) % slices != slice) {
 				continue;

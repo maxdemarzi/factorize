@@ -44,6 +44,8 @@ public:
 	//! Least compression a materialized join must reach for the plan to carry
 	//! on; 0 = no check. Measured after the join rather than predicted before it.
 	double min_compression = 0;
+	//! Print what each materialized join left behind, for factorize_explain.
+	bool explain_steps = false;
 	bool grouped = false;
 	//! One per key, in the aggregate's order, which is the answer's order.
 	vector<LogicalType> group_types;

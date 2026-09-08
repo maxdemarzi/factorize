@@ -153,24 +153,29 @@ Measured on 194 CE queries with both engines timed:
 
 Five-fold cross-validation reproduces this exactly, so it is not overfit.
 
-And then it was, on data the fit had not seen. On the CE corpus every prediction
-the gate can make is wrong by orders of magnitude on exactly the queries that
-lose, and no setting of any threshold repaired it — swept end to end, firing
-under the gate left the corpus **slower than not factorizing at all**. What
-worked was to stop predicting: after each join the operator reads the tuples the
-representation denotes against the records holding them, and abandons to the
-stock plan when that ratio is below `factorize_min_compression`. It costs 4–75ms
-when it fires, because the join has already computed every subtree size.
+And then it was, on data the fit had not seen. Firing under the gate left the
+corpus **slower than not factorizing at all** — 24.70s against a 21.66s stock
+baseline — and no setting of any threshold repaired it. Two rounds of trying to
+build a better decision rule (D37, D38) produced a run-time check that survives
+as a setting and a negative result that closes the question: no statistic of the
+representation separates the queries that lose from the ones where factorizing
+is the only way to get an answer, because they build nearly the same
+representation.
+
+The gap was never the decision. It was one line in the operator: the slice count
+was read from the thread count while the operator was not allowed to use more
+than one thread, so a single thread made **eight full filtering passes over the
+input** for no parallelism at all.
 
 | | corpus, 119 queries | vs stock |
 |---|---|---|
 | factorize off | 21.66 s | — |
-| auto, no run-time check | 24.70 s | 0.88× |
-| **auto + compression floor** | **18.68 s** | **1.16×** |
+| auto, before | 24.70 s | 0.88× |
+| **auto, after** | **17.26 s** | **1.25×** |
 
-The worst single regression falls from +5.42s to +0.55s. DECISIONS D37 has the
-calibration, including the first attempt at it being measured against the wrong
-join order and getting the threshold four times too high.
+`watdiv_217_01` went 6.820s → 1.502s and the worst regression is now +0.40s.
+DECISIONS D39 has it, D38 has the negative result, and both are worth reading
+for how long the symptom was mistaken for the disease.
 
 ## Read FINDINGS.md
 
@@ -191,8 +196,10 @@ Also worth knowing before trusting any number here:
   supported way to replace them.
 - **O12 / F19** — flat estimation over-predicts on uniform data by up to 84×.
   Three fixes were measured and rejected; it needs a joint-presence sketch or a
-  runtime bail-out, not a better decision rule. The run-time bail-out is now
-  built and is what makes the table above come out the right way round (D37).
+  runtime bail-out, not a better decision rule. The run-time bail-out is built
+  (`factorize_min_compression`) and does not work either: measured out of
+  sample it abandons queries DuckDB cannot answer at all, and D38 has a matched
+  pair showing why no statistic of the representation can decide this.
 - Benchmarks come from one laptop, not the paper's 64-core Xeon.
 
 ## Building and testing
