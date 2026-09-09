@@ -28,7 +28,7 @@ off:  no answer in 180 seconds
 ```
 
 And what it is not worth: across the 119 CE queries whose results DuckDB *can*
-materialise, the engine is faster on 23 and the gate fires on 15, for **1.38×**
+materialise, the engine is faster on 23 and the gate fires on 35, for **1.71×**
 on the corpus. Firing on every match instead would be **0.04×** — 524s against
 22s — because for a `count(*)` DuckDB carries no payload columns through a join
 and counts empty tuples faster than this engine can build a representation. The
@@ -170,24 +170,30 @@ was read from the thread count while the operator was not allowed to use more
 than one thread, so a single thread made **eight full filtering passes over the
 input** for no parallelism at all.
 
-Fixing that, and then loosening the two thresholds that a systematically low
-cardinality estimate had been compounding:
+Fixing that got the corpus to 1.39×. The rest of the gap was one statistic. The
+gate compares two predictions and both are driven by an estimated join size, but
+the error does not bias them evenly — DuckDB's predicted cost is dominated by
+result *tuples*, ours by *records*, and records grow far more slowly, so
+under-estimating a skewed join shrinks DuckDB's side much harder than ours.
+Every such error argues against firing.
+
+D13 specified the fix in 2 sentences — a most-common-value list per join
+column — and the code that consumes it was written. The code that *supplies* it
+to the optimizer never was, and an empty list "degrades to exactly the old
+textbook estimator", silently. The gate spent its whole life running on the
+estimator that list was added to replace. It now samples 16,384 rows per join
+column, and asks the catalog as a second opinion whenever the sample says no.
 
 | | corpus, 119 queries | vs stock |
 |---|---|---|
 | factorize off | 22.17 s | — |
 | auto, before | 24.70 s | 0.88× |
-| **auto, now** | **16.12 s** | **1.38×** |
+| **auto, now** | **12.95 s** | **1.71×** |
 | a gate with perfect knowledge | 10.98 s | 2.02× |
 | firing on every match | 524.73 s | 0.04× |
 
-`watdiv_217_01` went 6.820s → 1.502s and the worst regression is now +0.32s.
-The gate fires on 15 of 119 where the engine wins 23, and the 5.1s still
-separating it from the oracle is the cardinality estimate rather than any
-threshold: DuckDB's predicted cost is dominated by result tuples and ours by
-records, records grow far more slowly, so under-estimating a skewed join shrinks
-DuckDB's side of the comparison much harder than ours and every such error
-argues against firing. DECISIONS D38–D40, and they are worth reading for how
+Measured end to end, so 12.95 s includes what the gate spends sampling.
+`watdiv_217_01` went 6.820 s → 1.502 s. DECISIONS D38–D41, worth reading for how
 long the symptom was mistaken for the disease.
 
 ## Read FINDINGS.md
