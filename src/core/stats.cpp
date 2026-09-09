@@ -116,7 +116,34 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
 	size.records = head_records + tail_records;
 	size.distinct = std::max(1.0, head_distinct + surviving);
 	size.column_records = std::move(column_records);
+	// Recomputed rather than accumulated above, because the loop that builds
+	// head_flat runs over the union of the MCVs and this has to be keyed and
+	// sorted for lookup. The same products, kept instead of summed away.
+	size.flat_by_value.reserve(values.size());
+	for (int64_t value : values) {
+		double product = 1;
+		for (const auto &column : group) {
+			product *= column.Frequency(value);
+		}
+		size.flat_by_value.emplace_back(value, product);
+	}
+	std::sort(size.flat_by_value.begin(), size.flat_by_value.end(),
+	          [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
+		          return a.first < b.first;
+	          });
+	size.tail_flat_per_value = tail_flat / std::max(1.0, surviving);
 	return size;
+}
+
+double GroupSize::FlatFor(int64_t value) const {
+	const auto found = std::lower_bound(flat_by_value.begin(), flat_by_value.end(), value,
+	                                    [](const std::pair<int64_t, double> &entry, int64_t v) {
+		                                    return entry.first < v;
+	                                    });
+	if (found != flat_by_value.end() && found->first == value) {
+		return found->second;
+	}
+	return tail_flat_per_value;
 }
 
 } // namespace factorize

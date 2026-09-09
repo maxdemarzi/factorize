@@ -170,22 +170,21 @@ struct CostThresholds {
 	EngineCost duckdb {0.0, 2.324e-5, 3.981e-6};
 	//! Fire only when we are predicted to beat DuckDB by this factor.
 	//!
-	//! 1.2 rather than 1.5, and the reason is not that the model got better.
-	//! Both sides of the comparison are driven by an estimated tuple count, and
-	//! on skewed data that estimate is low -- by 100x to 350x on the epinions
-	//! queries. It does not bias the comparison evenly: DuckDB's predicted cost
-	//! is dominated by *tuples* while ours is dominated by *records*, and
-	//! records grow far more slowly, so under-estimating cardinality shrinks
-	//! DuckDB's side much harder than ours. The error is therefore systematic
-	//! and always points the same way -- against firing.
+	//! 1.5, and it was briefly 1.2 for a reason worth recording: with the gate's
+	//! estimate biased low, a wide margin compounded the bias, and narrowing it
+	//! bought three wins. That was compensation for a broken input, not a better
+	//! threshold, and once the input was fixed the compensation became a cost.
+	//! Measured end to end over the corpus with the MCV sample in place, 1.5
+	//! comes out at 12.41s and 1.2 at 12.79s (D41).
 	//!
-	//! A wide margin compounds that. Measured over the 119-query corpus with
-	//! both engines timed, 1.5 leaves 17 wins on the table worth 5.4s, some of
-	//! them 92x. Narrowing to 1.2 adds three wins and no new losses; the worst
-	//! regression is unchanged at +0.32s. Checked, not tuned, against the 481
-	//! queries of the excluded regime, where firing more can only help because
-	//! DuckDB does not finish at all: 248 fired at 1.5 and 249 at 1.2 (D40).
-	double margin = 1.2;
+	//! The bias it was compensating for: both sides of the comparison are driven
+	//! by an estimated tuple count, and it does not bias them evenly. DuckDB's
+	//! predicted cost is dominated by *tuples* while ours is dominated by
+	//! *records*, and records grow far more slowly, so under-estimating
+	//! cardinality shrinks DuckDB's side much harder than ours -- every such
+	//! error argues against firing. Widening or narrowing a margin cannot fix
+	//! that; supplying the statistic the estimator was written to use can.
+	double margin = 1.5;
 	//! Bytes an f-representation record occupies: a fixed header plus a slot
 	//! per relation. Measured across 857 CE queries -- median 47 bytes overall,
 	//! rising from 37 at three relations to 64 at twelve.

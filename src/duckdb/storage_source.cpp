@@ -157,6 +157,71 @@ static void AppendColumn(const LogicalType &type, const UnifiedVectorFormat &for
 }
 
 
+//! Appends one chunk's surviving rows to `held`, keeping every column in
+//! step. Shared by the full read and the sampled one so the row-alignment
+//! rule below has exactly one implementation -- a second copy of it was a
+//! live data-corruption bug once already (D17).
+static void AppendChunk(const BoundRelation &bound, DataChunk &chunk, vector<idx_t> &kept,
+                        std::vector<std::vector<int64_t>> &held) {
+	// A relation's columns must stay row-aligned: held[0][k] and held[1][k]
+	// have to describe the same source row, because MakeScan zips them back
+	// together by shared index with no row id attached. Deciding a row's fate
+	// (kept or dropped) requires looking at every column *before* pushing any
+	// of them -- checking and pushing one column at a time, independently,
+	// drops rows from whichever columns happen to hold a NULL and
+	// desynchronizes every row after the first such NULL for a relation with
+	// more than one join column. This was a live bug (DECISIONS D17): filter
+	// once per row, across all columns, or not at all.
+	std::vector<UnifiedVectorFormat> formats(bound.columns.size());
+	for (idx_t c = 0; c < bound.columns.size(); c++) {
+		chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
+	}
+	// Which rows survive is decided first, for the whole chunk, so that the
+	// per-column work below can be a tight typed loop instead of a switch
+	// per value. Reading 18 million rows a row at a time, re-deciding the
+	// column's type for each one, was most of the runtime of a query whose
+	// join is supposed to be the expensive part.
+	// A NULL in a column the answer *carries* is not a row to drop, it is a
+	// row of the answer. Checked per chunk rather than per row, and only for
+	// the few columns where it can arise: whether such a column may be NULL
+	// at all was already decided from the statistics when the region was
+	// bound, so reaching this is the statistics having been wrong -- they
+	// cover committed row groups and not rows appended in this transaction.
+	// Throwing there is the point. A silently missing row would break the
+	// one contract this rule has, that turning it off changes only speed.
+	for (auto column : bound.no_null_columns) {
+		if (formats[column].validity.AllValid()) {
+			continue;
+		}
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			if (formats[column].validity.RowIsValid(formats[column].sel->get_index(row))) {
+				continue;
+			}
+			throw InvalidInputException(
+			    "factorize: %s.%s contains NULL, which this query needs to report as its own "
+			    "group and the representation cannot carry; SET factorize_mode='off' to run it",
+			    bound.alias, bound.column_names[column]);
+		}
+	}
+	kept.clear();
+	for (idx_t row = 0; row < chunk.size(); row++) {
+		bool all_valid = true;
+		for (idx_t c = 0; c < bound.columns.size() && all_valid; c++) {
+			all_valid = formats[c].validity.RowIsValid(formats[c].sel->get_index(row));
+		}
+		if (all_valid) {
+			kept.push_back(row);
+		}
+		// A NULL in any of this relation's join columns can never equal
+		// anything, so the row can never contribute to an inner join's count
+		// -- and it is dropped from every column at once, never one column at
+		// a time, which is the rule the row alignment above depends on.
+	}
+	for (idx_t c = 0; c < bound.columns.size(); c++) {
+		AppendColumn(chunk.data[c].GetType(), formats[c], kept, held[c]);
+	}
+}
+
 StorageSource::StorageSource(ClientContext &context_p, const vector<BoundRelation> &relations_p)
     : context(context_p), relations(relations_p) {
 }
@@ -197,6 +262,11 @@ factorize::ColumnStats StorageSource::Stats(size_t relation, size_t column) {
 	if (frequencies.size() > MCV_ENTRIES) {
 		frequencies.resize(MCV_ENTRIES);
 	}
+	// A sample reports its own numbers, unscaled, and says so through `rows`.
+	// Scaling is the caller's, because only the caller knows what the sample is
+	// a sample *of*: the scan applies pushed-down filters, so the fraction of
+	// the table this saw is not `sampled / GetTotalRows()`, and the filtered
+	// row count lives in the plan rather than in storage.
 	stats.distinct = std::max(1.0, distinct);
 	stats.mcv = std::move(frequencies);
 	return stats;
@@ -274,74 +344,33 @@ void StorageSource::Load(size_t relation) {
 		return;
 	}
 
+	total_rows = static_cast<double>(expected_rows);
+	sampled_rows = 0;
+
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), types);
 	while (true) {
 		chunk.Reset();
 		storage.Scan(transaction, chunk, state);
+		if (sample_limit != 0 && chunk.size() > 0) {
+			// One chunk per scan range, then move on. Taking consecutive chunks
+			// instead would sample a prefix, and a table clustered on the join
+			// key would report a head that is an artefact of load order.
+			sampled_rows += static_cast<double>(chunk.size());
+			AppendChunk(bound, chunk, kept, held);
+			if (sampled_rows >= static_cast<double>(sample_limit) ||
+			    storage.NextParallelScan(context, parallel, state) == 0) {
+				break;
+			}
+			continue;
+		}
 		if (chunk.size() == 0) {
 			if (storage.NextParallelScan(context, parallel, state) == 0) {
 				break;
 			}
 			continue;
 		}
-		// A relation's columns must stay row-aligned: held[0][k] and held[1][k]
-		// have to describe the same source row, because MakeScan zips them back
-		// together by shared index with no row id attached. Deciding a row's fate
-		// (kept or dropped) requires looking at every column *before* pushing any
-		// of them -- checking and pushing one column at a time, independently,
-		// drops rows from whichever columns happen to hold a NULL and
-		// desynchronizes every row after the first such NULL for a relation with
-		// more than one join column. This was a live bug (DECISIONS D17): filter
-		// once per row, across all columns, or not at all.
-		std::vector<UnifiedVectorFormat> formats(bound.columns.size());
-		for (idx_t c = 0; c < bound.columns.size(); c++) {
-			chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
-		}
-		// Which rows survive is decided first, for the whole chunk, so that the
-		// per-column work below can be a tight typed loop instead of a switch
-		// per value. Reading 18 million rows a row at a time, re-deciding the
-		// column's type for each one, was most of the runtime of a query whose
-		// join is supposed to be the expensive part.
-		// A NULL in a column the answer *carries* is not a row to drop, it is a
-		// row of the answer. Checked per chunk rather than per row, and only for
-		// the few columns where it can arise: whether such a column may be NULL
-		// at all was already decided from the statistics when the region was
-		// bound, so reaching this is the statistics having been wrong -- they
-		// cover committed row groups and not rows appended in this transaction.
-		// Throwing there is the point. A silently missing row would break the
-		// one contract this rule has, that turning it off changes only speed.
-		for (auto column : bound.no_null_columns) {
-			if (formats[column].validity.AllValid()) {
-				continue;
-			}
-			for (idx_t row = 0; row < chunk.size(); row++) {
-				if (formats[column].validity.RowIsValid(formats[column].sel->get_index(row))) {
-					continue;
-				}
-				throw InvalidInputException(
-				    "factorize: %s.%s contains NULL, which this query needs to report as its own "
-				    "group and the representation cannot carry; SET factorize_mode='off' to run it",
-				    bound.alias, bound.column_names[column]);
-			}
-		}
-		kept.clear();
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			bool all_valid = true;
-			for (idx_t c = 0; c < bound.columns.size() && all_valid; c++) {
-				all_valid = formats[c].validity.RowIsValid(formats[c].sel->get_index(row));
-			}
-			if (all_valid) {
-				kept.push_back(row);
-			}
-			// A NULL in any of this relation's join columns can never equal
-			// anything, so the row can never contribute to an inner join's count
-			// -- and it is dropped from every column at once, never one column at
-			// a time, which is the rule the row alignment above depends on.
-		}
-		for (idx_t c = 0; c < bound.columns.size(); c++) {
-			AppendColumn(chunk.data[c].GetType(), formats[c], kept, held[c]);
-		}
+		AppendChunk(bound, chunk, kept, held);
 	}
 }
 

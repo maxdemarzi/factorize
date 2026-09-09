@@ -1,6 +1,7 @@
 #include "factorize/optimizer_rule.hpp"
 
 #include "factorize/logical_factorized.hpp"
+#include "factorize/storage_source.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -920,7 +921,37 @@ public:
 		throw InternalException("the factorize gate must not read data");
 	}
 
+	//! Read the join columns and compute exact statistics instead.
+	//!
+	//! Off by default and not a shipping default in this form -- it scans every
+	//! relation to decide whether to scan every relation. It exists because D13
+	//! named a dependency that was then never built ("the optimizer rule has to
+	//! sample max-frequency per join column or add the statistic"), and the
+	//! consequence is invisible from outside: with no MCV list the estimator
+	//! silently degrades to the textbook formula F14 measured at 2814x low.
+	//! This measures what the gate would decide if it had the statistic, which
+	//! is the number a sampler has to be judged against (D41).
+	void UseExactStatistics() {
+		exact = make_uniq<StorageSource>(context, relations);
+	}
+
+	//! Read a bounded, spread sample of each join column and take its MCV list.
+	//!
+	//! Rows and distinct counts still come from the catalog: DuckDB's
+	//! cardinality estimate already accounts for the filters on each scan, and
+	//! its distinct sketch covers the whole column, both of which a sample
+	//! answers worse. What the catalog does not have, and what the estimator
+	//! actually needed all along, is the *shape* of the distribution -- and a
+	//! heavy tail puts its head in any reasonable sample (D13, D41).
+	void UseSampledStatistics(idx_t rows) {
+		exact = make_uniq<StorageSource>(context, relations);
+		exact->SetSampleLimit(rows);
+	}
+
 	factorize::ColumnStats Stats(size_t relation, size_t column) override {
+		if (exact && !exact->Sampled()) {
+			return exact->Stats(relation, column);
+		}
 		factorize::ColumnStats stats;
 		auto &get = region.relations[relation].get();
 		stats.rows = static_cast<double>(get.EstimateCardinality(context));
@@ -949,13 +980,90 @@ public:
 			}
 		}
 		stats.distinct = stats.distinct < 1 ? 1 : stats.distinct;
+		if (exact && !suppress_sample) {
+			// The sample's frequencies are of the sample; the estimator's are of
+			// the relation. One multiplication by the ratio, taken against the
+			// catalog's filter-aware row count rather than the table's size,
+			// because the sampling scan applies the same pushed-down filters.
+			auto sampled = exact->Stats(relation, column);
+			const double scale = sampled.rows > 0 ? stats.rows / sampled.rows : 0.0;
+			if (scale > 0) {
+				// A value the sample saw a handful of times is not a hub, it is
+				// noise, and scaling it up is how noise becomes a hub. At 65,536
+				// rows out of 4.5M the multiplier is about 68, so a single
+				// sighting would be reported as 68 occurrences -- and the
+				// estimator multiplies these across every relation in a class,
+				// so the error compounds. Unfiltered, this fired on 49 of 119
+				// queries against an oracle of 23.
+				//
+				// 30 sightings is where the relative standard error of a count
+				// falls to about 1/sqrt(30), under 20%. Below it the value is
+				// left to the tail, which is what the tail is for: the MCV list
+				// is supposed to hold the values worth being exact about, and a
+				// value the sample cannot measure is not one of them.
+				static constexpr double kMinSightings = 30.0;
+				std::vector<std::pair<int64_t, double>> head;
+				double head_rows = 0;
+				for (const auto &entry : sampled.mcv) {
+					if (entry.second >= kMinSightings) {
+						head.emplace_back(entry.first, entry.second * scale);
+						head_rows += head.back().second;
+					}
+				}
+				// The head and the tail have to add up, and here they come from
+				// different places: the head is the sample's, the row and
+				// distinct counts are the catalog's. Nothing made them agree,
+				// and when a scaled head swallowed every row the tail was left
+				// with none -- at which point `Frequency` returns *zero* for
+				// every value it did not store, the class product collapses, and
+				// the gate declines a query reporting "estimated 0 tuples in 28M
+				// records". A representation of 28M records denotes no tuples in
+				// no world; that is two sources of truth disagreeing, not an
+				// estimate.
+				//
+				// So leave a row for each value the head did not name. That is
+				// the least the catalog's own distinct count implies must be
+				// there, and it keeps the tail average positive, which is the
+				// only property the rest of the estimator needs from it.
+				const double unstored = stats.distinct - static_cast<double>(head.size());
+				const double room = stats.rows - std::max(0.0, unstored);
+				if (room <= 0) {
+					// Every value is its own row: a head is meaningless and the
+					// uniform model is exactly right.
+					head.clear();
+				} else if (head_rows > room) {
+					const double shrink = room / head_rows;
+					for (auto &entry : head) {
+						entry.second *= shrink;
+					}
+				}
+				stats.mcv = std::move(head);
+			}
+		}
 		return stats;
+	}
+
+	//! Whether a sample is in play, and therefore whether there is a second
+	//! opinion to ask for.
+	bool UsingSample() const {
+		return exact && exact->Sampled();
+	}
+
+	//! Answer from the catalog alone from here on. The sample is kept, not
+	//! dropped: re-reading it would double the gate's cost to ask a question
+	//! about numbers already in hand.
+	void UseCatalogOnly() {
+		suppress_sample = true;
 	}
 
 private:
 	ClientContext &context;
 	const FactorizedRegion &region;
 	const vector<BoundRelation> &relations;
+	//! Set by UseExactStatistics or UseSampledStatistics; the first scans, which
+	//! is why it is not the default.
+	unique_ptr<StorageSource> exact;
+	bool suppress_sample = false;
 };
 
 static double DoubleSetting(ClientContext &context, const char *name, double fallback) {
@@ -982,6 +1090,17 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
                        const factorize::QueryGraph &graph, const factorize::Plan &plan, string &reason,
                        double &predicted_bytes) {
 	CatalogStats stats(context, region, relations);
+	// The statistic D13 asked for and nobody built. Sampled by default because a
+	// gate that scans every relation to decide whether to scan every relation is
+	// not a gate; exact is kept as the measurement it was calibrated against.
+	if (BooleanSetting(context, "factorize_gate_exact_stats")) {
+		stats.UseExactStatistics();
+	} else {
+		const auto sample = static_cast<idx_t>(DoubleSetting(context, "factorize_gate_sample_rows", 16384));
+		if (sample > 0) {
+			stats.UseSampledStatistics(sample);
+		}
+	}
 	factorize::CostThresholds thresholds;
 	thresholds.margin = DoubleSetting(context, "factorize_min_gain", thresholds.margin);
 	thresholds.min_duckdb_work_ms = DoubleSetting(context, "factorize_min_work_ms", thresholds.min_duckdb_work_ms);
@@ -993,7 +1112,32 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	reason = estimate.reason;
 	predicted_bytes = estimate.bytes;
-	return estimate.fire;
+	if (estimate.fire || !stats.UsingSample()) {
+		return estimate.fire;
+	}
+
+	// The sample said no. Ask the catalog too, and fire if either says yes.
+	//
+	// Not symmetry for its own sake -- this is the one direction the estimator's
+	// error is known to run. Under-predicting a join argues against firing (D40),
+	// so an estimate that declines is the one more likely to be wrong, and two
+	// independent under-estimates are still under-estimates. Taking the better of
+	// them can only move the gate toward firing, which is where the measured
+	// bias says the mistakes are.
+	//
+	// It is also what keeps the sample from being a regression where it matters
+	// most. Sampling is worth 15.94s -> 12.41s on the corpus DuckDB can answer,
+	// and cost 7 fires out of 248 on the corpus it cannot -- queries where a
+	// decline means 180 seconds instead of one. Consulting both keeps all 249
+	// (D41).
+	stats.UseCatalogOnly();
+	const auto fallback = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
+	if (fallback.fire) {
+		reason = fallback.reason;
+		predicted_bytes = fallback.bytes;
+		return true;
+	}
+	return false;
 }
 
 //===--------------------------------------------------------------------===//
@@ -1150,7 +1294,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// compression alone is right for all of them (DECISIONS D14).
 	config.AddExtensionOption("factorize_min_gain",
 	                          "Fire only when factorizing is predicted to beat the stock plan by this factor",
-	                          LogicalType::DOUBLE, Value::DOUBLE(1.2));
+	                          LogicalType::DOUBLE, Value::DOUBLE(1.5));
 	// How far past its own size estimate the representation may grow before the
 	// operator abandons and lets the replaced plan answer. The gate is a
 	// prediction; this bounds the cost of it being wrong. 0 disables.
@@ -1204,6 +1348,16 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",
 	                          LogicalType::DOUBLE, Value::DOUBLE(5.0));
+	config.AddExtensionOption("factorize_gate_sample_rows",
+	                          "Rows per join column the gate samples to build its most-common-value list, spread "
+	                          "across the table; 0 uses the catalog alone, which has no such list and degrades the "
+	                          "estimator to the textbook formula",
+	                          LogicalType::DOUBLE, Value::DOUBLE(16384));
+	config.AddExtensionOption("factorize_gate_exact_stats",
+	                          "Have the gate read the join columns and compute exact statistics instead of using the "
+	                          "catalog, which has no MCV list; measurement only, it scans every relation to decide "
+	                          "whether to scan every relation",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("factorize_explain",
 	                          "Print, per aggregate, whether the factorize rule took the plan over and why not",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));

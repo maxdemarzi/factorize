@@ -2377,3 +2377,111 @@ more, never fewer.
 **What is left.** Thresholds recover 1.06s of the 6.2s between the shipped gate
 and a perfect one. The other 5.1s is the cardinality estimate, and no threshold
 reaches it. That remains the open problem it has been since F13.
+
+## D41 — The statistic D13 asked for was never built, and the gate has been running on the estimator it was meant to replace
+
+D40 established that the gate declines 17 wins worth 5.4s, all epinions, because
+DuckDB's predicted work is 100x to 350x low. Two things then ruled out the
+obvious explanations.
+
+**It is not our estimator being worse than DuckDB's.** DuckDB's own
+`estimated_cardinality`, which the rule could read for free since it runs
+post-optimizer, is 3x to 735x low on the same queries -- median 76x. Every
+estimator built on independence assumptions fails this data the same way.
+
+**It is not the cross-class fold, though that was worth fixing.** Grouping the
+119 queries by equivalence class count:
+
+    classes   queries   engine wins   gate fires   missed
+       1         17          2             3          0
+       2         11          2             0          2
+       3         17          5             0          5
+       4         20          8             4          5
+       5         22          5             3          4
+       6          9          1             1          1
+
+The gate is perfect on single-class queries and blind on multi-class ones; all
+17 missed wins have two classes or more. `EstimateCost` sizes each class with
+the MCV lists and then folds classes together with `child.flat /
+max(parent_distinct, child.distinct)`, commenting "Uniformity is fair here: the
+skew inside each class has already been accounted for". It is not fair -- a hub
+value appears in the parent thousands of times *and* carries thousands of child
+tuples, so the two skews multiply exactly where an average says they cancel.
+That is now weighted by the parent's own value distribution, with `GroupSize`
+keeping per-value sizes for the purpose.
+
+**And it changed nothing, which is how the real cause surfaced.** The estimates
+came back byte-identical, because `CatalogStats` -- the `RelationSource` the
+gate actually uses -- never populates `mcv` at all. It cannot: "the factorize
+gate must not read data".
+
+D13 named this dependency in as many words:
+
+> Consequence for Phase 3, and it is a real dependency the plan does not name:
+> **DuckDB's catalog carries approximate distinct counts but no MCV list.** The
+> optimizer rule has to sample max-frequency per join column or add the
+> statistic.
+
+It was never built, and D13 also records why nobody noticed: "`ColumnStats` with
+an empty `mcv` degrades to exactly the old textbook estimator, so this is a
+graceful fallback rather than a hard requirement". Graceful, silent, and the old
+textbook estimator is the one F14 measured at 2814x low and which "declined all
+48 sampled epinions queries". The gate has been running on the estimator F13 was
+written to replace, in the one place it matters, since Phase 3.
+
+**What the statistic is worth.** Measured by letting the gate read every
+relation exactly (`factorize_gate_exact_stats`, kept as the measurement it is):
+
+                          fires  wins  losses  missed   corpus   vs stock
+    catalog stats            15     9       6      14   16.12 s    1.38x
+    exact stats              23    19       4       4   11.48 s    1.93x
+    a perfect gate           23    23       0       0   10.98 s    2.02x
+
+95% of the achievable gain, from a statistic that was specified and skipped.
+
+**Sampling, which is what D13 actually asked for.** 16,384 rows per join column,
+one chunk taken from each of the table's parallel scan ranges -- spread rather
+than a prefix, because a prefix samples load order. Two things had to be right:
+
+*A sample is not a hub list.* Scaled straight up, a value seen once in a 1.5%
+sample is reported as 68 occurrences, and the estimator multiplies these across
+every relation in a class, so the error compounds: the first sampled build fired
+on 49 of 119 against an oracle of 23. Requiring 30 sightings before a value
+counts -- where a count's relative standard error falls under 20% -- took it to
+36. Below that a value belongs to the tail, which is what the tail is for.
+
+*A sample and a catalog must add up.* The head came from the sample, the row and
+distinct counts from the catalog, and nothing made them agree. When a scaled
+head swallowed every row, `TailRows()` hit zero and `Frequency` then returns
+**zero** for every unstored value -- the class product collapses and the gate
+declines reporting "estimated 0 tuples in 28M records". A representation of 28M
+records denotes no tuples in no world; that is two sources of truth disagreeing.
+The head is now clamped to leave one row for each value it did not name.
+
+**Ask both, and fire if either says yes.** Sampling alone was worth 15.94s ->
+12.41s in sample and cost 7 fires out of 248 in the excluded regime, where a
+decline means 180 seconds instead of one. That trade is bad however it is
+weighed. But the direction of the estimator's error is known -- under-predicting
+argues against firing (D40) -- so of two under-estimates the one that declines is
+the one more likely to be wrong. Consulting the catalog as a second opinion can
+only move the gate toward firing, which is where the measured mistakes are.
+
+    corpus, 119 queries          end to end     vs stock    excluded regime
+    factorize off                  22.17 s         --             --
+    auto, start of the day         24.70 s       0.88x            --
+    auto, after D39/D40            15.94 s       1.39x        248 of 481 fire
+    auto, with the sample          12.95 s       1.71x        252 of 481 fire
+    a perfect gate                 10.98 s       2.02x            --
+
+Measured end to end, so the 12.95s includes what the gate spends sampling --
+about 0.5s across 119 queries, against 3.0s bought.
+
+**And the margin goes back to 1.5.** D40 narrowed it to 1.2 to buy three wins
+back from a biased estimator. That was compensation for a broken input, and once
+the input was fixed it became a cost: 12.95s at 1.5 against 13.07s at 1.2. A
+threshold tuned to absorb an error in an input is a thing to undo when the input
+is fixed, not to keep.
+
+> Every calibration in D37, D38 and D40 was fitting thresholds to compensate for
+> a statistic that was specified in D13, measured to be worth 2814x, and then
+> not wired up.

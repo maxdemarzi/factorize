@@ -192,13 +192,40 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	for (const auto &edge : cross) {
 		const auto &child = sizes[edge.child_group];
 		const double parent_distinct = std::max(1.0, edge.parent_column.distinct);
-		const double divisor = std::max(parent_distinct, child.distinct);
 		const double contexts = std::max(1.0, node_records[edge.parent_step]);
 
-		// Uniformity is fair here: the skew inside each class has already been
-		// accounted for, and what is left is how many of the parent's values find
-		// a partner.
-		flat = flat * child.flat / divisor;
+		// How many partners one parent tuple finds, weighted by how often the
+		// parent actually carries each connecting value.
+		//
+		// This used to be `child.flat / max(parent_distinct, child.distinct)`,
+		// with the note that "uniformity is fair here: the skew inside each
+		// class has already been accounted for". It is not fair, and the corpus
+		// says so plainly: the gate gets every single-class query right and
+		// misses a win on almost every multi-class one -- 17 of them, worth
+		// 5.4s, at speedups up to 92x, every single one with two classes or
+		// more. Skew was taken out within a class and put straight back at the
+		// seam between classes (D41).
+		//
+		// The connecting value is not interchangeable on graph data. A hub
+		// value appears in the parent thousands of times *and* carries
+		// thousands of child tuples, so the two skews multiply exactly where
+		// the average says they cancel. Both distributions are already stored:
+		// the parent's in its MCV list, the child's in the per-value sizes
+		// EstimateGroup now keeps.
+		const double parent_rows = std::max(1.0, edge.parent_column.rows);
+		double partners = 0;
+		double head_share = 0;
+		for (const auto &entry : edge.parent_column.mcv) {
+			const double share = entry.second / parent_rows;
+			head_share += share;
+			partners += share * child.FlatFor(entry.first);
+		}
+		// Whatever the MCV list did not cover is uniform, which is what it is
+		// for. Clamped because an MCV list that covers everything must leave
+		// nothing for the tail, and rounding must not make that negative.
+		const double tail_share = std::max(0.0, 1.0 - head_share);
+		partners += tail_share * child.flat / std::max(parent_distinct, child.distinct);
+		flat = flat * partners;
 
 		// Each context carries one connecting value, so it instantiates the
 		// class's share of records for that value -- per relation, so a later

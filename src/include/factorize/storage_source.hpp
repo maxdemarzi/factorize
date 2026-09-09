@@ -122,6 +122,33 @@ public:
 	const std::vector<std::vector<int64_t>> &Columns(size_t relation) override;
 	factorize::ColumnStats Stats(size_t relation, size_t column) override;
 
+	//! Read at most this many rows per relation, spread across the table, and
+	//! scale the statistics back up. 0 reads everything, which is the default
+	//! and what execution needs.
+	//!
+	//! For the gate, which needs statistics rather than data. D13 asked for
+	//! this and it was never built: with no MCV list the estimator silently
+	//! degrades to the textbook formula, which F14 measured at up to 2814x low
+	//! and which declined every epinions query it was shown. Measured with
+	//! *exact* statistics the gate goes from 1.38x to 1.93x of stock on the CE
+	//! corpus, against 2.02x for a gate with perfect knowledge -- so the
+	//! statistic is worth almost the whole remaining gap, and a scan to get it
+	//! is not, which is what makes this a sample (D41).
+	//!
+	//! Spread, not a prefix: one chunk is taken from each of the table's
+	//! parallel scan ranges in turn. A prefix samples whatever was inserted
+	//! first, and a table clustered on the join key would report a head that is
+	//! an artefact of load order.
+	void SetSampleLimit(idx_t rows) {
+		sample_limit = rows;
+	}
+
+	//! Only sampled reads are usable as statistics; a caller that needs data
+	//! must not get a sample by accident.
+	bool Sampled() const {
+		return sample_limit != 0;
+	}
+
 private:
 	void Load(size_t relation);
 
@@ -129,6 +156,11 @@ private:
 	const vector<BoundRelation> &relations;
 	std::vector<std::vector<int64_t>> held;
 	size_t loaded_relation = static_cast<size_t>(-1);
+	idx_t sample_limit = 0;
+	//! Rows the table actually holds, and how many of them the sample read.
+	//! Frequencies are scaled by their ratio.
+	double total_rows = 0;
+	double sampled_rows = 0;
 	//! Row offsets surviving the NULL check in the chunk being read. A member
 	//! rather than a local so the allocation is made once, not per chunk.
 	vector<idx_t> kept;

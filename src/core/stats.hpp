@@ -88,6 +88,26 @@ struct GroupSize {
 	//! relation's node, not beneath the class as a whole -- and using the whole
 	//! class over-counts the contexts by the number of its siblings.
 	std::vector<double> column_records;
+
+	//! `flat`, but per key value, for the values the MCV lists stored.
+	//!
+	//! The class total is what sizing a class needs; what *combining* classes
+	//! needs is this. A class hanging below another is instantiated once per
+	//! connecting value, and on graph data the connecting values are not
+	//! interchangeable -- a hub carries thousands of tuples where a tail value
+	//! carries one. Averaging them is the uniformity assumption F14 calls a
+	//! category error, and it was still being made at every cross-class edge
+	//! after being removed from within a class (D41).
+	//!
+	//! Sorted by value, so lookup is a binary search rather than a hash.
+	std::vector<std::pair<int64_t, double>> flat_by_value;
+	//! Flat tuples a value nobody stored contributes. Uniformity is right here
+	//! for the same reason it is right inside a class: the tail is what is left
+	//! once the skew has been taken out.
+	double tail_flat_per_value = 0;
+
+	//! Flat tuples this class contributes for one connecting value.
+	double FlatFor(int64_t value) const;
 };
 
 //! Estimates one equivalence class exactly over the union of the stored MCVs
