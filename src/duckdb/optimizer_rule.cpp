@@ -1108,6 +1108,7 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// slices instead -- but it is still a reason to decline: every slice is
 	// another pass over the input, and the gate is a bet about time.
 	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
+	thresholds.memory_slack = DoubleSetting(context, "factorize_memory_slack", thresholds.memory_slack);
 	// BuildPlan has already refused anything that cannot be arranged as a tree.
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	reason = estimate.reason;
@@ -1344,6 +1345,11 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Abandon to the stock plan when a materialized join leaves fewer than this many "
 	                          "tuples per record, measured rather than predicted (0 disables)",
 	                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
+	config.AddExtensionOption("factorize_memory_slack",
+	                          "How far past the memory budget the predicted f-representation size may go before the "
+	                          "gate declines on size alone; the run time slices or abandons either way, so this only "
+	                          "guards against a query predicted to need many passes",
+	                          LogicalType::DOUBLE, Value::DOUBLE(64.0));
 	config.AddExtensionOption("factorize_min_work_ms",
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",

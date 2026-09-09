@@ -2485,3 +2485,70 @@ is fixed, not to keep.
 > Every calibration in D37, D38 and D40 was fitting thresholds to compensate for
 > a statistic that was specified in D13, measured to be worth 2814x, and then
 > not wired up.
+
+## D42 — The size pre-check was banning queries on a number that is 1,390x wrong
+
+With the statistic fixed (D41), the census of what the gate still declines is
+lopsided. Across the 481 queries of the excluded regime -- the >1e9-tuple corpus
+D15 says the engine is for -- **134 of 138 declines are the memory pre-check**,
+and only 4 are anything else.
+
+That check refuses a query whose predicted f-representation exceeds the memory
+budget. Measured against what those queries actually build:
+
+    query               predicted   actual bytes   over by   forced   DuckDB
+    hetio_203_16            24 GB        17.3 MB    1,390x     0.8s   no answer
+    hetio_203_19            16 GB        14.7 MB    1,090x     0.3s   no answer
+    hetio_204_02            25 GB         1.03 GB      24x     5.4s   no answer
+
+Identical with the MCV sample on and off, so this is not something D41
+introduced. It is the record recurrence: records are accumulated as
+`contexts * share` down the join tree, so the error compounds multiplicatively
+with depth. The same model's *tuple* estimate runs 100x low (D41) while its
+*record* estimate runs 1,000x high -- and they are not independent mistakes,
+they are one recurrence read in two directions.
+
+**Nothing about memory safety runs through this check.** Exceeding the real
+budget is handled twice at run time and has been since D20 and D34:
+`ExecuteCountSliceWithinMemory` partitions the join key and re-counts rather
+than failing, and the estimate budget abandons to the stock plan when the
+representation outgrows what the gate bet on. The pre-check exists only because
+slicing costs a pass over the input per slice -- a statement about *time*,
+resting on a number wrong by three orders of magnitude.
+
+**The check is also redundant with the margin, which is how this was safe to
+relax.** Of the 9 queries it declines on the runnable corpus, every one is a
+catastrophic loss -- 3.55s of stock plans against 381.5s forced, one of them
+0.550s against 256s -- so the check is doing real work there and must not stop.
+Raised to 64x, all 9 still decline: eight of them on the margin, reporting
+"predicted 104238ms against DuckDB's 200ms", and one still on size at 6TB. The
+size check and the margin read the same record estimate, so when it is huge both
+fire; the size check merely gets there first with a worse message.
+
+Out of sample the margin does *not* decline them, because there DuckDB's
+predicted cost is huge too and the ratio clears. So the two corpora want
+different answers from the same check, and only the pre-check was giving them
+the same one.
+
+    memory_slack   excluded regime   runnable corpus
+       1 (was)      252 of 481 fire   unchanged, verified per query
+       8            295
+      64 (now)      332
+    1024            354
+
+The runnable corpus total does not move at any of these -- and it cannot resolve
+a difference this small anyway: measured four settings in order and then in
+reverse, the totals fell monotonically with *position* both times, 15.02s down
+to 12.85s forwards and 12.99s down to 12.11s backwards. That is cache warming
+across whole-corpus passes, not the setting, and it is why the per-query check
+above is the evidence and the corpus total is not.
+
+64 is chosen against the measured over-prediction rather than as a round number:
+at roughly 1,000x over, a 64x slack still corresponds to about 0.06x of the real
+budget. It admits queries predicted up to 832GB and leaves the one predicted at
+6TB declined.
+
+**What is not known.** The benefit rests on a 12-query sample of the 80 newly
+admitted: 10 answered, in 0.3s to 219s, on queries DuckDB does not finish inside
+180s; 2 hit a 300s timeout. Running all 80 to completion is hours, and has not
+been done.

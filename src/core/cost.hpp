@@ -204,6 +204,30 @@ struct CostThresholds {
 	//! bytes is no better than predicting records alone (0.875 vs 0.874) -- the
 	//! width term buys nothing but a number in the units budgets are set in.
 	double memory_budget_bytes = 0;
+	//! How far past the budget the *prediction* may go before the gate declines
+	//! on size alone.
+	//!
+	//! Not a safety margin -- nothing about memory safety runs through here.
+	//! Exceeding the real budget is handled twice at run time already:
+	//! ExecuteCountSliceWithinMemory partitions the join key and re-counts
+	//! rather than failing (D20), and D34's estimate budget abandons to the
+	//! stock plan when the representation outgrows what the gate bet on. This
+	//! check exists only because slicing costs a pass over the input per slice,
+	//! so a query predicted not to fit is predicted to be slow.
+	//!
+	//! It is set to 64 because the prediction is not good enough to ban a query
+	//! on. Measured against what those queries actually build: `hetio_203_16`
+	//! is predicted at 24GB and holds 17MB, over by 1,390x; `hetio_203_19` at
+	//! 16GB against 15MB, over by 1,090x. Both answer in under a second, and
+	//! DuckDB answers neither at all. On the corpus the CE benchmark disables,
+	//! 134 of 138 declines were this one check firing on numbers like those.
+	//!
+	//! The direction of the error is what settles the value. A record count
+	//! comes out of a recurrence that multiplies down the join tree, so its
+	//! errors compound upward, while the tuple estimate feeding the same model
+	//! runs 100x *low* (D41). Being over by three orders of magnitude is the
+	//! normal case, not the tail.
+	double memory_slack = 64.0;
 	//! Refuse cyclic join graphs.
 	bool require_acyclic = true;
 	//! Decline when the work DuckDB is predicted to do -- its per-row and

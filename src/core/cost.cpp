@@ -262,9 +262,11 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	}
 	// Checked before the margin, because "will not fit" is a different answer
 	// from "will not pay" and deserves to say so.
-	if (thresholds.memory_budget_bytes > 0 && estimate.bytes > thresholds.memory_budget_bytes) {
+	const double size_limit = thresholds.memory_budget_bytes * std::max(1.0, thresholds.memory_slack);
+	if (thresholds.memory_budget_bytes > 0 && estimate.bytes > size_limit) {
 		estimate.reason = "predicted " + Format(estimate.bytes) + "B of f-representation, over the " +
-		                  Format(thresholds.memory_budget_bytes) + "B budget";
+		                  Format(thresholds.memory_budget_bytes) + "B budget by more than " +
+		                  Millis(thresholds.memory_slack) + "x";
 		return estimate;
 	}
 	// Before the margin, because a query too small to matter is not a query we

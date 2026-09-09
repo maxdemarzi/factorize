@@ -321,13 +321,32 @@ static void TestMemoryBudget() {
 	Check(unlimited.fire, "with no budget this query should fire");
 	Check(unlimited.bytes > 0, "bytes must be estimated");
 
+	// Over the budget is not itself a refusal, and has not been since D42. The
+	// run time slices or abandons either way, so this check is only about a
+	// query predicted to need many passes -- and the prediction it rests on was
+	// measured 1,390x over on real data, which is why it now takes a slack
+	// factor rather than banning at 1x.
 	CostThresholds tight = generous;
 	tight.memory_budget_bytes = unlimited.bytes / 2;
-	const auto refused = EstimateCost(steps, true, tight);
-	std::printf("  %.4g bytes predicted, budget %.4g -> %s (%s)\n", refused.bytes, tight.memory_budget_bytes,
-	            refused.fire ? "FIRE" : "decline", refused.reason.c_str());
-	Check(!refused.fire, "over budget must decline");
+	const auto within = EstimateCost(steps, true, tight);
+	std::printf("  %.4g bytes predicted, budget %.4g, slack %.0fx -> %s\n", within.bytes,
+	            tight.memory_budget_bytes, tight.memory_slack, within.fire ? "FIRE" : "decline");
+	Check(within.fire, "twice the budget is inside the slack, so this must still fire");
+
+	CostThresholds refuse = generous;
+	refuse.memory_budget_bytes = unlimited.bytes / (2 * generous.memory_slack);
+	const auto refused = EstimateCost(steps, true, refuse);
+	std::printf("  %.4g bytes predicted, budget %.4g, slack %.0fx -> %s (%s)\n", refused.bytes,
+	            refuse.memory_budget_bytes, refuse.memory_slack, refused.fire ? "FIRE" : "decline",
+	            refused.reason.c_str());
+	Check(!refused.fire, "past the slack must decline");
 	Check(refused.reason.find("budget") != std::string::npos, "the reason must name the budget");
+
+	// And the slack is a setting, not a way of switching the check off: at 1x
+	// the old contract holds exactly.
+	CostThresholds strict = tight;
+	strict.memory_slack = 1.0;
+	Check(!EstimateCost(steps, true, strict).fire, "at slack 1 over budget must decline");
 
 	CostThresholds ample = generous;
 	ample.memory_budget_bytes = unlimited.bytes * 2;
