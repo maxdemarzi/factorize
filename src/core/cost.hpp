@@ -215,19 +215,32 @@ struct CostThresholds {
 	//! check exists only because slicing costs a pass over the input per slice,
 	//! so a query predicted not to fit is predicted to be slow.
 	//!
-	//! It is set to 64 because the prediction is not good enough to ban a query
+	//! Relaxed from 1 because the prediction is not good enough to ban a query
 	//! on. Measured against what those queries actually build: `hetio_203_16`
 	//! is predicted at 24GB and holds 17MB, over by 1,390x; `hetio_203_19` at
 	//! 16GB against 15MB, over by 1,090x. Both answer in under a second, and
 	//! DuckDB answers neither at all. On the corpus the CE benchmark disables,
 	//! 134 of 138 declines were this one check firing on numbers like those.
 	//!
-	//! The direction of the error is what settles the value. A record count
-	//! comes out of a recurrence that multiplies down the join tree, so its
-	//! errors compound upward, while the tuple estimate feeding the same model
-	//! runs 100x *low* (D41). Being over by three orders of magnitude is the
-	//! normal case, not the tail.
-	double memory_slack = 64.0;
+	//! The direction of the error is what makes relaxing it right at all. A
+	//! record count comes out of a recurrence that multiplies down the join
+	//! tree, so its errors compound upward, while the tuple estimate feeding
+	//! the same model runs 100x *low* (D41). Being over by three orders of
+	//! magnitude is the normal case, not the tail.
+	//!
+	//! 8 and not 64, which is where this was first set and shipped. 64 admits
+	//! `hetio_acyclic_216_04`, and that query is the whole argument: forced
+	//! through the factorized path it peaks at 13.7GB of a 15GB machine, hits
+	//! the memory limit, abandons, falls back, and answers nothing inside 150
+	//! seconds. Stock DuckDB also answers nothing, but uses almost no memory
+	//! doing it. So firing buys no answer and costs the machine, and declining
+	//! buys no answer and costs nothing -- declining strictly dominates, which
+	//! is not a trade-off, just a better move.
+	//!
+	//! At 8 that query declines on a 433GB prediction while the excluded regime
+	//! still gains 45 of the 88 fires that 64 was reaching for: 235 -> 280 of
+	//! 481, against 323 at 64 (D42).
+	double memory_slack = 8.0;
 	//! Refuse cyclic join graphs.
 	bool require_acyclic = true;
 	//! Decline when the work DuckDB is predicted to do -- its per-row and

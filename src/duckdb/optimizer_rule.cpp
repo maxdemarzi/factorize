@@ -1349,7 +1349,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "How far past the memory budget the predicted f-representation size may go before the "
 	                          "gate declines on size alone; the run time slices or abandons either way, so this only "
 	                          "guards against a query predicted to need many passes",
-	                          LogicalType::DOUBLE, Value::DOUBLE(64.0));
+	                          LogicalType::DOUBLE, Value::DOUBLE(8.0));
 	config.AddExtensionOption("factorize_min_work_ms",
 	                          "Fire only when DuckDB's own predicted work, excluding its fixed startup, exceeds "
 	                          "this many milliseconds; below it there is nothing to win",

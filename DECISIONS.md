@@ -2552,3 +2552,58 @@ budget. It admits queries predicted up to 832GB and leaves the one predicted at
 admitted: 10 answered, in 0.3s to 219s, on queries DuckDB does not finish inside
 180s; 2 hit a 300s timeout. Running all 80 to completion is hours, and has not
 been done.
+
+### D42a — 64 was wrong, 8 is the number, and the machine paid to find out
+
+D42 shipped `memory_slack = 64` on a 12-query sample of the 80 it newly admits.
+Running all 80 is what settled it, and the run did not finish: at query 25,
+`hetio_acyclic_216_04` drove the WSL VM to 31.1GB of the 31GB it was allowed,
+after which `free`, `ps` and `uptime` stopped returning and `wsl --shutdown`
+took several attempts and a reboot to land. 24 of 80 completed first: 18
+correct, 6 spending the full 600s cap.
+
+Re-run afterwards on a VM capped at 15GB, where nothing can take the host down:
+
+    hetio_acyclic_216_04, 150s cap
+      off             no answer, memory untouched
+      auto slack=64   no answer, peak 13.7GB, abandons on the memory limit and
+                      falls back
+
+So the factorized path is what consumes the memory, not the stock plan it falls
+back to. And the comparison is not a trade-off: firing buys no answer and costs
+the machine, declining buys no answer and costs nothing. Declining dominates.
+
+At 8 that query declines on its 433GB prediction, and the excluded regime still
+gains 45 of the 88 fires 64 was reaching for. Re-measured under the 6.3GiB
+budget the smaller VM implies:
+
+    slack   12.5GiB budget   6.3GiB budget
+        1      252 of 481       235 of 481
+        8      295              280
+       64      332              323
+     1024      354              351
+
+Halving the budget moves each point by 10-17 queries and changes nothing about
+the shape, so D42's finding survives; only its chosen constant does not.
+
+**Two things this cost, worth keeping.**
+
+*Re-running a known machine-killer to diagnose it.* After the first crash the
+evidence needed was already in the six "fell back to the stock plan" rows. Going
+back to the same query on the same machine -- with a `memory_limit` believed
+sufficient, which it was not -- took the host down a second time. A shrunken
+copy of the tables answers the same question and cannot.
+
+*A memory cap that silently did not apply.* `.wslconfig` was first written with
+`memory=16.25GB`. WSL rejects a decimal there: it prints "Invalid memory string",
+discards the entry, and boots at the 31GB default. A cap that looks set and is
+not is worse than no cap, because it is trusted. `16640MB` is the same number
+and parses.
+
+**Open, and not explained.** That 13.7GB peak should not be reachable. The
+operator caps each slice at `budget / threads`, which on this machine is 0.79GiB,
+and the arena checks it on every segment allocation. Something outside the arena
+is holding an order of magnitude more than the cap allows -- the scanned base
+columns are outside it by design (which is why the budget is half of DuckDB's
+limit), but eight hetio relations are a few hundred MB, not thirteen GB. Nothing
+here depends on the answer; the number is simply not accounted for.
