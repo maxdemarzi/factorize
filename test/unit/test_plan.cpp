@@ -324,7 +324,12 @@ static void TestOutOfMemoryFallsBackToSlices() {
 
 	MemorySource source;
 	std::vector<int64_t> keys;
-	for (int64_t v = 0; v < 4000; v++) {
+	// Large enough that the data dwarfs the structures' fixed cost. The limit
+	// below is a fraction of the measured need, and a fraction divides only the
+	// data: every arena reserves a 64KB first chunk however little it holds, so
+	// a need made mostly of fixed cost cannot be sliced under half of itself
+	// however finely it is divided.
+	for (int64_t v = 0; v < 40000; v++) {
 		for (int i = 0; i < 4; i++) {
 			keys.push_back(v);
 		}
@@ -340,12 +345,21 @@ static void TestOutOfMemoryFallsBackToSlices() {
 
 	const auto plan = BuildPlan(graph);
 	SetGlobalMemoryLimit(0);
+	const size_t baseline = ThreadBudget().used.load();
 	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	const size_t need = ThreadBudget().peak.load() - baseline;
 	Expect(whole.ok, "fallback: unlimited run succeeds (" + whole.error + ")");
 
-	// Tight enough that the undivided representation cannot fit, loose enough
-	// that a slice of it can.
-	SetGlobalMemoryLimit(220 * 1024);
+	// Half of what the undivided run was measured to hold: by construction too
+	// little for the whole, and with the data divided, enough for a slice.
+	//
+	// This was a constant, 220KB, and it stopped meaning anything once the
+	// limit bounded the *sum* of what a slice holds rather than each structure
+	// separately (D43). Several arenas are alive at once and each reserves a
+	// 64KB first chunk, so 220KB fell below the structures' fixed cost: the
+	// undivided run still failed, but so did every slice of it, and the test
+	// reported that as slicing not working.
+	SetGlobalMemoryLimit(need / 2);
 	const auto refused = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(!refused.ok, "fallback: the undivided run must hit the cap");
 	Expect(refused.out_of_memory, "fallback: hitting the cap must be distinguishable from any other error");

@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -53,6 +54,45 @@ struct MemoryLimitExceeded : std::runtime_error {
 	}
 };
 
+//! What one slice of the engine may hold, summed across everything it builds.
+//!
+//! The per-slice limit used to be applied to each structure separately -- each
+//! f-representation, each hash table, the top-insert snapshot arena -- and
+//! never to their sum. One join holds four or five of those at once: both
+//! inputs, the output, the index, the snapshots. So the limit bounded every
+//! piece and not the whole, and measured, the engine's peak followed DuckDB's
+//! entire memory_limit at one thread and at eight alike, twice the half it
+//! had budgeted. With the section 7.5 fallback running on top of that, it
+//! took a 31GB machine down (D43). One account per slice is what makes
+//! "per slice" mean what it says.
+struct SliceBudget {
+	//! 0 means unlimited.
+	size_t limit = 0;
+	//! Bytes currently reserved by every arena and index charged to it. Atomic
+	//! because an arena releases to the budget it charged, and nothing forbids
+	//! that happening on another thread.
+	std::atomic<size_t> used {0};
+	//! High-water mark of `used` since the limit was last set. A measurement,
+	//! not a control: it is what says whether the memory a process holds is
+	//! memory this account knows about.
+	std::atomic<size_t> peak {0};
+
+	//! Offers `now` as a new high-water mark.
+	void Note(size_t now) {
+		size_t seen = peak.load(std::memory_order_relaxed);
+		while (now > seen && !peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
+		}
+	}
+};
+
+//! This thread's budget. A slice runs start to finish on one thread, so a
+//! thread-local is a per-slice account without threading one through every
+//! constructor -- the same trade the memory limit in join.cpp already makes.
+inline SliceBudget &ThreadBudget() {
+	static thread_local SliceBudget budget;
+	return budget;
+}
+
 class Arena {
 public:
 	explicit Arena(size_t first_chunk_bytes = 64 * 1024)
@@ -61,8 +101,32 @@ public:
 
 	Arena(const Arena &) = delete;
 	Arena &operator=(const Arena &) = delete;
-	Arena(Arena &&) = default;
-	Arena &operator=(Arena &&) = default;
+	//! Moves carry the charge with the memory: a moved-from arena must not
+	//! release what it no longer holds, or the budget is credited twice.
+	Arena(Arena &&other) noexcept
+	    : chunks(std::move(other.chunks)), used(other.used), capacity(other.capacity), allocated(other.allocated),
+	      reserved(other.reserved), next_chunk_bytes(other.next_chunk_bytes), memory_limit(other.memory_limit),
+	      budget(other.budget) {
+		other.Forget();
+	}
+	Arena &operator=(Arena &&other) noexcept {
+		if (this != &other) {
+			Release();
+			chunks = std::move(other.chunks);
+			used = other.used;
+			capacity = other.capacity;
+			allocated = other.allocated;
+			reserved = other.reserved;
+			next_chunk_bytes = other.next_chunk_bytes;
+			memory_limit = other.memory_limit;
+			budget = other.budget;
+			other.Forget();
+		}
+		return *this;
+	}
+	~Arena() {
+		Release();
+	}
 
 	//! Allocates `bytes`, zeroed, aligned for any scalar type. The returned
 	//! address stays valid for the lifetime of the arena.
@@ -108,6 +172,7 @@ public:
 	}
 
 	void Reset() {
+		Release();
 		chunks.clear();
 		used = capacity = allocated = reserved = 0;
 		next_chunk_bytes = kMinChunk;
@@ -122,17 +187,40 @@ private:
 		while (bytes < at_least) {
 			bytes *= 2;
 		}
+		// The slice as a whole, not this arena alone, and before the memory
+		// exists. Charged only after it does, so an allocation that fails
+		// charges nothing.
+		SliceBudget &slice = budget != nullptr ? *budget : ThreadBudget();
+		if (slice.limit != 0 && slice.used.load(std::memory_order_relaxed) + bytes > slice.limit) {
+			throw MemoryLimitExceeded("the engine exceeded its per-slice memory budget");
+		}
 		auto chunk = std::unique_ptr<Byte[]>(new Byte[bytes]);
 		std::memset(chunk.get(), 0, bytes);
 		chunks.push_back(std::move(chunk));
 		used = 0;
 		capacity = bytes;
 		reserved += bytes;
+		slice.Note(slice.used.fetch_add(bytes, std::memory_order_relaxed) + bytes);
+		budget = &slice;
 		// Double until a ceiling, so a large f-representation does not end up
 		// making thousands of small allocations.
 		if (next_chunk_bytes < (32u << 20)) {
 			next_chunk_bytes = bytes * 2;
 		}
+	}
+
+	//! Returns this arena's charge to the budget it was taken from.
+	void Release() {
+		if (budget != nullptr && reserved != 0) {
+			budget->used.fetch_sub(reserved, std::memory_order_relaxed);
+		}
+		budget = nullptr;
+	}
+	//! Drops ownership without releasing, for a moved-from arena.
+	void Forget() {
+		chunks.clear();
+		used = capacity = allocated = reserved = 0;
+		budget = nullptr;
 	}
 
 	std::vector<std::unique_ptr<Byte[]>> chunks;
@@ -143,6 +231,8 @@ private:
 	size_t next_chunk_bytes;
 	//! 0 = unlimited.
 	size_t memory_limit = 0;
+	//! The slice budget this arena charged; null until its first chunk.
+	SliceBudget *budget = nullptr;
 };
 
 } // namespace factorize

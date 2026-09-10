@@ -778,6 +778,97 @@ static void TestMemoryLimitCoversBuildSide() {
 	}
 }
 
+//! The per-slice limit bounds the sum of what a slice holds, not each piece.
+//!
+//! Capped one structure at a time, a join holding both inputs, the output and
+//! an index could reach several times its budget -- measured, the engine's
+//! peak followed DuckDB's whole memory_limit (D43). These pin the properties a
+//! shared account needs, each of which fails silently rather than loudly:
+//! pieces that fit alone must be refused together; memory one structure
+//! returns must be available to the next; a moved arena must neither lose nor
+//! double-count its charge; and a join that throws partway through building
+//! must return every byte it charged. A leak in either of the last two would
+//! not show here -- it would make every later slice on the thread fail with
+//! a memory error it did not earn.
+static void TestSliceBudgetBoundsTheSum() {
+	const size_t baseline = ThreadBudget().used.load();
+	const size_t chunk = static_cast<size_t>(1) << 20;
+
+	// Two arenas, each within the budget on its own, together over it.
+	SetGlobalMemoryLimit(3 * chunk);
+	bool refused = false;
+	{
+		Arena a(2 * chunk);
+		a.Allocate(2 * chunk);
+		Arena b(2 * chunk);
+		try {
+			b.Allocate(2 * chunk);
+		} catch (const MemoryLimitExceeded &) {
+			refused = true;
+		}
+	}
+	Expect(refused, "slice budget: two arenas that each fit alone are refused together");
+	Expect(ThreadBudget().used.load() == baseline, "slice budget: destroying the arenas returns every byte");
+
+	// Returned memory is reusable: the same second arena fits once the first
+	// is gone.
+	bool reused = true;
+	try {
+		{
+			Arena a(2 * chunk);
+			a.Allocate(2 * chunk);
+		}
+		Arena b(2 * chunk);
+		b.Allocate(2 * chunk);
+	} catch (const MemoryLimitExceeded &) {
+		reused = false;
+	}
+	Expect(reused, "slice budget: memory one structure returns is available to the next");
+
+	// Moves carry the charge. Construct, move, move-assign, destroy all three:
+	// the account must come back exactly, neither short nor over.
+	{
+		Arena a(chunk);
+		a.Allocate(chunk);
+		Arena moved(std::move(a));
+		Arena assigned(chunk);
+		assigned = std::move(moved);
+	}
+	Expect(ThreadBudget().used.load() == baseline,
+	       "slice budget: moving an arena neither loses nor double-counts its charge");
+	SetGlobalMemoryLimit(0);
+
+	// And through a real join, both ways it can end.
+	const AttributeTypes types = {{0, ValueType::INT32}};
+	std::vector<int64_t> build(100000);
+	for (size_t i = 0; i < build.size(); i++) {
+		build[i] = static_cast<int64_t>(i);
+	}
+	std::vector<int64_t> probe = {0, 1};
+	JoinKeys keys;
+	keys.build = {0};
+	keys.probe = {0};
+	{
+		auto result = FactorizedJoin(MakeScan({0}, types, {build}), MakeScan({0}, types, {probe}), keys,
+		                             JoinMode::BOTTOM_INSERT);
+		Expect(result.Count() == 2, "slice budget: an unconstrained join still answers");
+	}
+	Expect(ThreadBudget().used.load() == baseline,
+	       "slice budget: a join that succeeds returns every byte once its result is gone");
+
+	SetGlobalMemoryLimit(64 * 1024);
+	bool threw = false;
+	try {
+		FactorizedJoin(MakeScan({0}, types, {build}), MakeScan({0}, types, {probe}), keys, JoinMode::BOTTOM_INSERT);
+	} catch (const std::exception &) {
+		threw = true;
+	}
+	SetGlobalMemoryLimit(0);
+	Expect(threw, "slice budget: a 64KB slice cannot hold a 100,000-row build side");
+	Expect(ThreadBudget().used.load() == baseline,
+	       "slice budget: a join that throws partway through building returns every byte it charged");
+}
+
 //! The exact composite-key width the packing accepts.
 //!
 //! The 64-bit cap is what makes KeyReader's INT64 case correct, not merely what
@@ -949,6 +1040,7 @@ int main() {
 	TestFusedCount();
 	std::printf("\n");
 	TestMemoryLimitCoversBuildSide();
+	TestSliceBudgetBoundsTheSum();
 	std::printf("\n");
 	TestCompositeKeyWidth();
 	std::printf("\n");

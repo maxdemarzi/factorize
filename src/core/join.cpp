@@ -29,6 +29,13 @@ thread_local double g_min_compression = 0;
 
 void SetGlobalMemoryLimit(size_t bytes) {
 	g_memory_limit = bytes;
+	// The same number now bounds the slice as a whole, not only each structure
+	// in it. A join holds four or five capped structures at once, and capping
+	// them one at a time let the engine reach DuckDB's entire memory_limit
+	// rather than the half it budgeted (D43).
+	ThreadBudget().limit = bytes;
+	// Setting a limit opens a new measurement window.
+	ThreadBudget().peak.store(ThreadBudget().used.load());
 }
 
 void SetGlobalEstimateBudget(size_t bytes) {
@@ -49,6 +56,8 @@ double GetGlobalMinCompression() {
 
 void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression) {
 	g_memory_limit = memory_bytes;
+	ThreadBudget().limit = memory_bytes;
+	ThreadBudget().peak.store(ThreadBudget().used.load());
 	g_estimate_budget = estimate_budget_bytes;
 	g_min_compression = min_compression;
 }

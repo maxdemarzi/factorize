@@ -1,4 +1,5 @@
 #include "factorize/physical_factorized.hpp"
+#include "../core/arena.hpp"
 #include <atomic>
 
 #include "duckdb/common/error_data.hpp"
@@ -176,25 +177,23 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 		// counting and is simply not written yet.
 		slices = 1;
 	}
-	// Divided by the *thread* count, not the bucket count, and they are no
-	// longer the same number.
+	// Divided by the thread count, not the bucket count, so a single bucket gets
+	// a share of the budget rather than all of it.
 	//
-	// This bounds what one attempt may hold, and the two questions it used to
-	// answer at once have come apart: buckets exist for parallelism, while the
-	// bound exists because without it "the engine allocates until the kernel
-	// kills the process, taking the whole session with it". Dividing by
-	// `slices` once slices became 1 would raise that ceiling eightfold as a
-	// side effect of a parallelism fix -- and a safety limit written against an
-	// observed kernel kill should not move by accident. No failure was measured
-	// at the wider bound; this keeps peak memory exactly where it was so that
-	// relaxing it stays a separate decision with its own measurement.
+	// The reason this started, D39a, is gone. Back then the limit capped each of
+	// a join's structures separately, so giving one bucket the whole budget let
+	// it hold several times that, and on the >1e9-tuple corpus two queries were
+	// killed. Since D43 the limit bounds the sum, and giving one bucket all of it
+	// was tried: nothing was killed, and every run peaked at 6.4GB against a
+	// 6.3GiB budget, exactly where it should.
 	//
-	// Nothing is lost by staying conservative here. A bucket that does not fit
-	// is sub-divided by ExecuteCountSliceWithinMemory's retry rather than
-	// refused, so the only effect of a tighter bound is that a query which
-	// genuinely needs more memory discovers it sooner and pays for the extra
-	// passes it actually needs -- instead of every query paying for eight it
-	// does not.
+	// But it was not simply better. hetio_210_07, which answered in 269s with a
+	// share, did not finish inside 300s with the whole budget -- a bucket
+	// allowed more spends longer building before it discovers it does not fit.
+	// Against that, the fired set runs 1.11x slower with a share than with the
+	// budget inert. Both directions cost something and neither is measured well
+	// enough to choose on, so the share stays: it is what shipped and was
+	// validated, and the trade is open (D43a).
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / threads));
 }
 
@@ -215,7 +214,11 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 //! Per slice, and said so: a bucket is a fraction of the data, and averaging
 //! the buckets would invent a query none of them ran.
 static void PrintSteps(const factorize::ExecuteResult &result, idx_t slice) {
-	string line = "[factorize] slice " + to_string(slice) + ": ";
+	// The slice budget's high-water mark beside the steps: what the engine's
+	// own account says this slice held at its fullest, to set against what
+	// the process as a whole held (D43).
+	string line = StringUtil::Format("[factorize] slice %llu (peak %.1fMB held): ", static_cast<uint64_t>(slice),
+	                                 static_cast<double>(factorize::ThreadBudget().peak.load()) / (1024.0 * 1024.0));
 	if (result.steps.empty()) {
 		line += "no materialized joins (the only join was fused into the count)";
 	}

@@ -2565,13 +2565,17 @@ correct, 6 spending the full 600s cap.
 Re-run afterwards on a VM capped at 15GB, where nothing can take the host down:
 
     hetio_acyclic_216_04, 150s cap
-      off             no answer, memory untouched
+      off             no answer, memory untouched  (misread -- see below)
       auto slack=64   no answer, peak 13.7GB, abandons on the memory limit and
                       falls back
 
-So the factorized path is what consumes the memory, not the stock plan it falls
-back to. And the comparison is not a trade-off: firing buys no answer and costs
-the machine, declining buys no answer and costs nothing. Declining dominates.
+*Corrected in D43.* This paragraph concluded that the factorized path consumed
+the memory and the stock plan did not, so declining saved the machine. The
+`off` reading behind it was taken after the process had exited -- `free`
+sampled a machine that had already been given the memory back. Measured while
+running, at a 4GB limit, `off` peaks at 4077MB and the fallback at 4085MB. Both
+fill DuckDB's limit; firing adds the time spent slicing first, and nothing
+else.
 
 At 8 that query declines on its 433GB prediction, and the excluded regime still
 gains 45 of the 88 fires 64 was reaching for. Re-measured under the 6.3GiB
@@ -2607,3 +2611,159 @@ is holding an order of magnitude more than the cap allows -- the scanned base
 columns are outside it by design (which is why the budget is half of DuckDB's
 limit), but eight hetio relations are a few hundred MB, not thirteen GB. Nothing
 here depends on the answer; the number is simply not accounted for.
+
+## D43 — The per-slice memory limit capped every piece and never the whole
+
+After D42a the open question was a 13.7GB peak that the engine's own limits
+should not have allowed. Each slice was capped at `budget / threads` -- 0.79GiB
+on the capped VM -- and checked on every allocation. Measured instead of
+reasoned about, because three successive hypotheses about it were wrong.
+
+**The shape of the problem.** Forced through the factorized path with the
+fallback off, `hetio_acyclic_216_04` peaked at DuckDB's whole `memory_limit`
+at every setting and every thread count:
+
+    memory_limit   per-slice cap   peak above idle
+        1 GB           64 MB           1280 MB
+        2 GB          128 MB           2126 MB
+        4 GB          256 MB           4086 MB
+      threads=1      2048 MB           3956 MB
+      threads=8       256 MB           4025 MB
+
+So the peak followed the limit and ignored the cap. Its inputs are 792,481
+rows, 12MB -- the data is not where the memory is.
+
+**Three things it was not.**
+
+*The hash table's index vectors.* `entries` and `directory` are heap vectors
+the arena's limit never saw, and `BytesAllocated` reported the directory
+without anything enforcing it -- 17 to 26 bytes per entry against a 32-byte
+`Entry`. That was a real hole and is now closed: the table enforces its limit
+over everything it holds. It moved the peak from 1280/2126/4086MB to
+1123/2092/3995MB. Correct, and not the cause.
+
+*Allocator retention.* The retry loop builds to the budget, throws, frees and
+rebuilds, which is the classic pattern for glibc keeping freed memory through
+its dynamic mmap threshold. Pinning `MALLOC_MMAP_THRESHOLD_`,
+`MALLOC_TRIM_THRESHOLD_` and `MALLOC_ARENA_MAX` changed nothing: 2231 against
+2235MB, 4142 against 4134MB. And the result means what it appears to, because
+DuckDB's bundled jemalloc is prefixed (`duckdb_je_malloc`) -- global `new` does
+reach glibc, so those were the right knobs.
+
+*DuckDB's buffer pool.* The arena allocates with plain `new`, outside it.
+
+**What it was.** The limit was applied to each structure separately and never to
+their sum. One materializing join holds four or five capped structures at once
+-- both inputs, the output, the snapshot arena and the hash table -- and the
+fused count join three. Each was allowed the whole per-slice budget, so the
+slice as a whole was allowed several times it.
+
+**The fix** is one account per slice. `SliceBudget` is thread-local, because a
+slice runs start to finish on one thread; every `Arena::Grow` charges it before
+the memory exists and after the allocation succeeds, every arena releases to the
+budget it charged, and moves carry the charge rather than duplicating it. The
+hash table's index vectors are charged to the same account. `SetGlobalLimits`
+sets its limit, so the one number now bounds the sum.
+
+**Verified against the process, not just the account.** A high-water mark on the
+budget, printed per slice under `factorize_explain`, set beside the process's
+own peak RSS on `hetio_acyclic_204_02`, which slices and still finishes:
+
+    one slice (fallback on)       engine held   process RSS   RSS/held
+      2 GB, cap 128 MB              110.8 MB        172 MB       1.6x
+      4 GB, cap 256 MB              209.8 MB        289 MB       1.4x
+
+    eight slices (fallback off)   max held   sum held   RSS    RSS/sum
+      2 GB, cap 128 MB             117.8 MB   922 MB    712 MB   0.8x
+      4 GB, cap 256 MB             209.8 MB  1574 MB   1488 MB   0.9x
+
+Every slice stays under its cap, the answer is correct, and the query takes
+5.7-6.4s against 5.4s unconstrained. The process holds a fixed ~60-80MB beyond
+what the engine accounts for, and with eight slices slightly *less* than the sum
+of their peaks, because the peaks do not all coincide. There is no unaccounted
+memory in the engine.
+
+**A cost the sum makes visible.** Every arena reserves a 64KB first chunk however
+little it stores, and several are alive at once, so a slice has a fixed cost of
+a few hundred KB. Per-structure caps never saw it; a sum does.
+`TestOutOfMemoryFallsBackToSlices` hard-coded 220KB and started failing -- not
+because slicing broke, but because 220KB had fallen below the fixed cost, so
+every slice failed along with the whole. It now sets its limit to half of what
+the undivided run was measured to hold, which states the intent instead of a
+number that stopped meaning it. Irrelevant at real budgets; worth knowing at
+tiny ones.
+
+**The crash scenario was never this engine.** Re-run in the configuration that
+took the host down -- forced to fire, fallback on, default limit -- our path now
+abandons exactly as designed, with "the engine exceeded its per-slice memory
+budget", capped near 0.79GiB. The process still peaked at 13.05GB against 13.8GB
+before. The rest is the section 7.5 fallback, and the fallback is simply
+DuckDB's plan. At a 4GB limit, run alone:
+
+    hetio_acyclic_216_04, 4GB memory_limit, 120s cap
+      off                         peak 4077MB, no answer
+      fallback (debug_fail)       peak 4085MB, no answer
+
+DuckDB fills its own limit on this query whichever way it is reached.
+
+So what took the host down was DuckDB's default `memory_limit` -- 80% of what
+the VM sees, 25GiB of an uncapped 31GB VM -- on a query that wants more than any
+limit. A user running it with factorization switched off would have lost the
+machine the same way. The engine's over-commit was real and is fixed above, but
+it was not the cause; the `.wslconfig` cap is what actually protects the host.
+
+This corrects D42a, whose premise was an `off` run that "used no memory". That
+reading came from `free`, sampled after the timed-out process had already exited
+and returned its memory. It also reopens D42a's decision: the case for slack 8
+over 64 was partly that firing cost the machine, and it does not. What remains
+is time spent slicing on queries nothing can answer, against answers on the
+ones 64 would add -- 18 of the 24 completed in D42a's run were correct, on a
+corpus DuckDB answers none of inside 180s. That trade has not been re-measured.
+
+That run also cost the VM a second time: it was launched beside the sanitizer
+build, reasoning that a memory measurement could share the machine with a
+CPU-heavy job. The ASan link is memory-heavy too, and the crash test was known
+to reach 13GB of a 15GB VM. The build died mid-link and WSL needed a forced
+shutdown. Memory-heavy experiments run alone.
+
+### D43a — What the per-slice budget costs, and dividing it by slices instead
+
+With the sum enforced, the fired set was timed A/B inside one binary: each query
+run `off`, `auto`, and `auto` at a 100GB limit -- where a slice is allowed
+6.25GiB, which no runnable query approaches, so the budget is inert -- all in
+one session, with a discarded warm-up per mode so that cache warming across
+passes cannot pose as a result.
+
+    35 fired queries, 0 wrong answers
+      off                  33.33s
+      auto                 12.37s    2.70x
+      auto, budget inert   11.12s
+
+Honest accounting costs 1.11x on the fired set, and it lands almost entirely on
+queries the gate should not be firing on: `watdiv_216_10` (+1.47s) runs 1.04s
+stock and 2.87s even with the budget inert, and `epinions_217_12` (+0.13s) 0.15s
+stock against 0.20s.
+
+The per-slice budget divides by the thread count even when there is one slice,
+which was D39a's correction for per-structure caps -- a reason D43 removed.
+Dividing by slices instead, forced to fire at the default limit with the
+fallback on, run alone:
+
+    query                  peak     elapsed    outcome
+    hetio_acyclic_210_07   6.4 GB   300s cap   no answer (answered in 269s with a share)
+    hetio_acyclic_216_15   6.4 GB   300s cap   no answer
+    hetio_acyclic_216_04   6.4 GB   300s cap   no answer (neither engine can)
+
+Nothing was killed, and every peak sits at the 6.3GiB budget -- which is D43
+doing its job, and means D39a's reason for the division no longer holds. But the
+larger budget was not simply better: a bucket allowed more spends longer
+building before it discovers it does not fit, and 210_07 went from an answer to
+none. Against the 1.11x above, that is one query, one run, near a timeout --
+not enough to choose on after a day of memory decisions reversed on thin
+evidence. The division stays at threads, which is what shipped and was
+validated, and the trade is open.
+
+The first report of that run called the two no-answers "KILLED": the script
+tested for empty output before it tested the exit code, and a process that
+`timeout` stops at 300s has not printed anything yet. Exit 124 is a timeout; a
+kill is 137.

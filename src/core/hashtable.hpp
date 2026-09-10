@@ -57,13 +57,32 @@ public:
 		Value value;
 	};
 
+	ChainingHashTable() = default;
+	ChainingHashTable(const ChainingHashTable &) = delete;
+	ChainingHashTable &operator=(const ChainingHashTable &) = delete;
+	//! Returns the index vectors' charge; the arena returns its own.
+	~ChainingHashTable() {
+		if (budget != nullptr && vector_bytes != 0) {
+			budget->used.fetch_sub(vector_bytes, std::memory_order_relaxed);
+		}
+	}
+
 	//! Collects one entry. Cheap and allocation-stable; no directory yet.
 	void Insert(uint64_t key, Value value) {
+		// Checked before the arena, and only when the index is about to grow,
+		// so the common insert is one comparison against a capacity it already
+		// has to load.
+		if (entries.size() == entries.capacity()) {
+			const size_t growth = (entries.capacity() == 0 ? 1 : entries.capacity()) * sizeof(Entry *);
+			CheckHeld(growth);
+			CheckSlice(growth);
+		}
 		auto *entry = reinterpret_cast<Entry *>(arena.Allocate(sizeof(Entry)));
 		entry->next = nullptr;
 		entry->key = key;
 		entry->value = value;
 		entries.push_back(entry);
+		ChargeVectors();
 	}
 
 	//! Builds the directory and links the chains. Idempotent per build phase.
@@ -78,7 +97,13 @@ public:
 			bits++;
 		}
 		shift = 64 - bits;
+		// The directory is the single largest allocation this table makes and
+		// it is made in one go, so this is where a limit has to be consulted if
+		// it is to mean anything at all.
+		CheckHeld(capacity * sizeof(Entry *));
+		CheckSlice(capacity * sizeof(Entry *));
 		directory.assign(capacity, nullptr);
+		ChargeVectors();
 		mask = capacity - 1;
 
 		for (auto *entry : entries) {
@@ -150,18 +175,74 @@ public:
 		return finalized;
 	}
 	size_t BytesAllocated() const {
-		return arena.BytesAllocated() + directory.capacity() * sizeof(Entry *);
+		return arena.BytesAllocated() + entries.capacity() * sizeof(Entry *) +
+		       directory.capacity() * sizeof(Entry *);
 	}
 
-	//! Caps the entry arena the same way FRepresentation caps its own; 0 means
-	//! unlimited. One `Entry` is allocated per `Insert`, so an unbounded build
-	//! side previously grew this arena with no check regardless of how small
-	//! the eventual output was.
+	//! Caps everything this table holds; 0 means unlimited. One `Entry` is
+	//! allocated per `Insert`, so an unbounded build side previously grew this
+	//! arena with no check regardless of how small the eventual output was.
+	//!
+	//! Everything, not just the arena, and that distinction was worth about a
+	//! factor of two. `entries` and `directory` are ordinary heap vectors: the
+	//! arena's limit never saw them, and `BytesAllocated` reported the directory
+	//! without anything enforcing it. They are not a rounding error beside the
+	//! arena they index -- one pointer in `entries` and up to two in
+	//! `directory` per entry is 17 to 26 bytes against a 32-byte `Entry`. So a
+	//! table capped at N bytes held closer to 2N, and the engine's peak came
+	//! out at DuckDB's whole `memory_limit` rather than the half it had
+	//! budgeted: measured 1280MB, 2126MB and 4086MB against per-slice caps of
+	//! 64MB, 128MB and 256MB across eight slices (D43).
 	void SetMemoryLimit(size_t bytes) {
+		limit = bytes;
 		arena.SetMemoryLimit(bytes);
 	}
 
 private:
+	//! As CheckHeld, but against the slice as a whole: the same growth can fit
+	//! this table's own limit and still take the slice past its budget.
+	void CheckSlice(size_t growing) const {
+		const SliceBudget &slice = budget != nullptr ? *budget : ThreadBudget();
+		if (slice.limit != 0 && slice.used.load(std::memory_order_relaxed) + growing > slice.limit) {
+			throw MemoryLimitExceeded("the engine exceeded its per-slice memory budget");
+		}
+	}
+
+	//! Brings the slice's account of the index vectors up to what they hold.
+	//! Vectors grow on their own schedule, so this reconciles after the fact
+	//! rather than predicting; CheckSlice has already refused growth that
+	//! would not fit.
+	void ChargeVectors() {
+		const size_t now = (entries.capacity() + directory.capacity()) * sizeof(Entry *);
+		if (now == vector_bytes) {
+			return;
+		}
+		if (budget == nullptr) {
+			budget = &ThreadBudget();
+		}
+		if (now > vector_bytes) {
+			budget->Note(budget->used.fetch_add(now - vector_bytes, std::memory_order_relaxed) + (now - vector_bytes));
+		} else {
+			budget->used.fetch_sub(vector_bytes - now, std::memory_order_relaxed);
+		}
+		vector_bytes = now;
+	}
+
+	//! Throws if the table would hold more than its limit once `growing` more
+	//! bytes of index are added. MemoryLimitExceeded rather than a plain error,
+	//! because the answer to "this bucket does not fit" is to subdivide the
+	//! join key and count again, not to give up (D20).
+	void CheckHeld(size_t growing) const {
+		if (limit == 0) {
+			return;
+		}
+		const size_t held = arena.BytesAllocated() + entries.capacity() * sizeof(Entry *) +
+		                    directory.capacity() * sizeof(Entry *);
+		if (held + growing > limit) {
+			throw MemoryLimitExceeded("hash table exceeded its memory limit");
+		}
+	}
+
 	//! Non-const twins of Find/FindNext. Deliberately not const_cast'd from the
 	//! const ones: a table being marked is genuinely being mutated, and saying
 	//! so in the type is what keeps the const overloads honest for every other
@@ -192,6 +273,12 @@ private:
 	}
 
 	Arena arena;
+	//! What SetMemoryLimit was given, applied to everything the table holds
+	//! rather than to the arena alone.
+	size_t limit = 0;
+	//! The slice budget the index vectors are charged to, and how much.
+	SliceBudget *budget = nullptr;
+	size_t vector_bytes = 0;
 	std::vector<Entry *> entries;
 	std::vector<Entry *> directory;
 	size_t mask = 0;

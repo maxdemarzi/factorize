@@ -229,13 +229,19 @@ struct CostThresholds {
 	//! magnitude is the normal case, not the tail.
 	//!
 	//! 8 and not 64, which is where this was first set and shipped. 64 admits
-	//! `hetio_acyclic_216_04`, and that query is the whole argument: forced
-	//! through the factorized path it peaks at 13.7GB of a 15GB machine, hits
-	//! the memory limit, abandons, falls back, and answers nothing inside 150
-	//! seconds. Stock DuckDB also answers nothing, but uses almost no memory
-	//! doing it. So firing buys no answer and costs the machine, and declining
-	//! buys no answer and costs nothing -- declining strictly dominates, which
-	//! is not a trade-off, just a better move.
+	//! `hetio_acyclic_216_04`, which neither engine can answer, and firing it
+	//! spends minutes slicing before handing it to a stock plan that then
+	//! fails exactly as it would have anyway. Declining saves that time.
+	//!
+	//! This comment used to say the stock plan answered nothing "but uses almost
+	//! no memory doing it", which made declining look like it also saved the
+	//! machine. That was a misreading: the memory was sampled after the process
+	//! had already exited. Measured while running, at a 4GB limit, stock DuckDB
+	//! peaks at 4077MB and the fallback at 4085MB -- both fill DuckDB's limit,
+	//! and what took the host down was that limit (80% of an uncapped VM), not
+	//! this engine (D43). So the case for 8 over 64 is time lost on queries
+	//! nothing can answer, weighed against answers on the ones 64 would add, and
+	//! that trade has not been re-measured since the premise changed.
 	//!
 	//! At 8 that query declines on a 433GB prediction while the excluded regime
 	//! still gains 45 of the 88 fires that 64 was reaching for: 235 -> 280 of
