@@ -3354,3 +3354,53 @@ Tested: the exemption is pinned in the core suite -- a three-relation chain,
 whose only materialized join is the first, must run to completion -- and the
 gate has its own case in the SQL suite, where the same impossible floor leaves
 the same query alone because two seconds have not passed.
+
+## D52 — A rate can be measured; DuckDB's cannot
+
+D51 ended on the next lever: the discriminator has to be a rate rather than a
+ratio -- tuples delivered per millisecond, which is the quantity DuckDB's own
+cost model is stated in. Measuring it needed one thing the operator did not
+record, the time at which each join finished, so `StepStats` now carries it and
+`factorize_explain` prints it. Measured across six wins and four losses:
+
+**The rate separates, at the end.** Cumulative tuples per millisecond at the
+last materialized join:
+
+    wins     1.11e5  1.88e5  3.9e5  5.71e5  8.4e5  6.28e7
+    losses     17.4    31.8    157   4.59e4
+
+DuckDB's fitted rate is 2.51e5 (cost.hpp), and a threshold near 7e4 separates
+all ten. At the *second* join they overlap completely -- a win at 0.05 against a
+loss at 207 -- so the signal arrives late, exactly as the compression ratio did.
+
+**And by then the work is done, except for the part nobody can size.** The
+elapsed stamps show where the time actually goes:
+
+    query                    materialized joins done at   total
+    hetio_acyclic_205_03                        4.6s      142s
+    hetio_acyclic_211_07                        3.0s       92.6s
+    watdiv_acyclic_218_15                       9.6s       98s
+    watdiv_acyclic_217_05                      27.9s       44s
+
+Everything after that is the fused count join, whose size is the one quantity
+this project has never been able to predict. Abandoning at the last materialized
+step therefore buys almost nothing: `217_05` would spend 27.9s and then 13.3s on
+the stock plan, against 44s finishing.
+
+**A plain race on elapsed time fails too**, and the same table says why: the
+winners' totals (38.7s to 142s) overlap the losers' (14.5s to 138s). Any cutoff
+that catches `217_05` at 44s also abandons `216_14` at 38.7s -- and `216_14` is
+a query the stock plan cannot answer at all.
+
+So nothing measurable inside our own run separates these cases, because what
+separates them is how fast DuckDB would have been, and the only estimator-free
+way to know that is to run it. That leaves one design that is sound on this
+evidence and was available to none of D44a through D51: **run both plans and
+keep whichever finishes first.** It needs no estimate of anything, bounds the
+loss at the winner's time, and costs roughly double the CPU on every query it
+fires on. It is an operator-level change rather than an estimator one, and it is
+where this line of work now points.
+
+Kept: per-step elapsed in `StepStats` and in `factorize_explain`. Inert, and the
+reason any of the above could be seen at all -- before it, the project could
+measure what each join built but not when.

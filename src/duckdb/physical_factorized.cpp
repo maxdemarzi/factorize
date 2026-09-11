@@ -223,10 +223,10 @@ static void PrintSteps(const factorize::ExecuteResult &result, idx_t slice) {
 		line += "no materialized joins (the only join was fused into the count)";
 	}
 	for (const auto &step : result.steps) {
-		line += StringUtil::Format("[%llu: %llu recs %llu live %lld tuples %.3fx] ",
+		line += StringUtil::Format("[%llu: %llu recs %llu live %lld tuples %.3fx %.0fms] ",
 		                           static_cast<uint64_t>(step.relation), static_cast<uint64_t>(step.records),
 		                           static_cast<uint64_t>(step.live), static_cast<long long>(step.tuples),
-		                           step.Compression());
+		                           step.Compression(), step.elapsed_ms);
 	}
 	if (!result.ok) {
 		line += "-> " + result.error;

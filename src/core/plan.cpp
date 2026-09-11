@@ -443,6 +443,7 @@ namespace {
 //! What one materialized join left behind.
 StepStats MeasureStep(size_t relation, const FactorizedRelation &accumulated) {
 	StepStats step;
+	step.elapsed_ms = ElapsedSliceMs();
 	step.relation = relation;
 	step.records = accumulated.Rep().RecordCount();
 	step.live = accumulated.Rep().LiveRecordCount();

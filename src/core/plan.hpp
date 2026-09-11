@@ -163,6 +163,15 @@ struct StepStats {
 	//! roots rather than a second traversal.
 	int64_t tuples = 0;
 
+	//! Milliseconds of slice time when this step finished.
+	//!
+	//! The ratio says how much the representation is saving; this says what it
+	//! cost to get there, and the two together are a rate -- tuples delivered
+	//! per millisecond -- which is the quantity DuckDB's own cost model is
+	//! stated in and the only one measurable here that can be compared with it
+	//! (D52).
+	double elapsed_ms = 0;
+
 	//! Tuples per live record: how much the representation is actually saving.
 	//!
 	//! 1 means the join built one record per tuple, which is a hash join with
