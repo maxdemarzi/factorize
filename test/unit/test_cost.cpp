@@ -353,6 +353,61 @@ static void TestMemoryBudget() {
 	Check(EstimateCost(steps, true, ample).fire, "under budget must still fire");
 }
 
+//! A plain count fuses its last join into the count and never builds it, so
+//! the size check must not charge it. On the excluded regime that join was
+//! 78-96% of every predicted size -- the deepest step, and the one multiplied
+//! most -- for a representation that never exists (D44). The fold builds every
+//! join, so there the whole estimate stands.
+static void TestFusedLastJoinIsNotCharged() {
+	std::printf("memory budget: a fused last join is never built, so it is never charged\n");
+	// A star, then a class hanging beneath it that dominates the records.
+	std::vector<CostStep> steps;
+	for (int i = 0; i < 3; i++) {
+		CostStep step;
+		step.key = ToStats(Skewed(6000, 5, 40, 1), 8);
+		step.key_group = 0;
+		step.parent_step = i == 0 ? -1 : 0;
+		step.parent_key = step.key;
+		steps.push_back(step);
+	}
+	CostStep below;
+	below.key = ToStats(Skewed(6000, 5, 400, 3), 8);
+	below.key_group = 1;
+	below.parent_step = 1;
+	below.parent_key = ToStats(Skewed(6000, 5, 40, 1), 8);
+	steps.push_back(below);
+
+	CostThresholds materialized;
+	CostThresholds fused;
+	fused.last_join_fused = true;
+	const auto all = EstimateCost(steps, true, materialized);
+	const auto counted = EstimateCost(steps, true, fused);
+
+	const auto n = all.step_records.size();
+	Check(n == steps.size(), "one predicted record count per step");
+	const double last = all.step_records[n - 1] - all.step_records[n - 2];
+	const double per_record = materialized.bytes_per_record + materialized.bytes_per_relation * steps.size();
+	std::printf("  materialized %.4g bytes, fused %.4g bytes, last join %.4g records of %.4g\n", all.bytes,
+	            counted.bytes, last, all.factorized_records);
+	Check(last > all.factorized_records / 2, "the fixture's last join has to dominate, or this tests nothing");
+	CheckClose(counted.bytes, (all.factorized_records - last) * per_record, 1.0001,
+	           "fused: every record but the last join's");
+	CheckClose(all.bytes, all.factorized_records * per_record, 1.0001, "materialized: every record");
+	// The rest of the estimate is untouched: only what is held changes.
+	CheckClose(counted.factorized_records, all.factorized_records, 1.0001, "records feed the time model unchanged");
+	CheckClose(counted.ours_ms, all.ours_ms, 1.0001, "our predicted time is unchanged");
+
+	// And it changes the decision where it should: a budget between the two.
+	CostThresholds tight_fused = fused;
+	CostThresholds tight_all = materialized;
+	tight_fused.memory_slack = tight_all.memory_slack = 1.0;
+	tight_fused.memory_budget_bytes = tight_all.memory_budget_bytes = (counted.bytes + all.bytes) / 2;
+	Check(EstimateCost(steps, true, tight_all).reason.find("budget") != std::string::npos,
+	      "materialized over the budget must decline on size");
+	Check(EstimateCost(steps, true, tight_fused).reason.find("budget") == std::string::npos,
+	      "fused under the budget must not decline on size");
+}
+
 static void TestEmptyMcvDegradesToTextbook() {
 	std::printf("no MCV list: must degrade to the textbook estimator, not to garbage\n");
 	std::vector<ColumnStats> stats;
@@ -376,6 +431,7 @@ int main() {
 	TestCalibration();
 	TestGateDecision();
 	TestMemoryBudget();
+	TestFusedLastJoinIsNotCharged();
 	TestEmptyMcvDegradesToTextbook();
 	std::printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

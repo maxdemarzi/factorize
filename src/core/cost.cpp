@@ -241,6 +241,12 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		}
 	}
 
+	double standing = 0;
+	for (double step : node_records) {
+		standing += step;
+		estimate.step_records.push_back(standing);
+	}
+
 	estimate.flat_tuples = std::max(0.0, flat);
 	estimate.factorized_records = std::max(1.0, records);
 	estimate.ratio = estimate.flat_tuples / estimate.factorized_records;
@@ -253,8 +259,14 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	estimate.ours_ms = thresholds.ours.Estimate(input_rows, estimate.factorized_records);
 	estimate.duckdb_ms = thresholds.duckdb.Estimate(input_rows, estimate.flat_tuples);
 
-	estimate.bytes = estimate.factorized_records *
-	                 (thresholds.bytes_per_record + thresholds.bytes_per_relation * static_cast<double>(steps.size()));
+	// Only what is built: a fused last join counts its output without ever
+	// holding it, and being the deepest step it was also the largest term.
+	double held = estimate.factorized_records;
+	if (thresholds.last_join_fused && steps.size() > 1) {
+		held = std::max(1.0, held - node_records.back());
+	}
+	estimate.bytes =
+	    held * (thresholds.bytes_per_record + thresholds.bytes_per_relation * static_cast<double>(steps.size()));
 
 	if (thresholds.require_acyclic && !acyclic) {
 		estimate.reason = "cyclic join graph";

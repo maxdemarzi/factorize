@@ -1109,10 +1109,24 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// another pass over the input, and the gate is a bet about time.
 	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
 	thresholds.memory_slack = DoubleSetting(context, "factorize_memory_slack", thresholds.memory_slack);
+	// The operator's IsPlainCount, restated: only then is the last join fused.
+	thresholds.last_join_fused = !region.grouped && region.aggregates.size() == 1 &&
+	                             region.aggregates[0].kind == factorize::Aggregate::COUNT;
 	// BuildPlan has already refused anything that cannot be arranged as a tree.
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	reason = estimate.reason;
 	predicted_bytes = estimate.bytes;
+	// What the gate expects standing after each step, printed in the same shape
+	// as the operator's measured steps so the two can be laid side by side.
+	if (ExplainRequested(context)) {
+		string line = "[factorize] gate predicted: ";
+		for (idx_t i = 0; i < estimate.step_records.size() && i < plan.steps.size(); i++) {
+			line += StringUtil::Format("[%llu: %.4g recs] ", static_cast<uint64_t>(plan.steps[i].relation),
+			                           estimate.step_records[i]);
+		}
+		line += StringUtil::Format("flat %.4g bytes %.4g", estimate.flat_tuples, estimate.bytes);
+		Printer::Print(line);
+	}
 	if (estimate.fire || !stats.UsingSample()) {
 		return estimate.fire;
 	}

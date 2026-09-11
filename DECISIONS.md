@@ -2767,3 +2767,150 @@ The first report of that run called the two no-answers "KILLED": the script
 tested for empty output before it tested the exit code, and a process that
 `timeout` stops at 300s has not printed anything yet. Exit 124 is a timeout; a
 kill is 137.
+
+## D44 — The size check charged a join the engine never builds
+
+D43 reopened `memory_slack`, 8 against 64. Re-measuring it against the
+estimate it compensates for would have spent four hours answering a question
+about a known-wrong number, so the estimate went first. D42 established the
+record estimate was ~1,000x high and attributed it to the recurrence as a
+whole; nobody had set it beside the operator step by step. With the gate now
+printing its predicted records per step under `factorize_explain`, in the shape
+of the operator's own `StepStats`, the seven excluded-regime queries that answer
+fastest were run both ways.
+
+**Most of the error was one step, and not the recurrence.** A plain `count(*)`
+fuses its last join into the count (`FactorizedCountJoin`); that join's output
+is counted as it is produced and never held. The estimator charged it anyway,
+and being the deepest step -- the one multiplied most -- it was the largest
+term in every prediction:
+
+    query          last join's share   predicted bytes        engine's own
+                   of predicted        before      after      peak held
+    hetio_203_16         96%           24.1 GB  (133x)  1.06 GB  (5.9x)    172 MB
+    hetio_203_19         78%           16.2 GB  (144x)  3.49 GB (31.1x)    107 MB
+    hetio_204_02         87%           25.0 GB   (17x)  3.28 GB  (2.2x)   1442 MB
+    hetio_204_03         79%           29.2 GB   (22x)  6.15 GB  (4.5x)   1292 MB
+    hetio_208_15         78%           17.2 GB  (160x)  3.72 GB (34.5x)    103 MB
+    hetio_216_01         84%          181.5 GB  (848x) 29.63 GB (138x)     204 MB
+    hetio_216_02         96%           33.7 GB   (38x)  1.32 GB  (1.5x)    845 MB
+
+"Peak held" is the slice budget's high-water mark (D43), which is what the size
+check is actually a claim about; D42's 1,390x was measured against the final
+representation's bytes, a smaller and less relevant number.
+
+The fix charges only what is built: `CostThresholds::last_join_fused`, set by
+the gate exactly when the operator's `IsPlainCount` holds, drops the last
+step's records from the byte estimate. Sums and grouped queries go through the
+fold, which materializes every join, and are charged in full as before. Only
+the byte estimate changes -- `factorized_records` still feeds the time model,
+whose per-record coefficient was fitted against it, so no gate decision moves
+except through the size check.
+
+**What is left is pruning, and it runs the other way.** A later join removes
+parent records whose value finds no partner, so the measured representation
+often *shrinks* at a step -- `hetio_203_19` goes from 422K records to 273K --
+while the recurrence only ever adds. That is the residual 1.5x-138x, median
+about 6x. Modelling it means per-step survival, which the recurrence has no
+term for; not attempted here.
+
+**Attribution, measured rather than assumed.** Each variant swept over both
+corpora with EXPLAIN (planning only):
+
+    variant                     runnable fires   excluded fires (slack 8)
+    before                            35              280 of 481
+    byte fix only (shipped)           35              312
+    byte fix + FlatFor fix            43              318
+
+The byte fix leaves the runnable corpus's fired set identical and admits 32
+excluded-regime queries -- 24 of them among the 43 that raising the slack to 64
+was reaching for. Correcting the estimate recovers most of what inflating the
+tolerance around it did.
+
+### D44a — A real estimator bug, fixed, measured, and not taken
+
+The step comparison also exposed a bug in D41's cross-class fold.
+`EstimateGroup` returns early for a one-relation class without filling
+`flat_by_value` or `tail_flat_per_value`, so `GroupSize::FlatFor` returns 0 for
+every value -- and a one-relation class hanging beneath a two-column relation
+is the common shape on graph data. The parent's MCV head then contributes
+nothing to the seam. Against a closed form (hubs of 400 and 300 on the same
+five values over a tail of ones), the estimate was 7,485 tuples for an exact
+605,995, 81x low; with the per-value sizes filled in, 607,488. A two-relation
+child class was already exact.
+
+Fixed, it admits 8 more runnable queries, and every one of them loses:
+
+    query                      off       auto      
+    epinions_acyclic_211_00   0.023s    0.054s   0.43x
+    epinions_acyclic_211_08   0.020s    0.057s   0.35x
+    epinions_acyclic_211_16   0.017s    0.056s   0.30x
+    epinions_acyclic_218_08   0.024s    0.062s   0.39x
+    epinions_acyclic_218_16   0.036s    0.066s   0.55x
+    watdiv_acyclic_213_09     0.018s    0.134s   0.13x
+    yago_acyclic_Chain_9_24   0.008s    0.030s   0.27x
+    yago_acyclic_Chain_9_48   0.022s    0.038s   0.58x
+
+All correct, all tiny, together +0.33s. On the excluded regime it adds 6 fires.
+The corrected number is right and the decision it drives is worse, because the
+runnable corpus's tuple estimate already runs high -- median 15x over, p90 over
+2,000x -- and raising DuckDB's predicted cost further lifts small queries over
+the work floor. Shipping it would mean either taking those losses or tuning a
+threshold to cancel them, and this project has twice paid for compensating a
+broken input with a threshold (D41's margin, D42's slack). So it is recorded
+here and left out: the fix is a few lines in the size-1 branch of
+`EstimateGroup` (copy `mcv` into `flat_by_value`, sorted by value; set
+`tail_flat_per_value` to `TailRows() / TailDistinct()`), and it belongs with
+whatever corrects the over-prediction on the runnable corpus, not before it.
+
+### D44b — What the fix admits, and the slack re-decided
+
+**What the 32 it admits did.** Each run twice, alone on the VM, factorized
+(`auto`) then stock (`off`), 300s cap, peak RSS from the process:
+
+    outcome                                  queries
+    answered only when factorized                 9   0.9s-166s; stock times out on all nine
+    answered by both, stock faster                4   all watdiv: 344.9s here, 138.5s stock
+    answered by neither                          19
+    answered by stock and not here                0
+
+Every answer is correct. Of the 19 no-answers, 16 exceeded the per-slice
+budget and abandoned to the section 7.5 fallback, whose stock plan then timed
+out as the stock run did; 3 (`hetio_216_07`, `218_11`, `218_19`) ran
+factorized to the cap. Every peak above 1.5GB was the stock plan after a
+fallback, and the stock run of the same query matched it: 13,050MB against
+12,922MB on `watdiv_210_16`, 11,160 against 11,130 on `hetio_218_15`.
+
+The four watdiv queries are the cost, and they correct a premise. The excluded
+regime is defined by result size -- CE disables anything over 1e9 tuples --
+not by DuckDB failing, and on these four DuckDB answers in 13-89s:
+
+    query                   here      stock
+    watdiv_acyclic_217_05   63.0s     13.3s   abandoned to the fallback
+    watdiv_acyclic_217_10   23.5s     12.9s   abandoned to the fallback
+    watdiv_acyclic_217_15  119.8s     89.3s   abandoned to the fallback
+    watdiv_acyclic_218_15  138.6s     23.0s   finished factorized
+
+Before this change they declined on size, which was the right answer for the
+wrong reason. What admits them now is the watdiv error the gate has always
+had -- DuckDB runs 3-24x faster there than predicted (cost.hpp header) -- no
+longer hidden behind an inflated size. Nine answers nobody else produces
+against 206s on four queries that are still answered is the trade taken. The
+watdiv error belongs to the tuple estimate and is recorded here, not
+compensated with a threshold.
+
+**Slack, re-decided.** Fires on the excluded regime at the 6.3GiB budget:
+
+    slack   before   after
+       1      235      262
+       8      280      312
+      64      323      345
+
+8 stays, now for a reason that holds: it covers the residual over-prediction --
+1.5x-138x, median about 6x, never under on the queries measured -- rather than
+a 17x-848x one. 64 still adds 33, `hetio_acyclic_216_04` among them, which
+neither engine answers.
+
+Validated: 682 core checks and 739 SQL assertions, 0 failures, no sanitizer
+reports; CE corpus forced, 119 taken over, 0 wrong; auto with shipped
+defaults, 35 taken over -- the identical set -- 0 wrong.

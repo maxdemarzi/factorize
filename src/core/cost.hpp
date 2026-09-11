@@ -99,6 +99,11 @@ struct CostEstimate {
 	double duckdb_ms = 0;
 	//! Estimated bytes the f-representation will occupy.
 	double bytes = 0;
+	//! Records predicted to be standing after each step, cumulative, in plan
+	//! order -- the same shape as the operator's measured StepStats, so the
+	//! step where the recurrence departs from the representation is visible
+	//! rather than inferred from one total that is 1,000x off (D42).
+	std::vector<double> step_records;
 	//! Whether the join graph is acyclic. The paper reports cyclic queries as
 	//! 32% slower, so they are refused outright.
 	bool acyclic = true;
@@ -190,6 +195,13 @@ struct CostThresholds {
 	//! rising from 37 at three relations to 64 at twelve.
 	double bytes_per_record = 28.0;
 	double bytes_per_relation = 3.0;
+	//! Whether the plan's last join is fused into the count and never built.
+	//! True for a single ungrouped count(*) -- the operator's IsPlainCount --
+	//! and false for anything that goes through the fold, which materializes
+	//! every join. The size check charges only what is built: on the excluded
+	//! regime the final join was 78-96% of every predicted size, for a
+	//! representation that never exists (D44).
+	bool last_join_fused = false;
 	//! Decline when the f-representation is predicted not to fit. Zero means no
 	//! limit.
 	//!
@@ -216,36 +228,24 @@ struct CostThresholds {
 	//! so a query predicted not to fit is predicted to be slow.
 	//!
 	//! Relaxed from 1 because the prediction is not good enough to ban a query
-	//! on. Measured against what those queries actually build: `hetio_203_16`
-	//! is predicted at 24GB and holds 17MB, over by 1,390x; `hetio_203_19` at
-	//! 16GB against 15MB, over by 1,090x. Both answer in under a second, and
-	//! DuckDB answers neither at all. On the corpus the CE benchmark disables,
-	//! 134 of 138 declines were this one check firing on numbers like those.
+	//! on. Most of what made it bad is gone: the size check used to charge a
+	//! fused last join that a count never builds, 78-96% of every prediction
+	//! (D44). Against the slice budget's own peak, `hetio_203_16` went from
+	//! 24GB predicted for 172MB held (133x) to 1.06GB (5.9x). What remains is
+	//! pruning the recurrence cannot see -- a later join removes parent
+	//! records with no partner -- and it still runs 1.5x-138x over, median
+	//! about 6x, never under on the queries measured.
 	//!
-	//! The direction of the error is what makes relaxing it right at all. A
-	//! record count comes out of a recurrence that multiplies down the join
-	//! tree, so its errors compound upward, while the tuple estimate feeding
-	//! the same model runs 100x *low* (D41). Being over by three orders of
-	//! magnitude is the normal case, not the tail.
+	//! 8 covers that residual. With the fix in, at a 6.3GiB budget, the
+	//! excluded regime fires on 262 / 312 / 345 of 481 at slack 1 / 8 / 64.
+	//! Of the 32 queries the fix newly admits at 8, run both ways: 9 answered
+	//! that DuckDB does not inside 300s, 4 watdiv queries answered by both and
+	//! slower here (345s against 139s), 19 answered by neither, 0 lost.
 	//!
-	//! 8 and not 64, which is where this was first set and shipped. 64 admits
-	//! `hetio_acyclic_216_04`, which neither engine can answer, and firing it
-	//! spends minutes slicing before handing it to a stock plan that then
-	//! fails exactly as it would have anyway. Declining saves that time.
-	//!
-	//! This comment used to say the stock plan answered nothing "but uses almost
-	//! no memory doing it", which made declining look like it also saved the
-	//! machine. That was a misreading: the memory was sampled after the process
-	//! had already exited. Measured while running, at a 4GB limit, stock DuckDB
-	//! peaks at 4077MB and the fallback at 4085MB -- both fill DuckDB's limit,
-	//! and what took the host down was that limit (80% of an uncapped VM), not
-	//! this engine (D43). So the case for 8 over 64 is time lost on queries
-	//! nothing can answer, weighed against answers on the ones 64 would add, and
-	//! that trade has not been re-measured since the premise changed.
-	//!
-	//! At 8 that query declines on a 433GB prediction while the excluded regime
-	//! still gains 45 of the 88 fires that 64 was reaching for: 235 -> 280 of
-	//! 481, against 323 at 64 (D42).
+	//! 64 still adds 33 more, `hetio_acyclic_216_04` among them, which neither
+	//! engine answers: firing it spends minutes before the stock plan fails as
+	//! it would have anyway. That this also saved the machine was a misreading
+	//! -- stock DuckDB and the fallback both fill DuckDB's limit on it (D43).
 	double memory_slack = 8.0;
 	//! Refuse cyclic join graphs.
 	bool require_acyclic = true;
