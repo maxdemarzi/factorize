@@ -3229,3 +3229,66 @@ foreign keys, where it is right by construction (test_cost.cpp).
 Not taken; reverted. The measurement harness ships as
 `scripts/compare-records.sh` -- the first tool here that sets the gate's
 prediction beside the operator's own numbers step by step.
+
+## D50 — The domain bound is real and the model built on it is worse
+
+D49 ended on a statistic rather than a formula: overlap at a class seam sits
+between containment, `min(V_a, V_b)`, and independence over a domain of N,
+`V_a * V_b / N`, and neither row nor distinct counts can say where. DuckDB's
+column statistics carry min and max, which bound N, and the sampler did not
+pass them through. Measured on the corpus, the domain is much wider than the
+values in it:
+
+    column             distinct   domain / distinct
+    yago37.d              1,763       2,313x
+    yago6.s             118,213          15.6x
+    epinions75922.s       6,329          12.0x
+    watdiv1052644.s      77,757           8.6x
+    hetio45160.s          9,526           3.0x
+
+So the bound is informative, and the existing formula is the containment
+special case of the general one: a parent tail value finds partners only if the
+child class holds it -- `common / V_parent` of them do -- and then finds the
+class average, `flat / V_child`, which is exactly `flat / max(V_p, V_c)` when
+common is `min(V_p, V_c)`. Plumbed through (unused first, and verified to
+change no decision on either corpus), then switched on at the seam.
+
+**It is much worse.** The tuple estimate on the runnable corpus, log10 of
+predicted over exact:
+
+    query shape      shipped   with overlap
+    2 classes          +0.58      +0.58
+    3 classes          -0.66      -0.66
+    4+ classes         +1.01      -4.78
+
+Four-class queries go from 10x over to 60,000x *under*. The runnable corpus
+fires on 20 queries instead of 35, losing `epinions_216_08` (26x), `205_00`
+(6.7x) and `217_04` (3.5x) among them, and times 6.612s against 6.233s. The
+excluded regime falls from 312 fires to 237.
+
+**Why the bound does not do what it promised.** A range is a weak proxy for a
+key domain: graph identifiers are sparse inside it, so independence treats two
+columns as independent draws from a space far larger than the one they really
+share, and under-predicts the overlap -- 113 common values for `yago6.s` and
+`yago37.d`, where containment says 1,763 and the truth is 306. Under by 2.7x
+where containment is over by 5.8x, and compounded once per seam that is four to
+five orders of magnitude by the fourth class. These columns are not independent
+draws: they are subsets of one entity set joined along real edges, which is the
+correlation containment accidentally encodes and independence discards.
+
+Not taken; reverted, plumbing included, since a statistic no model reads is
+dead weight. The diff is kept with D44a's, D45's, D46's and D49's.
+
+**Five fixes, five rejections, one pattern.** D44a corrected a seam that
+returned zero, D45 an order-dependent class size, D46 three sampler errors, D49
+the missing pruning term, D50 the containment assumption. Each is right in
+isolation and each made the gate worse, because the estimator's errors are
+load-bearing: they cancel against each other and against the cost
+coefficients, which were fitted on top of them (D48). What this says is that
+the next attempt should not be another single correction. Either several move
+together with a refit -- the estimator's inputs and the coefficients in one
+change, judged on measured time and the measured excluded-regime wins -- or the
+gate stops predicting sizes it cannot predict and decides on something it can
+measure: D37's abandon-on-measured-compression already does this at run time,
+and it is the one mechanism here that has never needed the estimator to be
+right.
