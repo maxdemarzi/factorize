@@ -3049,3 +3049,49 @@ statements too, so the first three-way run read a `SET` as the shipped timing
 (0.000s everywhere) and was discarded; the harness that timed D44a's losers had
 the same off-by-one in its auto column, which biases those times low and
 reverses none of them.
+
+## D47 — Counting fires in the excluded regime does not measure benefit
+
+D42 wrote that "in the >1e9-tuple regime DuckDB does not finish, so firing more
+is strictly better there", and every decision since has used the excluded
+regime's fire count as the benefit side of its trade: D42's slack curve
+(252/295/332/354), D42a's re-measurement at a smaller budget, D44b's case for
+keeping `memory_slack` at 8 (262/312/345), and D46's "+9 fires, none lost".
+
+Measured, it is false. D46's nine new fires, each run both ways alone on the
+VM, 300s cap:
+
+    query                      fired      stock       outcome
+    hetio_acyclic_210_09        142.8s     no answer   win
+    hetio_acyclic_211_14         80.5s     no answer   win
+    watdiv_acyclic_210_06         0.5s      12.6s      win, 25x
+    hetio_acyclic_204_01         45.0s      35.7s      +9.3s, fell back
+    hetio_acyclic_204_08         39.3s      29.6s      +9.7s, fell back
+    yago_acyclic_Chain_12_63      0.6s       0.02s     +0.6s
+    yago_acyclic_Chain_12_06     23.7s       0.02s     +23.7s
+    yago_acyclic_Chain_9_71   no answer      3.9s      +296s
+    watdiv_acyclic_205_19     no answer      5.1s      +295s
+
+Three wins, six losses, two of them a 300-second cap against a 4-5 second
+stock answer. The regime is defined by *result size* -- CE disables anything
+over 1e9 tuples -- and a query can have 1e10 tuples and still be answered in
+seconds, because a count(*) carries no payload and DuckDB's hash joins are
+fast. "DuckDB does not finish" was measured on a sample of hetio queries and
+generalised to 481 queries of four datasets, three of which it does not
+describe.
+
+**What this invalidates.** Any decision whose benefit was a fire count on this
+corpus: the slack curves in D42, D42a and D44b, and D46's nine fires. It does
+not touch decisions measured by running the queries: D44's byte fix was judged
+on its 32 admissions run both ways (9 answered that stock does not, 0 lost, 4
+answered by both but slower here), and that measurement stands.
+
+**What it costs to fix.** The excluded corpus needs a stock baseline -- every
+query timed under `factorize_mode='off'` at a fixed cap -- so "fires" can be
+replaced by "answers stock does not produce, minus time lost on the ones it
+does". Until that exists, this corpus can say a setting is *safe* (nothing
+declined that used to fire) but not that it is *better*.
+
+**D46 is rejected.** It made the runnable corpus 1.5s slower and the excluded
+regime three wins and six losses. Recorded above; the diff stays out of the
+tree.
