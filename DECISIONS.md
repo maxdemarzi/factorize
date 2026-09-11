@@ -2914,3 +2914,58 @@ neither engine answers.
 Validated: 682 core checks and 739 SQL assertions, 0 failures, no sanitizer
 reports; CE corpus forced, 119 taken over, 0 wrong; auto with shipped
 defaults, 35 taken over -- the identical set -- 0 wrong.
+
+## D45 — A second correct estimator fix, measured and not taken
+
+After D44 the open item was the tuple estimate. Split by shape, the runnable
+corpus's worst errors were single-class yago stars: 575x *low* at the median
+and 700,000x low at p10 -- `yago_acyclic_Star_6_22` predicted at 0.017 tuples
+for a join of 5,519. Rerun with `factorize_gate_exact_stats` the same query
+came out 13-72x high rather than 300,000x low, so the collapse was in the
+statistics path, not the head of the model; and a single class never reaches
+the cross-class fold, so it had to be `EstimateGroup`'s tail.
+
+**The bug.** The tail combines relations pairwise with the textbook rule,
+`|R join S| = |R||S| / max(V_R, V_S)`, but carried the running *maximum*
+domain forward, where the rule leaves `min(V_R, V_S)` values on the key. Every
+narrow relation after a wide one was divided by the wide domain again, so a
+class's size depended on the order its relations were listed in. On
+Star_6_22 -- two 118K-value columns, then four 1.8K-value ones -- that is four
+extra factors of about 67. It had been there since the first commit
+(`f416f0a`) and no test could see it: the foreign-key test's one narrow
+relation comes last, where max and min agree, and the randomised test gives
+every column the same domain.
+
+**Fixed, it is right.** A test with the same six relations in two orders went
+from 1,000,000x low (wide first) against exact (narrow first) to exact in both.
+On the corpus:
+
+    log10(predicted / exact)            before         after
+    yago Star, median                   -2.76  (575x)   0.62  (4x high)
+    runnable single-class, p10          -5.51           -0.20
+    excluded single-class, median       -1.97  (93x)   -1.48  (30x)
+
+**And it makes the decisions worse.** The excluded regime's fired set does not
+move (312). The runnable corpus gains one fire, `watdiv_acyclic_202_06`, and it
+is the worst loss this gate has admitted in months: 0.044s stock, 5.837s fired,
+133x. Its prediction went from 3.4e7 tuples (3x over the exact 1.13e7, declined
+on the margin) to 1.9e8 (17x over, fired). The rule the fix restores is
+containment -- the narrow relation's values all appear in the wider one -- and
+on watdiv they mostly do not (F18 measured 18% on `watdiv_212_15`), so the
+correct textbook rule over-predicts there, and the max had been cancelling it.
+Our side is off on this query too: 12.7M records across its steps in 4.1s on
+one thread, about 8x the fitted per-record cost.
+
+This is D44a again. Two correct fixes to the tuple estimate, each of which
+raises it, meet a runnable corpus where it already runs 10x high at the median
+and a watdiv regime where both engines' costs are mispredicted, and each is
+paid for there. Not taken: the fix is one token (`std::max` to `std::min` on
+the tail's running domain) plus `TestClassSizeIgnoresOrder`, both kept out of
+the tree with D44a's.
+
+**What this says about the order of work.** The estimator cannot be repaired
+from the bottom up one bug at a time: its errors currently cancel, and removing
+one that under-predicts exposes the ones that over-predict. The over-prediction
+on the runnable corpus -- containment on watdiv, and `Frequency` treating every
+head value as present in every relation -- has to be corrected first or
+together with these, or every correct fix will cost the runnable corpus.

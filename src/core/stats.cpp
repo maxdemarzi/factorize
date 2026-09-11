@@ -90,6 +90,16 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
 
 	// The tail: values nobody stored. Here uniformity is the right model,
 	// because the tail is what is left after the skew has been taken out.
+	//
+	// Known bug, measured and left in place deliberately. The textbook rule
+	// leaves min(V_R, V_S) values on the key after a join; this carries the
+	// *max* forward, so a narrow relation after a wide one is divided by the
+	// wide domain again and a class's size depends on the order of its
+	// relations -- 0.017 tuples for a join of 5,519 on yago_acyclic_Star_6_22.
+	// Fixed, it is right and the gate is worse: on watdiv containment does not
+	// hold, the max had been cancelling that, and the one query the fix newly
+	// admits runs 133x slower than stock (D45). It belongs with the fix for the
+	// over-prediction on the runnable corpus, not before it.
 	double tail_flat = group[0].TailRows();
 	double tail_domain = group[0].TailDistinct();
 	for (size_t i = 1; i < group.size(); i++) {
