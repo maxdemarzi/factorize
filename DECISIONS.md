@@ -3095,3 +3095,69 @@ declined that used to fire) but not that it is *better*.
 **D46 is rejected.** It made the runnable corpus 1.5s slower and the excluded
 regime three wins and six losses. Recorded above; the diff stays out of the
 tree.
+
+## D48 — The cost coefficients were compensating for the record estimate, and cannot be refitted alone
+
+D47 left the refit as the next step: three correct fixes to the gate's inputs
+(D44a, D45, D46) had each made its decisions worse, which pointed at the
+decision layer rather than the estimates. The procedure is the one O11 asked
+for -- measure this machine, fit the coefficients to it -- with one correction:
+the model charges our side per *record*, and the previous fit had been driven by
+result tuples, which is a different quantity. Per query: input rows, the records
+the operator actually built (summed over its materialised steps, read from
+`factorize_explain`), the exact result size, a warm stock time and a warm forced
+time. DuckDB fitted at the 25th percentile, ours at the 75th, as the asymmetry
+the gate depends on requires.
+
+    fitted, our side timed at threads=1     shipped
+    duckdb  8.51ms + 7.45e-7/row + 1.17e-6/tuple    0 + 2.324e-5 + 3.981e-6
+    ours    0 + 3.69e-5/row + 4.94e-5/record        0.108542 + 2.445e-5 + 3.961e-5
+
+The per-input-row term for DuckDB was **31x too high**: a scan it does in 1.4ms
+was charged 1.4 seconds, which is most of why the gate fired on queries DuckDB
+answers in milliseconds. A real 8.5ms fixed cost per query appears in its place.
+
+**The replay said take it; measuring said otherwise.** Replayed over the same
+116 queries against their measured times, margin 3 came out at 9.112s with two
+regressions, against the shipped pair's 9.588s with ten (all-stock 19.369s,
+perfect gate 8.418s). Applied to the gate and measured -- rebuild, both test
+suites, then timed three ways over every query either binary fires on -- it was
+*slower*: 6.000s against 5.835s. The cause is in the replay's own inputs: our
+side had been timed at `threads=1` while the operator runs one slice per thread,
+so `watdiv_acyclic_212_05`, which fires in 0.508s on eight threads, was judged
+on a 1.2s single-threaded run, declined, and lost 0.698s -- more than the 0.61s
+gained by declining four watdiv losers.
+
+Re-collected at the default thread count the fit changes again -- ours to
+2.68e-4 per input row and 3.25e-4 per record, *higher*, because eight slices
+re-read the inputs eight times, which is the slicing tax D39 measured -- and no
+margin beats what ships: 10.882s against 10.920s.
+
+**Every candidate fails the excluded regime.** D47 said that corpus cannot be
+scored by counting fires, but it can be scored on the 44 queries whose outcome
+has actually been measured: 15 where firing is right (12 that stock does not
+answer at all, 3 that it answers slower) and 10 where it is wrong. The refitted
+coefficients keep **1 or 2 of the 15**, at every margin and floor.
+
+The reason is the entanglement. hetio's queries have large inputs, and their
+record estimate is over by about 1,000x (D42), so our side is predicted to take
+minutes. The shipped DuckDB per-row term -- the 31x-too-high one -- made DuckDB
+look expensive enough to fire them anyway. Two errors held in balance: correct
+either one alone and the gate stops firing on the queries this project exists
+for, which is exactly what D44a, D45 and D46 each ran into one layer up.
+
+**So the order of work is now fixed by measurement, not by preference.** The
+record recurrence first: its known gap is pruning -- a later join removes parent
+records whose value finds no partner, and the recurrence only ever adds, which
+is why `hetio_203_19`'s representation shrinks from 422K records to 273K while
+the estimate climbs. Then the coefficients, with the excluded-regime constraint
+in the replay from the start. Then the sampler and estimator fixes held in D44a
+and D46.
+
+Nothing here is about correctness: with the refit applied the unit tests pass
+(37 checks) and the SQL suite passes (610 assertions). It is about which queries
+the gate takes. Reverted; the harness ships --
+`scripts/calibrate-measured.sh` measures the inputs and
+`scripts/refit-measured.py` fits and replays both corpora, superseding
+`refit-cost.py`. The excluded-regime constraint is the part that turned a
+four-hour answer into a twenty-minute one.
