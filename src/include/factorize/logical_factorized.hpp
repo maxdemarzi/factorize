@@ -71,6 +71,9 @@ public:
 	//! Least compression a materialized join must reach for the plan to carry
 	//! on; 0 = no check. Measured after the join rather than predicted before it.
 	double min_compression = 0;
+
+	//! Milliseconds of slice time before `min_compression` may abandon (D51).
+	double abandon_after_ms = 0;
 	//! Print what each materialized join left behind, for factorize_explain.
 	bool explain_steps = false;
 	//! The join order, decided when the region was matched. Ordering at match

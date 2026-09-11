@@ -464,20 +464,44 @@ StepStats MeasureStep(size_t relation, const FactorizedRelation &accumulated) {
 //!
 //! Deliberately not MemoryLimitExceeded. Slicing a query that is not
 //! compressing makes several smaller copies of the same mistake.
+//!
+//! Two measured quantities, not one. A poor ratio alone is not a reason to
+//! stop: most queries that compress badly also finish in milliseconds, which
+//! is why a floor on its own abandoned 17 of 248 out-of-sample queries (D37).
+//! The ones worth abandoning are those where the ratio is poor *and* real time
+//! has already gone into it -- every catastrophic loss measured has that shape,
+//! 300s against stock's 5.1s, 1.065s against 0.015s -- and both halves are
+//! read off the run rather than predicted before it.
 void CheckCompression(const StepStats &step, size_t step_index, size_t total_steps) {
 	const double floor = GetGlobalMinCompression();
 	if (floor <= 0 || step.live == 0) {
+		return;
+	}
+	// Never on the first materialized join. Records grow by a sum over joins
+	// and tuples by a product, so the product has not overtaken yet and a ratio
+	// near 1 there says nothing: measured, the first step is 0.94 on a 142s win
+	// and 0.50, 0.95, 0.99 on three queries worth abandoning. The second step is
+	// what separates them -- 43.8 against 0.33, 0.97, 2.34 -- and judging at the
+	// first is what made a floor abandon a query only this engine can answer,
+	// and what a floor calibrated to 0.6 was working around (D37, D51).
+	if (step_index <= 1) {
 		return;
 	}
 	const double achieved = step.Compression();
 	if (achieved >= floor) {
 		return;
 	}
+	const double after = GetGlobalAbandonAfter();
+	const double elapsed = ElapsedSliceMs();
+	if (after > 0 && elapsed < after) {
+		return;
+	}
 	throw std::runtime_error("join " + std::to_string(step_index) + " of " + std::to_string(total_steps - 1) +
 	                         " left " + std::to_string(step.live) + " records standing for " +
 	                         std::to_string(step.tuples) + " tuples, a compression of " +
 	                         std::to_string(achieved) + " against a floor of " + std::to_string(floor) +
-	                         ", so factorizing this query is not paying for itself");
+	                         " after " + std::to_string(static_cast<long long>(elapsed)) +
+	                         "ms, so factorizing this query is not paying for itself");
 }
 
 } // namespace

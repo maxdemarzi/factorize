@@ -227,7 +227,21 @@ double GetGlobalMinCompression();
 //! `factorized_count` could abandon against a prediction made for a different
 //! query entirely. Taking all three together is what makes the omission
 //! impossible to write.
-void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression);
+//! Milliseconds of slice time before the compression floor may abandon.
+//!
+//! The floor alone was measured and shelved: at 0.6 it abandoned 17 of 248
+//! out-of-sample queries (D37), because a query that compresses badly and
+//! finishes in 20ms costs nothing to finish. Time is what separates those from
+//! the ones worth stopping, and it is measured rather than predicted -- which
+//! is the property five rejected estimator fixes were missing (D50).
+void SetGlobalAbandonAfter(double milliseconds);
+double GetGlobalAbandonAfter();
+
+//! Milliseconds since this slice's limits were set.
+double ElapsedSliceMs();
+
+void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression,
+                     double abandon_after_ms = 0);
 
 //! Builds a flat, single-node relation from columnar input. This is the
 //! trivial f-representation of section 4.2.1.

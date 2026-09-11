@@ -1224,6 +1224,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					// whole SQL suite into a test of the fallback, passing all
 					// the way and covering nothing (D25, D26 again).
 					replacement->min_compression = gated ? DoubleSetting(context, "factorize_min_compression", 0.0) : 0.0;
+					replacement->abandon_after_ms = DoubleSetting(context, "factorize_abandon_after_ms", 2000.0);
 					replacement->explain_steps = explain;
 					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
 					if (slack > 0 && predicted_bytes > 0) {
@@ -1359,6 +1360,11 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Abandon to the stock plan when a materialized join leaves fewer than this many "
 	                          "tuples per record, measured rather than predicted (0 disables)",
 	                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
+	config.AddExtensionOption("factorize_abandon_after_ms",
+	                          "Milliseconds of slice time before factorize_min_compression may abandon; below it a "
+	                          "query that compresses badly is left to finish, because finishing is cheap (0 abandons "
+	                          "as soon as the floor is missed)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(2000.0));
 	config.AddExtensionOption("factorize_memory_slack",
 	                          "How far past the memory budget the predicted f-representation size may go before the "
 	                          "gate declines on size alone; the run time slices or abandons either way, so this only "

@@ -3292,3 +3292,65 @@ gate stops predicting sizes it cannot predict and decides on something it can
 measure: D37's abandon-on-measured-compression already does this at run time,
 and it is the one mechanism here that has never needed the estimator to be
 right.
+
+## D51 — Abandoning on measured compression: two defects fixed, and why the floor still cannot be turned on
+
+D50 ended by pointing away from prediction and towards what can be measured
+mid-flight. That mechanism already exists: D37's compression floor abandons to
+the stock plan when a materialized join leaves fewer than N tuples per record.
+It has shipped disabled ever since, because calibrated at 0.6 it abandoned 17 of
+248 out-of-sample queries.
+
+**Two defects, both measured.**
+
+*The first join was judged when it cannot be.* Records grow by a sum over joins
+while tuples grow by a product, so the product has not overtaken yet and the
+first step's ratio says nothing. Measured, it is 0.94 on a 142-second win and
+0.50, 0.95 and 0.99 on three queries worth abandoning. With the floor on,
+`hetio_acyclic_205_03` -- 142s here, no answer at all from the stock plan --
+was abandoned at its first join. The first join is now exempt, which is also
+what a floor calibrated down to 0.6 was working around.
+
+*Nothing separated "not compressing" from "not worth finishing".* Most queries
+that compress badly finish in milliseconds, and finishing them costs nothing.
+A gate on slice time does separate them, and like the ratio it is read off the
+run rather than predicted: `factorize_abandon_after_ms`, default 2000.
+
+With both, on the cases that motivated it:
+
+    query                    floor 0   floor 5   stock
+    watdiv_acyclic_217_05      44.0s     19.4s   13.3s
+    watdiv_acyclic_218_15      97.8s     19.5s   23.0s
+    watdiv_acyclic_217_10      14.5s      9.7s   12.9s
+    hetio_acyclic_205_03      140.9s    141.0s   no answer   (win, survives)
+    watdiv_acyclic_216_10       1.2s      1.2s    0.6s       (under the gate)
+    epinions_acyclic_216_08     0.1s      0.1s    0.9s       (under the gate)
+
+**And it still cannot be turned on by default.** Across the excluded-regime
+queries whose outcome has been measured, a floor of 5 saves about 240 seconds on
+the four watdiv queries the gate should not have fired on -- and destroys three
+wins: `hetio_acyclic_211_07` (92.6s), `211_10` (77.0s) and `216_14` (38.7s)
+return no answer at all, because abandoning hands them to a stock plan that does
+not finish inside 300s.
+
+No floor separates them, because the measured ratios overlap exactly:
+
+    hetio_acyclic_216_14    WIN    0.86  0.336  1.87   294
+    watdiv_acyclic_217_05   LOSS   0.50  0.333  0.25  0.20
+
+0.336 against 0.333, at the same step. Nor does the trajectory:
+`watdiv_acyclic_218_15` climbs to 128x and is still a loss, because its problem
+is not compression at all. Our engine is slower per record on watdiv than DuckDB
+is per tuple -- F18's K spans 84x across these datasets -- and no ratio of
+tuples to records can see that.
+
+So the mechanism ships and the floor stays at 0, which leaves it inert unless
+someone sets it. What would make it usable is a *rate* rather than a ratio:
+tuples per second achieved against what DuckDB achieves on this machine. Both
+are measurable, neither is measured mid-flight today, and that is the next thing
+to build on this path.
+
+Tested: the exemption is pinned in the core suite -- a three-relation chain,
+whose only materialized join is the first, must run to completion -- and the
+gate has its own case in the SQL suite, where the same impossible floor leaves
+the same query alone because two seconds have not passed.

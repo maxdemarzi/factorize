@@ -2013,6 +2013,14 @@ SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
 # The floor turned on. The answer must not move: abandoning runs the plan that
 # was replaced, and §7.5 exists so that the user cannot tell the difference in
 # anything but time.
+#
+# The clock is turned off for these, because they are about the ratio. A query
+# this small finishes in about a millisecond, so with the shipped two-second
+# gate nothing here would abandon at all -- which is the point of the gate and
+# is tested on its own below (D51).
+statement ok
+SET factorize_abandon_after_ms = 0;
+
 statement ok
 SET factorize_min_compression = 1000.0;
 
@@ -2041,6 +2049,24 @@ SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
  WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
 ----
 compression
+
+# The clock, which is the half that makes the floor safe to turn on at all. The
+# same query, the same impossible floor, the fallback still off -- and with the
+# shipped gate it runs to completion, because two seconds have not passed and a
+# query that compresses badly and finishes in a millisecond costs nothing to
+# finish. A floor without this abandoned a 142-second win at its first join
+# (D51).
+statement ok
+SET factorize_abandon_after_ms = 2000.0;
+
+query I
+SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
+ WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
+----
+4000
+
+statement ok
+SET factorize_abandon_after_ms = 0;
 
 # A floor the query clears changes nothing. The steps below measure 0.5 and
 # 0.333, so 0.3 is under both -- which is what makes this a test of the

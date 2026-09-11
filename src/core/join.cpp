@@ -1,6 +1,7 @@
 #include "join.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -25,6 +26,8 @@ namespace {
 thread_local size_t g_memory_limit = 0;
 thread_local size_t g_estimate_budget = 0;
 thread_local double g_min_compression = 0;
+thread_local double g_abandon_after_ms = 0;
+thread_local std::chrono::steady_clock::time_point g_slice_start = std::chrono::steady_clock::now();
 }
 
 void SetGlobalMemoryLimit(size_t bytes) {
@@ -50,16 +53,33 @@ void SetGlobalMinCompression(double tuples_per_record) {
 	g_min_compression = tuples_per_record;
 }
 
+void SetGlobalAbandonAfter(double milliseconds) {
+	g_abandon_after_ms = milliseconds;
+}
+
+double GetGlobalAbandonAfter() {
+	return g_abandon_after_ms;
+}
+
+double ElapsedSliceMs() {
+	const auto now = std::chrono::steady_clock::now();
+	return std::chrono::duration<double, std::milli>(now - g_slice_start).count();
+}
+
 double GetGlobalMinCompression() {
 	return g_min_compression;
 }
 
-void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression) {
+void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression,
+                     double abandon_after_ms) {
 	g_memory_limit = memory_bytes;
 	ThreadBudget().limit = memory_bytes;
 	ThreadBudget().peak.store(ThreadBudget().used.load());
 	g_estimate_budget = estimate_budget_bytes;
 	g_min_compression = min_compression;
+	g_abandon_after_ms = abandon_after_ms;
+	// The slice's clock starts here, which is where its work does.
+	g_slice_start = std::chrono::steady_clock::now();
 }
 
 size_t GetGlobalMemoryLimit() {

@@ -430,10 +430,15 @@ static void TestCompressionFloorAbandons() {
 	chain_source.Add({unique});
 	chain_source.Add({unique});
 	chain_source.Add({unique});
+	chain_source.Add({unique});
+	// Four relations, so two joins materialize and one of them is past the
+	// first. The floor exempts the first: records grow by a sum there while
+	// tuples grow by a product, so a ratio near 1 says nothing yet, and judging
+	// on it abandons queries only this engine can answer (D51).
 	QueryGraph chain;
-	chain.column_counts = {1, 1, 1};
-	chain.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
-	chain.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}};
+	chain.column_counts = {1, 1, 1, 1};
+	chain.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	chain.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}, Predicate {2, 0, 3, 0}};
 
 	// Star: one centre value per group, twenty partners in each of three arms,
 	// so a group of 61 records stands for 8000 tuples.
@@ -498,6 +503,25 @@ static void TestCompressionFloorAbandons() {
 	       "compression floor: the error says what was measured, got '" + chain_on.error + "'");
 	Expect(chain_on.slices == 1, "compression floor: the chain was not sliced, it ran " +
 	                                 std::to_string(chain_on.slices) + " slices");
+	// The exemption, pinned: three relations leave exactly one materialized
+	// join -- the first -- and the floor must not judge the query on it.
+	MemorySource short_source;
+	short_source.Add({unique});
+	short_source.Add({unique});
+	short_source.Add({unique});
+	QueryGraph short_chain;
+	short_chain.column_counts = {1, 1, 1};
+	short_chain.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	short_chain.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}};
+	const auto short_plan = BuildPlan(short_chain);
+	SetGlobalMinCompression(2.0);
+	const auto short_on = ExecuteCountWithinMemory(short_chain, short_plan, short_source, JoinMode::BOTTOM_INSERT);
+	SetGlobalMinCompression(0);
+	Expect(short_on.ok, "compression floor: a query whose only materialized join is the first is not judged on it (" +
+	                        short_on.error + ")");
+	Expect(short_on.count == 2000, "compression floor: the exempt chain still counts 2000, got " +
+	                                   std::to_string(short_on.count));
+
 	Expect(star_on.ok, "compression floor: the star still answers (" + star_on.error + ")");
 	Expect(star_on.count == star_off.count, "compression floor: the star's count is unchanged, " +
 	                                            std::to_string(star_on.count) + " against " +
