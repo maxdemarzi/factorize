@@ -2969,3 +2969,83 @@ one that under-predicts exposes the ones that over-predict. The over-prediction
 on the runnable corpus -- containment on watdiv, and `Frequency` treating every
 head value as present in every relation -- has to be corrected first or
 together with these, or every correct fix will cost the runnable corpus.
+
+## D46 — Three sampler errors, fixed together, and the gate is slower for it
+
+D45 said the runnable corpus's over-prediction had to come first. Split by
+where the statistics came from, most of it is not the model. Swept with
+`factorize_gate_exact_stats` against the shipped sample:
+
+    median log10(predicted/exact)   sampled   exact
+    2 classes                         1.74     0.00
+    3 classes                         1.72     0.07
+    4+ classes                        1.01    -0.08
+    watdiv                            0.81     0.13
+    epinions                          1.34    -0.42
+
+With exact statistics the gate fires on 20 runnable queries, a strict subset of
+the sample's 35, and the 15 only the sample fires on are a net loss: 6.98s stock
+against 8.10s fired, nine of them watdiv at 0.05x-0.38x.
+
+**Three errors, all in how the statistics are gathered.**
+
+*Clustered storage.* The sample takes one 2048-row chunk per scan range and
+scales each value's count by rows / sampled, which assumes rows were drawn
+independently of their value. `watdiv1052644` holds 3.29M rows over 77,757
+values of `s`, and `s` changes value 77,756 times in storage order -- one run
+per value. A chunk of such a table holds whole groups, and scaling them by ~200
+invents hubs. epinions and watdiv are clustered on `s`; hetio is in load order
+on both keys, which is why the sample worked there. Reproduced on synthetic
+tables clustered in groups of 32-64: two relations predicted at 3.1e8 for an
+exact 6.4e6, four at 6.0e15 for 5.2e10.
+
+*A prefix, not a sample.* The loop stops when the scan ranges run out, so a
+table of one or two row groups was sampled by its first 2048 rows. An epinions
+relation of 10K rows clustered on `s` reported its first 1,300 groups, with the
+real hubs elsewhere -- and the 5x scale-up happened to land its estimate near
+the truth on `epinions_216_08`, a 26x win.
+
+*The catalog's distinct count.* Rows and distinct counts always come from
+DuckDB's catalog, whose sketch reports 2,169 values for a clustered column of
+6,250. D41's second opinion -- fire if the catalog-only estimate says yes --
+then overruled an exact 3.2M-tuple estimate with that 3x-low count.
+
+**The fix, as built.** `SampleHoldsWholeGroups` counts runs in storage order,
+restarted at each chunk, and when the sample holds whole groups their counts are
+kept unscaled. A table no bigger than eight samples is read whole and its exact
+statistics used. The second opinion is asked only when some relation was
+actually sampled, and is printed under `factorize_explain` -- it had been
+deciding queries invisibly.
+
+It needed D44a with it. Read whole, a relation's MCV list covers every row, the
+cross-class fold puts all its weight on the child's per-value sizes, and D44a's
+`FlatFor` returns 0 for a one-relation class: three hetio queries were predicted
+at 0 tuples and declined. They are real wins on the shipped binary -- 0.1s
+against 35.4s, 0.8s against 9.3s, and 92.6s against no answer in 300s -- and
+with D44a in they fire again, predicted close to exact.
+
+**Together they are right, and on the runnable corpus they are slower.**
+Every query either binary fires on, three ways in one session per binary:
+
+    46 queries    stock 16.48s   shipped 6.89s   candidate 8.41s   0 wrong
+
+Gained: the five watdiv losers stop firing (-0.77s). Lost: tiny queries that
+accurate estimates now admit -- `yago_acyclic_Chain_12_25` 0.015s stock against
+1.065s, `Chain_9_40` 0.007s against 0.270s, six epinions queries +0.05-0.11s
+each -- and 6-10ms of planning on every fired epinions query, from reading its
+relations whole and sorting them for statistics. The excluded regime goes from
+312 fires to 321, none lost; the SQL suite passes 620 of 620.
+
+So the inputs are better and the decisions are worse, for the reason D44a and
+D45 already found one layer up: the decision layer -- D41's margin, the 5ms
+work floor, the fitted coefficients -- was tuned on inflated inputs, and on a
+tiny query our fixed per-query cost is under-charged. Not taken; the combined
+diff (429 lines, both tests included) is kept out of the tree with D44a's and
+D45's. The next step is refitting the cost model on these inputs and measuring
+what whole reads cost at plan time, then retrying this with them.
+
+One measurement correction on the way: `.timer on` prints a Run Time for `SET`
+statements too, so the first three-way run read a `SET` as the shipped timing
+(0.000s everywhere) and was discarded; the harness that timed D44a's losers had
+the same off-by-one in its auto column, which biases those times low and
+reverses none of them.
