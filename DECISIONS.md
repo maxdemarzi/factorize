@@ -3161,3 +3161,71 @@ the gate takes. Reverted; the harness ships --
 `scripts/refit-measured.py` fits and replays both corpora, superseding
 `refit-cost.py`. The excluded-regime constraint is the part that turned a
 four-hour answer into a twenty-minute one.
+
+## D49 — Pruning is the missing term, and correcting it alone makes the gate worse
+
+D48 put the record estimate first in the order of work, because the cost
+coefficients were compensating for it. Its known gap was pruning, and the first
+thing to do was measure rather than model: the gate already prints the records
+it expects standing after each step, the operator prints what it built, and
+pairing them by relation gives the error per step instead of one number for the
+query. 44 queries, 229 steps:
+
+    log10(predicted/measured)   p10     p50     p90
+    after step 1               -0.32   -0.01    1.38
+    after step 2               -0.24    0.16    1.65
+    after step 3               -0.05    0.35    1.81
+    after step 4               +0.20    0.66    1.93
+    after step 5               +0.36    0.86    2.25
+    deepest steps                       2.5-4.9
+
+The error compounds with depth and is almost never an under-prediction, and the
+representation *shrinks* at 68 of 185 step transitions -- 37% -- which is the
+pruning the recurrence has no term for: a join drops the parent records whose
+value found no partner, while the estimate only adds. (D42's "1,390x over" was
+the predicted bytes against the final representation's; paired per step on the
+same plan the median is 7.2x.)
+
+**The term, added.** One survival factor per class edge, both ways: of the
+values connecting a parent column to a child class only min(V_parent, V_child)
+can survive, so the child keeps surviving/V_child of its records and the
+parent's node keeps surviving/V_parent, carried down the tree for children and
+up for parents.
+
+    median last-step error   7.2x -> 5.8x
+    median at step 5         7.2x -> 5.2x
+    worst                  72,697x -> 33,788x
+
+Correct in direction, and small, for a reason the formula makes plain:
+min(V_p, V_c) / V_c is 1 whenever the child class is the narrower side, so only
+parent nodes prune at all. Containment is the assumption doing the damage --
+`yago6.s` holds 118,213 values and `yago37.d` 1,763, of which **306** are
+actually common, 17% where containment assumes 100% -- and that error compounds
+once per class edge, which is exactly the residual shape.
+
+**And the decisions get worse.** Unit tests pass (37 checks), the SQL suite
+passes (610 assertions), and the runnable corpus goes from 6.620s to 11.990s
+over the queries either binary fires on. Two new fires cause it, one of them
+`watdiv_acyclic_208_00`: 0.189s stock, 0.184s as shipped, 5.434s with the term.
+On the excluded queries whose outcome is measured it keeps 13 of 15 wins
+instead of 12, and fires on 6 of the 10 it should not instead of 4.
+
+The reason is D48 read backwards. Lowering the record estimate makes our side
+look cheaper, and the per-record coefficient it feeds was fitted against the
+*inflated* records. Correcting the input without refitting the coefficient
+fitted to the old input breaks the same balance from the other side. The two
+have to move together, which means the record estimate has to be close to right
+first -- and 5.8x is not close.
+
+**The next lever is a statistic, not a formula.** Overlap at a class seam
+cannot be derived from row and distinct counts: containment says
+min(V_p, V_c), independence over a shared domain of size N says V_p*V_c/N, and
+the truth on graph data sits between. DuckDB's column statistics carry min and
+max, which bound N, and the sampler does not pass them through. That is the
+change worth trying next: exact overlap on the MCV heads, an independence
+estimate over the bounded tail domain, and the containment case kept for
+foreign keys, where it is right by construction (test_cost.cpp).
+
+Not taken; reverted. The measurement harness ships as
+`scripts/compare-records.sh` -- the first tool here that sets the gate's
+prediction beside the operator's own numbers step by step.
