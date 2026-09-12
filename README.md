@@ -71,6 +71,26 @@ stock and was slower on 93 of them, because DuckDB stops its probe at the first
 tuple while this stops at the first non-empty bucket of the join key. On
 epinions-like data it is a 2.5× win; on watdiv it is 33× worse (DECISIONS D53).
 
+### Settings
+
+Every one has a description in `duckdb_settings()`; these are the ones worth
+knowing about. Four of them — `factorize_limit`, `factorize_second_key` and the
+two abandon floors — are built, tested and **off**, each because turning it on
+was measured and was worse. They are listed because a switch nobody can find is
+the same as a switch that does not exist, not because they are recommended.
+
+| setting | default | what it does |
+|---|---|---|
+| `factorize_mode` | `off` | `auto` fires on the gate's verdict, `force` on every match, `off` disables the rule |
+| `factorize_explain` | `false` | say what was taken over, or why not |
+| `factorize_fallback` | `true` | carry the stock plan so an internal error costs time rather than the answer (§7.5) |
+| `factorize_limit` | `false` | let the gate consider `EXISTS` and `count(*)` over `LIMIT k` (D53) |
+| `factorize_second_key` | `false` | split a bucket that is one skewed key value on a different key instead of failing (D55) |
+| `factorize_min_compression` | `0` (off) | abandon to the stock plan when a materialized join is not compressing (D37, D51) |
+| `factorize_min_rate` | `0` (off) | abandon when the last materialized join is delivering fewer than this many tuples/ms (D56) |
+| `factorize_min_gain` | `1.5` | how much faster the gate must predict this engine to be before firing |
+| `factorize_gate_sample_rows` | `16384` | rows sampled per join column for the MCV list; `factorize_gate_exact_stats` scans instead |
+
 ### Beyond counting
 
 Four things the representation can answer that an aggregate cannot. `EXISTS` is
@@ -231,10 +251,25 @@ Also worth knowing before trusting any number here:
   supported way to replace them.
 - **O12 / F19** — flat estimation over-predicts on uniform data by up to 84×.
   Three fixes were measured and rejected; it needs a joint-presence sketch or a
-  runtime bail-out, not a better decision rule. The run-time bail-out is built
-  (`factorize_min_compression`) and does not work either: measured out of
-  sample it abandons queries DuckDB cannot answer at all, and D38 has a matched
-  pair showing why no statistic of the representation can decide this.
+  runtime bail-out, not a better decision rule. Two run-time bail-outs are now
+  built and neither works, which is why both default to off:
+
+  - `factorize_min_compression` abandons when a materialized join is not
+    compressing. Measured out of sample it abandons queries DuckDB cannot
+    answer at all, and D38 has a matched pair showing why no statistic of the
+    *representation* can decide this.
+  - `factorize_min_rate` abandons on tuples delivered per millisecond, which is
+    at least the unit DuckDB's own cost model is stated in. It separated six
+    wins from four losses when it was fitted and did not survive being measured
+    again: `hetio_acyclic_205_03` was recorded at 1.11e5 tuples/ms and
+    re-measures at 34,296, inside the loss range, so a floor abandons a query
+    this engine answers in 129 s and the stock plan never does (D56).
+
+  That is ten criteria now. Every quantity visible from inside our own
+  execution separates the queries it was derived from and overlaps on the next
+  ones, because what separates them is how fast DuckDB would have been — and
+  D56 records why running both plans to find out is not reachable from an
+  extension.
 - Benchmarks come from one laptop, not the paper's 64-core Xeon.
 
 ## Building and testing
