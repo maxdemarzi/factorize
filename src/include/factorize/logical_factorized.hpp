@@ -38,6 +38,11 @@ public:
 	//! -- and operators above reference both, so the replacement has to expose
 	//! both.
 	bool grouped = false;
+	//! Set for `count(*)` over a `LIMIT k` -- which is what EXISTS is planned
+	//! into. The answer is min(k, |join|), and the engine stops counting the
+	//! moment it has seen k tuples.
+	bool limited = false;
+	idx_t limit = 0;
 	idx_t group_index = 0;
 	//! One per key, in the aggregate's own order, which is the order the answer
 	//! columns come back in. Kept as the types the aggregate bound rather than
@@ -74,6 +79,11 @@ public:
 
 	//! Milliseconds of slice time before `min_compression` may abandon (D51).
 	double abandon_after_ms = 0;
+	//! Tuples per millisecond the last materialized join must have delivered
+	//! for the plan to carry on; 0 = no check (D52).
+	double min_rate = 0;
+	//! Split a skewed bucket on a different key rather than failing; off (D55).
+	bool second_key = false;
 	//! Print what each materialized join left behind, for factorize_explain.
 	bool explain_steps = false;
 	//! The join order, decided when the region was matched. Ordering at match

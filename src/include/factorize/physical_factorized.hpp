@@ -47,9 +47,19 @@ public:
 
 	//! Milliseconds of slice time before `min_compression` may abandon (D51).
 	double abandon_after_ms = 0;
+	//! Tuples per millisecond the last materialized join must have delivered
+	//! for the plan to carry on; 0 = no check (D52).
+	double min_rate = 0;
+	//! Split a skewed bucket on a different key rather than failing; off (D55).
+	bool second_key = false;
 	//! Print what each materialized join left behind, for factorize_explain.
 	bool explain_steps = false;
 	bool grouped = false;
+	//! Set for `count(*)` over a `LIMIT k`, the shape EXISTS is planned into.
+	//! The answer is min(k, |join|), reached by counting buckets of the join key
+	//! until k tuples have been seen rather than by counting all of them.
+	bool limited = false;
+	idx_t limit = 0;
 	//! One per key, in the aggregate's order, which is the answer's order.
 	vector<LogicalType> group_types;
 	vector<factorize::GroupKey> group_keys;
@@ -108,22 +118,24 @@ public:
 	//! bottom-inserts into a shared representation; this trades that efficiency
 	//! for not having to make insertion thread-safe, and for an invariance that
 	//! holds by construction rather than by locking discipline.
-	//! Parallel only when there is no fallback to drive.
+	//! Parallel, fallback or no fallback.
 	//!
-	//! Driving the fallback's pipeline means several tasks arrive in GetData and
-	//! park on the source state's lock while the owner runs it -- and a parked
-	//! worker is one the executor cannot use to run the very pipeline it is
-	//! waiting for. Measured on a 27M-tuple star, 40 fallbacks in a row: 40/40
-	//! at one thread and at two, hung after 24 at four. PhysicalRecursiveCTE
-	//! never meets this because it is a serial source, so a second task for its
-	//! pipeline cannot exist -- which is the third way that precedent does not
-	//! transfer to an extension.
+	//! This used to be `children.empty()` -- serial whenever the §7.5 fallback
+	//! was carried, which is the default. The reason was real but was a property
+	//! of how the fallback was driven rather than of driving one: the thread
+	//! running its pipeline held the source state's lock, every other task
+	//! parked on that lock, and a parked worker is one the executor cannot use
+	//! to run the very pipeline it is waiting for. Measured then on a 27M-tuple
+	//! star, 40 fallbacks in a row: 40/40 at one thread and at two, hung after
+	//! 24 at four.
 	//!
-	//! The cost is real and is the reason `factorize_fallback` exists: a serial
-	//! source gives up the slicing of DECISIONS D20, measured here at 7ms
-	//! against 2-4ms at eight threads.
+	//! The lock is no longer held across the work and the threads that arrive
+	//! meanwhile run the pipeline's tasks instead of waiting for them, so the
+	//! starvation has nothing left to starve. What it costs to be wrong about
+	//! this is a hang, so it is measured at 1, 2, 4 and 8 threads rather than
+	//! argued.
 	bool ParallelSource() const override {
-		return children.empty();
+		return true;
 	}
 	//! One row has no order to preserve.
 	//!
@@ -149,6 +161,12 @@ private:
 	                            class FactorizedGlobalSourceState &gstate) const;
 	SourceResultType EmitFallback(ExecutionContext &context, DataChunk &chunk,
 	                              class FactorizedGlobalSourceState &gstate) const;
+	//! Runs the fallback's pipeline to completion. One thread only, and never
+	//! with the source state's lock held.
+	void DriveFallback(class FactorizedGlobalSourceState &gstate) const;
+	//! What every other thread does meanwhile: run the executor's tasks, which
+	//! are the pipeline being driven, rather than block on a lock and starve it.
+	void HelpFallback(class FactorizedGlobalSourceState &gstate) const;
 	SourceResultType ScanFallback(DataChunk &chunk, class FactorizedGlobalSourceState &gstate) const;
 	SourceResultType EmitGroups(ExecutionContext &context, DataChunk &chunk,
 	                            class FactorizedGlobalSourceState &gstate) const;

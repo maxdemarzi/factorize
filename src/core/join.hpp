@@ -240,8 +240,40 @@ double GetGlobalAbandonAfter();
 //! Milliseconds since this slice's limits were set.
 double ElapsedSliceMs();
 
+//! Tuples per millisecond this slice must be delivering by its last
+//! materialized join for the plan to carry on; 0 = no check.
+//!
+//! The compression floor asks whether the representation is small. This asks
+//! the question that actually decides the race: how fast tuples are being
+//! delivered, in the same unit DuckDB's own cost model is stated in, so the two
+//! can be compared at all. Measured across six wins and four losses (D52), the
+//! cumulative rate at the last materialized join was 1.11e5 to 6.28e7 tuples/ms
+//! for the wins and 17 to 4.59e4 for the losses -- separated, with DuckDB's own
+//! fitted rate of 2.51e5 sitting between them.
+//!
+//! Only at the last materialized join, and that restriction is the whole of
+//! what makes it usable: at the second join the same measurement has a win at
+//! 0.05 and a loss at 207, so a check there abandons the queries it exists to
+//! protect.
+void SetGlobalMinRate(double tuples_per_ms);
+double GetGlobalMinRate();
+
+//! Whether a bucket that no modulus of its own key can split may be split on a
+//! *different* key; false = fail instead, which is what happened before this
+//! existed.
+//!
+//! Off, and measured rather than assumed. It converts a query that cannot be
+//! answered at all into one that can (D55), and on the corpus it also converts
+//! two queries that used to fail in 20s and be answered by the stock plan in
+//! another few into queries this engine answers itself in 270 and 280 seconds.
+//! Recovering a query the stock plan could have had in 13s is not a win, and
+//! telling those two cases apart is the problem D34 through D56 have not
+//! solved. So the mechanism ships and the switch stays off.
+void SetGlobalSecondKey(bool enabled);
+bool GetGlobalSecondKey();
+
 void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression,
-                     double abandon_after_ms = 0);
+                     double abandon_after_ms = 0, double min_rate = 0, bool second_key = false);
 
 //! Builds a flat, single-node relation from columnar input. This is the
 //! trivial f-representation of section 4.2.1.

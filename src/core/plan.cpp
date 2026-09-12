@@ -1,5 +1,6 @@
 #include "plan.hpp"
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -473,6 +474,41 @@ StepStats MeasureStep(size_t relation, const FactorizedRelation &accumulated) {
 //! has already gone into it -- every catastrophic loss measured has that shape,
 //! 300s against stock's 5.1s, 1.065s against 0.015s -- and both halves are
 //! read off the run rather than predicted before it.
+//! Abandons when the tuples are arriving too slowly to be worth the trouble.
+//!
+//! The rate, rather than the compression, because the rate is what the choice
+//! is actually between: DuckDB's cost model is stated in tuples per
+//! millisecond, so a measured rate can be compared to it and a measured ratio
+//! cannot. Only at the last materialized join, where D52 measured the two
+//! populations apart -- wins 1.11e5 to 6.28e7, losses 17 to 4.59e4 -- and
+//! nowhere earlier, where the same measurement has them overlapping completely.
+//!
+//! The last materialized join is `total_steps - 2`: the final step of a count
+//! is fused and materializes nothing, so the step before it is the last one
+//! that leaves a representation to measure.
+void CheckRate(const StepStats &step, size_t step_index, size_t total_steps) {
+	const double min_rate = GetGlobalMinRate();
+	if (min_rate <= 0 || step.live == 0 || step.tuples <= 0) {
+		return;
+	}
+	if (step_index + 2 != total_steps) {
+		return;
+	}
+	const double elapsed = ElapsedSliceMs();
+	if (elapsed <= 0) {
+		return;
+	}
+	const double rate = static_cast<double>(step.tuples) / elapsed;
+	if (rate >= min_rate) {
+		return;
+	}
+	throw std::runtime_error("join " + std::to_string(step_index) + " of " + std::to_string(total_steps - 1) +
+	                         " had delivered " + std::to_string(step.tuples) + " tuples in " +
+	                         std::to_string(static_cast<long long>(elapsed)) + "ms, a rate of " +
+	                         std::to_string(rate) + " tuples/ms against a floor of " + std::to_string(min_rate) +
+	                         ", so the stock plan is the better bet from here");
+}
+
 void CheckCompression(const StepStats &step, size_t step_index, size_t total_steps) {
 	const double floor = GetGlobalMinCompression();
 	if (floor <= 0 || step.live == 0) {
@@ -591,6 +627,7 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 			if (!last_join) {
 				result.steps.push_back(MeasureStep(step.relation, accumulated));
 				CheckCompression(result.steps.back(), i, plan.steps.size());
+				CheckRate(result.steps.back(), i, plan.steps.size());
 			}
 			// Applied by the join just issued, so substitutable from here on and
 			// not before -- the same order BuildPlan validated the graph under.
@@ -731,6 +768,56 @@ std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
 	return by_class[best];
 }
 
+//! Every class that could be sliced on, widest reach first.
+//!
+//! `ChooseSliceColumns` returns the first of these and it is the right one to
+//! start with: the more relations a key reaches, the more of the input a bucket
+//! of it shrinks. What it cannot do is get out of the way when it is the wrong
+//! key, and that is the case the README has been calling "no spilling" -- a
+//! single value of the chosen class whose own subtree does not fit, which no
+//! number of buckets separates from itself, because they all separate values
+//! and it is one value.
+//!
+//! A *different* class is what separates it, and slicing on one is sound
+//! whichever one it is: the closure argument is about a class, not about the
+//! widest class. So the retries have somewhere left to go.
+std::vector<std::vector<int>> RankSliceColumns(const QueryGraph &graph) {
+	EquivalenceClasses classes(graph);
+	std::map<size_t, std::vector<int>> by_class;
+	std::map<size_t, size_t> reach;
+	for (size_t relation = 0; relation < graph.RelationCount(); relation++) {
+		for (size_t column = 0; column < graph.column_counts[relation]; column++) {
+			const auto root = classes.Find(AttributeOf(graph, relation, column));
+			auto &columns = by_class[root];
+			if (columns.empty()) {
+				columns.assign(graph.RelationCount(), -1);
+			}
+			if (columns[relation] < 0) {
+				columns[relation] = static_cast<int>(column);
+				reach[root]++;
+			}
+		}
+	}
+	std::vector<std::pair<size_t, size_t>> ranked;
+	for (const auto &entry : reach) {
+		if (entry.second > 1) {
+			// A class reaching one relation buckets that relation and leaves
+			// every other one whole, so it cannot shrink the join.
+			ranked.emplace_back(entry.second, entry.first);
+		}
+	}
+	std::sort(ranked.begin(), ranked.end(),
+	          [](const std::pair<size_t, size_t> &a, const std::pair<size_t, size_t> &b) {
+		          return a.first != b.first ? a.first > b.first : a.second < b.second;
+	          });
+	std::vector<std::vector<int>> out;
+	out.reserve(ranked.size());
+	for (const auto &entry : ranked) {
+		out.push_back(by_class[entry.second]);
+	}
+	return out;
+}
+
 } // namespace
 
 ExecuteResult ExecuteCountNotEqual(const QueryGraph &graph, const NotEqualPredicate &neq, RelationSource &source,
@@ -821,6 +908,90 @@ ExecuteResult ExecuteCountSlice(const QueryGraph &graph, const Plan &plan, Relat
 	return result;
 }
 
+//! Counts one bucket by partitioning it on a key other than the one it is a
+//! bucket of. Not ok when no other key can be found or none of them fits.
+//!
+//! The case this exists for is a bucket whose contents are a single value of the
+//! chosen class: refining that class puts the same rows in the same bucket
+//! however fine the modulus, because a modulus separates values and there is
+//! only one. A different class separates them, and slicing on one is sound
+//! whichever one it is -- the closure argument in `ChooseSliceColumns` is about
+//! a class, not about the widest class (D55).
+//!
+//! Nested rather than swapped: the inner source is still this bucket of the
+//! original key, so the pieces partition exactly what the caller was given and
+//! no other bucket's work is touched. That is the property the modulus
+//! refinement relies on too, reached a different way.
+static ExecuteResult CountBySecondKey(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                      size_t slice, size_t slices, PathStrategy strategy) {
+	ExecuteResult failed;
+	if (!GetGlobalSecondKey()) {
+		failed.error = "this bucket does not fit and splitting it on another key is off";
+		return failed;
+	}
+	auto ranked = RankSliceColumns(graph);
+	if (ranked.size() < 2) {
+		failed.error = "only one join key reaches more than one relation, so there is no other key to partition on";
+		return failed;
+	}
+	// One alternative key, and two moduli. Every piece re-scans the whole input
+	// to find its own rows, so an attempt at `parts` pieces costs `parts` passes
+	// -- and this runs only after the modulus refinement has already spent
+	// 8 + 64 + 512 + 4096 of them failing.
+	//
+	// The first version of this tried every class at every modulus up to 4096,
+	// and it turned `watdiv_acyclic_217_10` from a query that failed in 23s and
+	// was answered by the stock plan into one that did not finish in 300s. The
+	// bound is not a tuning knob: a second key either separates the value that
+	// is carrying the bucket or it does not, and 64 pieces is enough to find out
+	// (the regression fixture recovers at 8).
+	static const size_t kOtherKeys = 1;
+	static const size_t kMaxParts = 64;
+	const size_t limit_rank = ranked.size() < 1 + kOtherKeys ? ranked.size() : 1 + kOtherKeys;
+	for (size_t rank = 1; rank < limit_rank; rank++) {
+		SlicedSource bucket(source, ranked[0], slice, slices);
+		for (size_t parts = 8; parts <= kMaxParts; parts *= 8) {
+			int64_t total = 0;
+			size_t records = 0;
+			size_t bytes = 0;
+			std::vector<StepStats> steps;
+			bool fits = true;
+			for (size_t part = 0; part < parts && fits; part++) {
+				SlicedSource inner(bucket, ranked[rank], part, parts);
+				auto piece = ExecuteCount(graph, plan, inner, mode, strategy);
+				if (!piece.ok) {
+					if (!piece.out_of_memory) {
+						// Something other than size, which a different
+						// partition will not fix.
+						return piece;
+					}
+					fits = false;
+					break;
+				}
+				total = CheckedCardinalityAdd(total, piece.count);
+				records = records > piece.records ? records : piece.records;
+				bytes = bytes > piece.bytes ? bytes : piece.bytes;
+				if (steps.empty()) {
+					steps = std::move(piece.steps);
+				}
+			}
+			if (fits) {
+				ExecuteResult refined;
+				refined.ok = true;
+				refined.count = total;
+				refined.records = records;
+				refined.bytes = bytes;
+				refined.slices = slices * parts;
+				refined.steps = std::move(steps);
+				return refined;
+			}
+		}
+	}
+	failed.out_of_memory = true;
+	failed.error = "no partition of any join key made this bucket fit";
+	return failed;
+}
+
 ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source,
                                             JoinMode mode, size_t slice, size_t slices, PathStrategy strategy) {
 	auto result = ExecuteCountSlice(graph, plan, source, mode, slice, slices, strategy);
@@ -865,6 +1036,14 @@ ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan 
 			refined.steps = std::move(steps);
 			return refined;
 		}
+	}
+
+	// Refining the same key has run out, which means the bucket is not merely
+	// big but skewed: one value of the chosen class is carrying it, and no
+	// modulus separates a value from itself. A second class can.
+	auto second = CountBySecondKey(graph, plan, source, mode, slice, slices, strategy);
+	if (second.ok) {
+		return second;
 	}
 	return result;
 }
@@ -1507,36 +1686,73 @@ GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, Rela
 	               strategy);
 }
 
-ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                            PathStrategy strategy) {
-	// Enough buckets that finding a witness early is worth something, few enough
-	// that a genuinely empty join does not pay for many passes to learn it. The
-	// buckets are examined in order and nothing about the answer depends on
-	// which one answers first.
+ExecuteResult ExecuteCountAtMost(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                 size_t limit, PathStrategy strategy) {
+	ExecuteResult result;
+	if (limit == 0) {
+		// `LIMIT 0` keeps no tuples, and reading the input to learn that would
+		// be the one case where this operator is strictly worse than not
+		// existing. Said as zero buckets read, since none were.
+		result.ok = true;
+		result.count = 0;
+		result.slices = 0;
+		return result;
+	}
+	// Enough buckets that reaching the limit early is worth something, few
+	// enough that a join too small to reach it does not pay for many passes to
+	// learn that. The buckets are examined in order and nothing about the
+	// answer depends on which one supplies the tuples: their counts are added,
+	// and the total is what the limit clamps.
 	static const size_t kProbeSlices = 16;
 	auto key_column = ChooseSliceColumns(graph);
 	const size_t slices = key_column.empty() ? 1 : kProbeSlices;
 
-	ExecuteResult result;
+	// Sixteen, and not the much finer partition that looks obviously better.
+	//
+	// The measured problem is granularity: DuckDB streams its probe and stops at
+	// the first *tuple*, while this stops at the first non-empty *bucket*, and a
+	// sixteenth of a dense join is still an enormous join to build in order to
+	// learn it is not empty. So looking first in two buckets of a partition 64
+	// times finer was tried, expecting the dense case to end there for two
+	// passes over the input.
+	//
+	// It made things worse and was reverted (D53). Gated over the corpus it cost
+	// 4.74s against 4.60s for this; on watdiv, the dataset it was aimed at, it
+	// bought 10% (46.8s to 42.1s) because what is expensive there is the pass
+	// and not the bucket -- while on epinions, where the gate actually fires, it
+	// was 2.6x worse for exactly the same reason. A partition finer than the
+	// key's distinct count also mostly produces empty buckets, and the execution
+	// path has no cheap distinct count to size one against.
+	int64_t total = 0;
 	for (size_t slice = 0; slice < slices; slice++) {
 		auto part = ExecuteCountSliceWithinMemory(graph, plan, source, mode, slice, slices, strategy);
 		if (!part.ok) {
 			return part;
 		}
-		if (part.count > 0) {
+		total = CheckedCardinalityAdd(total, part.count);
+		// The high-water mark across the buckets, not their sum: they are built
+		// one at a time and the space is reused.
+		result.records = part.records > result.records ? part.records : result.records;
+		result.bytes = part.bytes > result.bytes ? part.bytes : result.bytes;
+		if (static_cast<uint64_t>(total) >= static_cast<uint64_t>(limit)) {
 			result.ok = true;
-			result.count = 1;
-			result.records = part.records;
-			result.bytes = part.bytes;
+			result.count = static_cast<int64_t>(limit);
 			// How much of the partition was read before the answer was known.
 			result.slices = slice + 1;
 			return result;
 		}
 	}
 	result.ok = true;
-	result.count = 0;
+	result.count = total;
 	result.slices = slices;
 	return result;
+}
+
+ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                            PathStrategy strategy) {
+	// One tuple is all the evidence EXISTS needs, and stopping at it is the
+	// whole difference from counting.
+	return ExecuteCountAtMost(graph, plan, source, mode, 1, strategy);
 }
 
 ExecuteResult ExecuteCountWithinMemory(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
@@ -1557,6 +1773,14 @@ ExecuteResult ExecuteCountWithinMemory(const QueryGraph &graph, const Plan &plan
 			return sliced;
 		}
 		result = sliced;
+	}
+	// Past the ceiling, which is where the query is not too big overall but too
+	// skewed -- one key value whose own subtree does not fit. A partition of a
+	// different key is what separates it, and taking the whole input as one
+	// bucket is how this path asks for that (D55).
+	auto second = CountBySecondKey(graph, plan, source, mode, 0, 1, strategy);
+	if (second.ok) {
+		return second;
 	}
 	return result;
 }

@@ -3404,3 +3404,302 @@ where this line of work now points.
 Kept: per-step elapsed in `StepStats` and in `factorize_explain`. Inert, and the
 reason any of the above could be seen at all -- before it, the project could
 measure what each join built but not when.
+
+## D53 — EXISTS reaches the matcher, and the corpus says not to fire on it
+
+D23 left four v2 features as table functions nobody can reach from SQL and named
+wiring them into the matcher "the obvious next step and is not done". Two of them
+turn out to be one shape. DuckDB plans `EXISTS (SELECT ... FROM a, b WHERE ...)`
+as `count(*)` over a constant projection over `LIMIT 1` over the join, so
+matching a constant LIMIT above a plain count(*) reaches EXISTS and `count(*)`
+over any `LIMIT k` together. Until now the rule declined all of it with "not a
+scan: LIMIT".
+
+**What the shape can be answered with.** `count(*)` over `LIMIT k` is
+min(k, |join|). *Which* k tuples a limit keeps is undefined without an ORDER BY,
+but how many there are is not, and that is what makes it answerable: the buckets
+of the join key are counted until k tuples have been seen, and no tuple is ever
+enumerated. `ExecuteCountAtMost` is that, and `ExecuteExists` is now it with
+k = 1. Declined, because their answers *would* depend on which k tuples: sum()
+over a limit, a count per group over a limit, an OFFSET, a percentage.
+
+**Correct, and slower.** All 119 runnable CE queries, rewritten as EXISTS,
+forced against stock:
+
+    disagreements                    0 of 119
+    forced faster                   21
+    forced slower                   93
+    total, stock                  4.76s
+    total, forced                69.47s
+
+The reason is granularity, and it is not fixable by tuning. DuckDB streams its
+probe and stops at the first *tuple*; this stops at the first non-empty
+*bucket*, and a sixteenth of a dense join is still an enormous join to build in
+order to learn that it is not empty. `watdiv_acyclic_205_02` spent 19.0s on a
+question stock answered in 7ms.
+
+The split by dataset is total, and it is F18's split again:
+
+    dataset     n   forced faster    stock    forced
+    epinions   30       16           1.07s     0.42s
+    hetio       2        0           0.03s     0.04s
+    watdiv     40        1           1.42s    46.77s
+    yago       47        4           2.25s    22.23s
+
+**A finer partition was the obvious fix and made it worse.** If a sixteenth is
+too coarse to stop early, look in two buckets of a partition 64 times finer
+first -- two passes over the input, and the dense case ends there. Measured over
+the whole corpus against the same stock:
+
+    all stock                     4.61s
+    gate on, sixteenths           6.17s
+    gate on, fine probe           6.60s
+    forced everywhere, fine probe 78.58s
+
+On watdiv, the dataset it was aimed at, it bought 10% (46.8s to 42.1s), because
+what is expensive there is the pass and not the bucket. On epinions, where the
+gate actually fires, it was 2.6x worse for the same reason, and on yago 1.6x.
+A partition finer than the key's distinct count also mostly produces empty
+buckets, and the execution path has no cheap distinct count to size one against
+-- `SharedRelations::Stats` reports distinct = rows, a placeholder. Reverted.
+
+**So it does not fire.** Gating on the cost model brings 69.47s down to 6.09s,
+which is still 28% worse than never firing at all, and of the 35 queries it
+takes it wins 14 and loses 19. That is not a gate that knows something about
+EXISTS; it is a gate whose refusals happen to exclude watdiv.
+
+The shape therefore matches, is tested, and answers -- under `'force'`, and
+under `factorize_limit=true` for anyone whose data looks like epinions, where
+firing everywhere is a 2.5x win. Under `'auto'` it is declined with a reason
+that says so. What it waits for is not a better probe but something that can
+tell those two datasets apart, which is the same thing D34 through D52 were
+looking for.
+
+Tested: 51 assertions in `test/sql/factorized_limit.test` -- the shape fires
+under 'force', declines under 'auto', fires again under the setting, and the
+declines (OFFSET, sum, grouped, percentage) each still answer. In the core, the
+clamp is checked at every k either side of the join's own size.
+
+## D54 — The fallback did not cost the parallelism; holding a lock across it did
+
+D27 and D30 recorded that carrying the §7.5 fallback makes the operator a serial
+source, and the README has been selling the trade ever since: `factorize_fallback`
+defaults to true because 32x serialised to 11x is still 11x. The measurement
+behind it was real -- 40 fallbacks in a row completed 40/40 at one thread and at
+two, and hung after 24 at four.
+
+It was also a measurement of one implementation, not of the idea. The thread
+driving the fallback's pipeline held the source state's lock for the whole of
+`WorkOnTasks`, so every other task that arrived parked on that mutex -- and a
+parked worker is one the executor cannot use to run the very pipeline the holder
+is waiting for. The more threads the query had, the more certainly it starved.
+
+**The fix is to stop blocking them and put them to work.** One thread claims the
+drive under the lock and then releases it; every other thread runs
+`executor.WorkOnTasks()` until the phase says the rows are ready. They are
+running the fallback pipeline's own tasks, so the starvation has nothing left to
+starve, and the stock plan now runs in parallel rather than on one thread.
+`ParallelSource()` is unconditionally true.
+
+Two things had to come with it. The re-entrancy flag is now set by the helpers as
+well as the driver, because a helper is running arbitrary tasks and one of them
+can be another `GetData` on this operator on this thread -- without the flag that
+call becomes a second helper and the next a third, one stack frame per task. And
+the factorized path re-checks `fell_back` *after* its bucket as well as before
+it: several threads can now be inside it at once, so one falling back while
+another is mid-count would otherwise have the second thread's total emitted
+beside the fallback's rows -- two answers to one query. It joins the fallback
+instead.
+
+**Measured.** A 3000-key star over two 3M-row legs, 3e9 tuples, forced:
+
+    fallback ON,  1 thread     0.103s
+    fallback ON,  8 threads    0.122s
+    fallback OFF, 8 threads    0.131s
+    fallback OFF, 1 thread     0.101s
+
+Fallback ON at eight threads now matches fallback OFF at eight, which is the
+whole claim: carrying the fallback costs nothing in parallelism. What the same
+table also says is that eight threads is *slower* than one on this shape, and
+burns five times the CPU to be -- which is D39 again, since every bucket must
+look at every row to find its own and eight buckets is eight filtering passes.
+Restoring the parallelism restores something that is not always worth having, so
+what it is worth was measured on the corpus rather than on that star: 42 CE
+queries, forced, one thread against eight.
+
+    8 threads faster on            32
+    8 threads slower on             9
+    total, 1 thread            140.25s
+    total, 8 threads            94.02s      1.49x
+    of which, the 4 queries over 1s:
+      1 thread                 137.35s
+      8 threads                 92.11s      1.49x
+
+So the synthetic star was the unrepresentative case, not the corpus. The
+speedups reach 4.07x and every slowdown is on a query already under 150ms --
+the shape D39 describes, where eight filtering passes cost more than the join
+they divide. The four queries that take real time carry the whole result and all
+four are faster.
+
+42 of 119 rather than all of them: the run was stopped once the direction was
+unambiguous, because the remaining queries are the slow ones and each costs six
+runs at up to 300s.
+
+Tested: `test/sql/factorized_fallback_parallel.test`, 51 assertions at 1, 2, 4
+and 8 threads, every aggregate shape and EXISTS. The failure it guards against
+is a hang rather than a wrong answer, so there is nothing to assert on beyond
+the queries coming back.
+
+## D55 — "No spilling" was one key, not no key
+
+The README has carried this limitation since the memory cap went in: a
+representation too large for the budget is re-counted over a partition of its
+join key, and *skew is the case that defeats it, because no number of buckets
+separates one value from itself.* Both halves are true. The conclusion drawn
+from them was not.
+
+The partition is built from one equivalence class -- `ChooseSliceColumns`
+returns the class reaching the most relations, which is the right one to start
+with, since the more relations a key reaches the more of the input a bucket of
+it shrinks. Every retry then refines *that* class: 8 buckets, 64, 512, 4096. If
+one value of it is carrying the weight, all 4096 buckets are that value's
+bucket, and the query fails.
+
+**A different class separates what the first one cannot**, and slicing on one is
+sound whichever one it is: the closure argument in `ChooseSliceColumns` is about
+a class, not about the widest class. So when refining runs out, the retry now
+takes the next class by reach and partitions *inside* the bucket -- a
+`SlicedSource` wrapped around the bucket's own `SlicedSource`, so the pieces
+partition exactly what this thread was given and no other thread's work is
+touched. That is the same property the modulus refinement relies on, reached a
+different way.
+
+**Measured on a fixture built to be exactly this case.** Four relations: the
+widest class reaches three of them and every row carries the single value 7, so
+a bucket of it is either empty or the whole join; a second class reaches the
+other two and spreads. With the cap set to half the measured peak and below:
+
+    cap            before                              after
+    peak / 1.5     failed, having refined to 4096      answers, 8 pieces
+    peak / 2       failed, having refined to 4096      answers, 8 pieces
+    peak / 4       failed, having refined to 4096      answers, 8 pieces
+    peak / 8       failed, having refined to 4096      answers, 8 pieces
+
+and the count is the same 16,000,000,000 the uncapped run produces. The "before"
+column is the committed code, compiled from `git show HEAD` and run against the
+same fixture, rather than the fix disabled by hand.
+
+Two things the fixture had to get right, and both were wrong first:
+
+  - The spreading key must have *distinct* values. With `v % 600` the whole
+    query compresses to 602 records for any input size, so it never runs out of
+    memory and there is nothing to recover from.
+  - The cap must come from the peak, not from `ExecuteResult::bytes`. `bytes` is
+    what stood at the end, and when the last join is fused that is almost
+    nothing -- 602 records against a 75MB high-water mark.
+
+What this does not do is spill. Nothing is written to disk and the limitation
+section still says so; what it removes is the specific claim that skew has no
+answer. Skew on *every* key at once still has none, and that is the honest
+remaining case.
+
+**And it ships off, because the corpus said so.** Ten queries with a forced time
+already on record were re-run against it:
+
+    query                      recorded       now
+    hetio_acyclic_203_09           0.3s     0.012s
+    hetio_acyclic_205_11           0.5s     0.100s
+    hetio_acyclic_216_01           0.9s     0.318s
+    hetio_acyclic_222_07           1.5s     0.517s
+    hetio_acyclic_225_02           4.1s     0.612s
+    watdiv_acyclic_210_06         12.4s     0.327s
+    watdiv_acyclic_218_15         18.9s     31.0s
+    yago_acyclic_Chain_12_63       0.1s     0.617s
+    watdiv_acyclic_217_05         19.3s    269.2s
+    yago_acyclic_Chain_9_71        3.6s    280.3s
+
+The six that got faster are D54's parallelism, not this. The last two are this,
+and they are the reason it is a setting. Both used to fail on memory, fall back,
+and be answered by the stock plan in a few more seconds. Now the second key
+*succeeds*, and this engine spends 269 and 280 seconds computing an answer
+DuckDB has in 13 and 4. Recovering a query the stock plan could have had is not
+a win, and separating that case from the one above it -- where the stock plan
+has nothing to offer -- is the problem D34 through D56 have not solved.
+
+A first version was worse still. It tried every remaining class at every modulus
+up to 4096, and since each piece re-scans the whole input to find its own rows,
+`watdiv_acyclic_217_10` went from failing in 23s to not finishing in 300s. It is
+bounded to one alternative key and at most 64 pieces now, which is what the
+numbers above were measured with.
+
+So `factorize_second_key` defaults to false and the limitation stands as it was
+for anyone who does not set it. What the mechanism buys, for anyone who does, is
+the fixture above: a query that cannot be answered at any memory limit becoming
+one that can.
+
+## D56 — The race D52 asked for cannot be built here, and the rate it settled for does not reproduce
+
+D52 ended on one recommendation: run both plans and keep whichever finishes
+first. It needs no estimate of anything, bounds the loss at the winner's time,
+and was the only design still standing after nine measured rejections. This is
+what happened when it was attempted.
+
+**It is not reachable from an extension, and the reason is cancellation.** A
+race needs the loser stopped, and DuckDB has two ways to stop work, neither of
+which is one pipeline:
+
+  - `Executor::CancelTasks()` sets `cancelled` for the whole executor and then
+    clears every pipeline, event and state it owns (`executor.cpp:430`). It
+    would take our own source down with the stock plan's. It also drains with
+    `while (executor_tasks > 0) WorkOnTasks()`, and the thread calling it is one
+    of those tasks, so from inside the operator it waits for itself.
+  - `ClientContext::interrupted` is per *context* (`client_context.hpp:81`), so
+    interrupting the stock plan interrupts the query containing it.
+
+The sink-level early stop that LIMIT uses does not help either: returning
+`SinkResultType::FINISHED` stops the pipeline feeding that sink, and the sink we
+own is the *end* of the replaced plan -- by the time a row reaches it the
+aggregate below has already done the work. Running the stock plan in a second
+ClientContext would give it its own interrupt flag and also its own transaction,
+so a query inside an open transaction would race against data it cannot see.
+That is not a race, it is a wrong answer with a stopwatch.
+
+**So what was built is the half that needs no cancellation**: notice we are
+losing and abandon *ourselves*, which costs nothing because the §7.5 fallback is
+already the landing. `factorize_min_rate`, checked at the last materialized join
+and nowhere else -- D52's numbers say where, since at the second join the same
+measurement has a win at 0.05 and a loss at 207. The unit is the point:
+compression is a ratio nothing can be compared against, while tuples per
+millisecond is what DuckDB's cost model is stated in.
+
+**And the separation it was built on does not reproduce.** D52 measured
+`hetio_acyclic_205_03` delivering 1.11e5 tuples/ms at its last materialized
+join, above every loss, which topped out at 4.59e4. Re-measured, the same query
+on the same machine:
+
+    join 4 of 5 had delivered 3856975007 tuples in 112460ms,
+    a rate of 34296 tuples/ms
+
+34,296 is not above 4.59e4, it is inside it. So a floor at 7e4 abandons a query
+this engine answers in 129s and the stock plan does not answer at all -- and
+abandoning hands it to that stock plan, so the query gets no answer. The first
+five SHOULD-FIRE queries measured this way lost three that way:
+`hetio_acyclic_205_03` (129s), `205_09` (121s) and `205_15` (59s).
+
+That is the tenth criterion in a row that separated the sample it was fitted on
+and did not survive being measured again. The pattern by now is the finding:
+every quantity this project can see from inside its own execution -- predicted
+records, predicted bytes, measured compression, measured rate -- separates wins
+from losses on the queries it was derived from and overlaps on the next ones,
+because what actually separates them is how fast DuckDB would have been, and
+that is the one number not available without running it.
+
+`factorize_min_rate` therefore defaults to 0, which is off, and the reason is
+recorded above rather than left as calibration work.
+
+Tested: an impossible floor abandons a four-relation chain at "join 2 of 3" --
+the last materialized join, not the first -- leaves a two-relation query alone
+because its only join is fused and materializes nothing to judge, and a floor at
+the bottom abandons nothing. Abandoning was checked end to end against a real
+query: `hetio_acyclic_205_11` under an impossible floor falls back and returns
+1813418909, which is the answer.

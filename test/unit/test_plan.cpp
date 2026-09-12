@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "../../src/core/arena.hpp"
 #include "../../src/core/join.hpp"
 #include "../../src/core/plan.hpp"
 
@@ -408,6 +409,221 @@ static void TestExistsAgreesWithCount() {
 	Expect(none.count == 0, "exists: a join with no tuples must answer no");
 }
 
+//! `count(*)` over `LIMIT k` is min(k, |join|), at every k either side of the
+//! join's own size.
+//!
+//! The partitioned search is what makes this worth having and is also what can
+//! get it wrong: the buckets are counted one at a time and stopped early, so a
+//! limit larger than any single bucket has to keep adding rather than answer
+//! from the first one, and a limit smaller than the join must not read on past
+//! it. Both directions are checked against the undivided count.
+static void TestCountAtMostClampsToTheLimit() {
+	Group scope("count over a limit is min(k, join size), and stops once it is reached");
+
+	// Two keys, each joining 3 x 3, so the join has 18 tuples spread over more
+	// than one bucket of the partition -- which is the case a limit above one
+	// bucket's own count has to survive.
+	MemorySource source;
+	for (int side = 0; side < 2; side++) {
+		source.Add({{1, 1, 1, 2, 2, 2}, {10, 11, 12, 20, 21, 22}});
+	}
+
+	QueryGraph graph;
+	graph.column_counts = {2, 2};
+	graph.column_types = {{ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}};
+	const auto plan = BuildPlan(graph);
+
+	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(whole.ok && whole.count == 18,
+	       "limit: the unlimited join has 18 tuples, got " + std::to_string(whole.count));
+
+	// Below, at, and above the join's own size. The last is the one that proves
+	// the clamp is a clamp rather than a cap applied blindly: asking for more
+	// tuples than exist answers with how many exist.
+	const int64_t wanted[] = {1, 5, 17, 18, 19, 1000};
+	for (auto limit : wanted) {
+		const auto got = ExecuteCountAtMost(graph, plan, source, JoinMode::BOTTOM_INSERT,
+		                                    static_cast<size_t>(limit));
+		const int64_t expected = limit < whole.count ? limit : whole.count;
+		Expect(got.ok, "limit: succeeds at k=" + std::to_string(limit) + " (" + got.error + ")");
+		Expect(got.count == expected, "limit: k=" + std::to_string(limit) + " must answer " +
+		                                  std::to_string(expected) + ", got " + std::to_string(got.count));
+	}
+
+	// `LIMIT 0` keeps nothing, and must answer without reading the input at all.
+	const auto nothing = ExecuteCountAtMost(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(nothing.ok && nothing.count == 0, "limit: k=0 answers zero");
+	Expect(nothing.slices == 0, "limit: k=0 must read no bucket of the partition");
+}
+
+//! One value carrying the whole partition is separated by a different key.
+//!
+//! This is the case the README has been calling "no spilling": a bucket too big
+//! to fit whose contents are one value of the chosen key, which no modulus can
+//! divide because every modulus divides values and this is one value. The way
+//! out is not a finer partition but a different one, nested inside the bucket so
+//! that no other bucket's work is touched.
+//!
+//! The fixture is skewed on purpose. Every row shares one value of the key that
+//! reaches all three relations, so slicing on it puts the entire join in one
+//! bucket however fine the modulus; a second column spreads the same rows
+//! evenly, and is what the retry has to find.
+static void TestSkewedBucketFallsBackToAnotherKey() {
+	Group scope("a bucket that is one key value is split on a second key instead");
+
+	MemorySource source;
+	std::vector<int64_t> small_skewed;
+	for (int64_t v = 0; v < 200; v++) {
+		small_skewed.push_back(7);
+	}
+	// Distinct, not repeated: a spreading key with few values compresses to
+	// nothing and the query can never run out of memory to begin with. The
+	// first version of this fixture used v % 600 and held 602 records for any
+	// input size at all.
+	std::vector<int64_t> big_skewed;
+	std::vector<int64_t> big_spread;
+	std::vector<int64_t> partner;
+	for (int64_t v = 0; v < 200000; v++) {
+		big_skewed.push_back(7);
+		big_spread.push_back(v);
+		partner.push_back(v);
+	}
+	source.Add({small_skewed});              // r0: one column, all 7
+	source.Add({small_skewed});              // r1: one column, all 7
+	source.Add({big_skewed, big_spread});    // r2: the weight of the query
+	source.Add({partner});                   // r3: joined on the spreading key
+
+	QueryGraph graph;
+	graph.column_counts = {1, 1, 2, 1};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64}};
+	// The widest class reaches r0, r1 and r2 and is the skewed one: every row
+	// of all three carries the single value 7, so a bucket of it is either
+	// empty or the whole join. The second class reaches r2 and r3 only, and is
+	// the one that spreads -- the retry has to find it.
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}, Predicate {2, 1, 3, 0}};
+	const auto plan = BuildPlan(graph);
+	Expect(plan.complete, "skew: the fixture must be plannable (" + plan.reason + ")");
+
+	SetGlobalMemoryLimit(0);
+	ThreadBudget().peak.store(0);
+	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(whole.ok, "skew: the undivided count must work with no cap (" + whole.error + ")");
+
+	// The high-water mark, not the last representation. `bytes` reports what
+	// stood at the end, and here that is 602 records -- the join is fused and
+	// what has to fit is the peak on the way there.
+	const size_t need = ThreadBudget().peak.load();
+	Expect(need > 0, "skew: the undivided run must report a peak");
+	SetGlobalMemoryLimit(need / 2);
+	const auto refused = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(!refused.ok && refused.out_of_memory, "skew: the undivided run must hit the cap");
+
+	// Off by default, because on the corpus it also converts two queries that
+	// failed in 20s and were answered by the stock plan into queries this
+	// engine answers itself in 270 and 280 seconds (D55). Off, the bucket is a
+	// failure, exactly as it was before the mechanism existed.
+	SetGlobalSecondKey(false);
+	const auto without = ExecuteCountSliceWithinMemory(graph, plan, source, JoinMode::BOTTOM_INSERT, 0, 1);
+	Expect(!without.ok, "skew: with the second key off, a bucket of one value is still a failure");
+
+	// Every bucket of the widest key is the whole join, because every row has
+	// the same value of it. Before the second key was reachable this refined all
+	// the way to 4096 buckets and failed at every one of them, which is the
+	// README's "no spilling" in one line.
+	SetGlobalSecondKey(true);
+	const auto recovered = ExecuteCountSliceWithinMemory(graph, plan, source, JoinMode::BOTTOM_INSERT, 0, 1);
+	Expect(recovered.ok, "skew: a bucket of one key value must be split on another key (" + recovered.error + ")");
+	Expect(recovered.count == whole.count, "skew: the count must survive the second partition -- got " +
+	                                           std::to_string(recovered.count) + ", want " +
+	                                           std::to_string(whole.count));
+	SetGlobalSecondKey(false);
+	SetGlobalMemoryLimit(0);
+}
+
+//! The rate floor abandons, and does it at the last materialized join only.
+//!
+//! *Which* join it judges at is the whole of what makes it usable rather than
+//! harmful: measured across ten queries, the cumulative rate separates the wins
+//! from the losses at the last materialized join and overlaps completely at the
+//! second (D52). So a floor checked everywhere would abandon the queries it
+//! exists to protect, and the test for that is structural rather than timed --
+//! an impossible floor must name the last join, and must leave a query with no
+//! materialized join at all alone.
+static void TestRateFloorAbandonsAtTheLastJoin() {
+	Group scope("the rate floor abandons at the last materialized join, and only there");
+
+	MemorySource source;
+	std::vector<int64_t> keys;
+	for (int64_t v = 0; v < 500; v++) {
+		keys.push_back(v);
+	}
+	for (int r = 0; r < 4; r++) {
+		source.Add({keys});
+	}
+
+	// Two relations: the only join is fused into the count, so nothing is
+	// materialized and there is no step at which to judge.
+	QueryGraph pair;
+	pair.column_counts = {1, 1};
+	pair.column_types = {{ValueType::INT64}, {ValueType::INT64}};
+	pair.predicates = {Predicate {0, 0, 1, 0}};
+
+	// Three: one materialized join, which is therefore also the last.
+	QueryGraph three;
+	three.column_counts = {1, 1, 1};
+	three.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	three.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}};
+
+	// Four: two materialized joins, so the first one must be left alone.
+	QueryGraph four;
+	four.column_counts = {1, 1, 1, 1};
+	four.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	four.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}, Predicate {2, 0, 3, 0}};
+
+	const auto pair_plan = BuildPlan(pair);
+	const auto three_plan = BuildPlan(three);
+	const auto four_plan = BuildPlan(four);
+
+	// Off, which is the shipped default: every shape answers.
+	SetGlobalMinRate(0);
+	Expect(ExecuteCount(pair, pair_plan, source, JoinMode::BOTTOM_INSERT).ok, "rate floor: off, the pair answers");
+	Expect(ExecuteCount(three, three_plan, source, JoinMode::BOTTOM_INSERT).ok, "rate floor: off, three answers");
+	Expect(ExecuteCount(four, four_plan, source, JoinMode::BOTTOM_INSERT).ok, "rate floor: off, four answers");
+
+	// A floor no machine can meet. What it abandons says where it looks.
+	SetGlobalMinRate(1e300);
+	const auto pair_run = ExecuteCount(pair, pair_plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(pair_run.ok, "rate floor: a query with no materialized join has no step to judge, so it must answer (" +
+	                        pair_run.error + ")");
+
+	const auto three_run = ExecuteCount(three, three_plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(!three_run.ok, "rate floor: an impossible floor must abandon at the one materialized join");
+	Expect(!three_run.out_of_memory,
+	       "rate floor: abandoning is a plain failure, not a memory problem -- slicing a query that is not paying "
+	       "for itself only makes smaller copies of the same mistake");
+	Expect(three_run.error.find("tuples/ms") != std::string::npos,
+	       "rate floor: the error says what was measured, got: " + three_run.error);
+
+	const auto four_run = ExecuteCount(four, four_plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(!four_run.ok, "rate floor: an impossible floor must abandon the four-relation chain too");
+	Expect(four_run.error.find("join 2 of 3") != std::string::npos,
+	       "rate floor: it must judge at the LAST materialized join (2 of 3), not the first, got: " +
+	           four_run.error);
+
+	// A floor any machine meets leaves everything alone, which rules out the
+	// abandons above having been caused by anything other than the floor.
+	SetGlobalMinRate(1e-300);
+	Expect(ExecuteCount(three, three_plan, source, JoinMode::BOTTOM_INSERT).ok,
+	       "rate floor: a floor at the bottom abandons nothing");
+	Expect(ExecuteCount(four, four_plan, source, JoinMode::BOTTOM_INSERT).ok,
+	       "rate floor: a floor at the bottom abandons nothing, at four relations either");
+	SetGlobalMinRate(0);
+}
+
 //! The gate is a prediction; this is a measurement, and they disagree.
 //!
 //! Two graphs of the same shape and size, differing only in how the keys
@@ -549,6 +765,12 @@ int main() {
 	TestOutOfMemoryFallsBackToSlices();
 	std::printf("\n");
 	TestExistsAgreesWithCount();
+	std::printf("\n");
+	TestCountAtMostClampsToTheLimit();
+	std::printf("\n");
+	TestRateFloorAbandonsAtTheLastJoin();
+	std::printf("\n");
+	TestSkewedBucketFallsBackToAnotherKey();
 	std::printf("\n");
 	TestCompressionFloorAbandons();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

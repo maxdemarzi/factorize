@@ -1,6 +1,8 @@
 #include "factorize/physical_factorized.hpp"
 #include "../core/arena.hpp"
 #include <atomic>
+#include <string>
+#include <thread>
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/printer.hpp"
@@ -30,6 +32,9 @@ InsertionOrderPreservingMap<string> PhysicalFactorized::ParamsToString() const {
 	result["Relations"] = DescribeRelations(relations);
 	result["Predicates"] = DescribePredicates(relations, graph);
 	result["Join Order"] = DescribeJoinOrder(relations, plan);
+	if (limited) {
+		result["Counts At Most"] = std::to_string(limit);
+	}
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
 }
@@ -71,6 +76,17 @@ public:
 	//! answering instead (§7.5). Under `lock`, because several threads can be
 	//! inside the operator when one of them throws and only one plan may run.
 	bool fell_back = false;
+	//! How far the fallback's own pipeline has got.
+	//!
+	//! Read and written under `lock`, but the pipeline is *driven* with the lock
+	//! released. Holding it across the work is what made this operator serial:
+	//! every other worker parked on the mutex, and a parked worker is one the
+	//! executor cannot use to run the very pipeline the holder is waiting for
+	//! (D27, D30). They help now instead, which is what this state is for --
+	//! a thread has to be able to see that someone else is driving without
+	//! waiting to find out.
+	enum class FallbackPhase : uint8_t { NONE, RUNNING, DONE, FAILED };
+	FallbackPhase fallback_phase = FallbackPhase::NONE;
 	//! Scan position in the fallback's collected rows, set once it has run.
 	unique_ptr<ColumnDataScanState> fallback_scan;
 
@@ -79,7 +95,25 @@ public:
 //! Set while this thread is inside the fallback's own pipeline execution, so a
 //! task that re-enters GetData on the same thread can turn back rather than
 //! block on a lock that thread already holds.
+//!
+//! Set by the helpers too, not only by the thread driving: a helper is running
+//! executor tasks, and one of those can be another call into GetData on this
+//! operator on this thread. Without the flag that call would become a second
+//! helper, and the next one a third, nesting a stack frame per task.
 static thread_local bool fallback_running = false;
+
+//! RAII for the flag above, so every exit clears it -- including the throwing
+//! one, which would otherwise leave the thread unable to try again.
+namespace {
+struct FallbackRunning {
+	FallbackRunning() {
+		fallback_running = true;
+	}
+	~FallbackRunning() {
+		fallback_running = false;
+	}
+};
+} // namespace
 
 //! Where the fallback plan's rows land. This operator is the sink of the
 //! pipeline it drives, the same arrangement PhysicalRecursiveCTE uses.
@@ -147,21 +181,31 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	// the operator is not a parallel source at all. More buckets than that would
 	// only add passes over the input; fewer would leave threads idle.
 	//
-	// Reading NumberOfThreads() unconditionally was a 5x penalty on the default
-	// settings and it hid in plain sight, because both halves of it are correct
-	// on their own. Carrying the §7.5 fallback makes ParallelSource() false
-	// (D30): a source that may have to drive the fallback's pipeline cannot be
-	// parallel. So with the fallback on -- the default -- one thread executed
-	// all eight buckets in sequence, and since every bucket has to look at every
-	// row to find its own, that is eight full filtering passes over the input
-	// for no parallelism whatsoever. Measured on a 7.8M-row two-relation join:
-	// 0.574s at eight buckets on one thread, 0.115s at one.
+	// Reading NumberOfThreads() unconditionally was once a 5x penalty on the
+	// default settings, and it hid in plain sight because both halves of it are
+	// correct on their own. Carrying the §7.5 fallback used to make
+	// ParallelSource() false (D30), so with the fallback on -- the default --
+	// one thread executed all eight buckets in sequence, and since every bucket
+	// has to look at every row to find its own, that is eight full filtering
+	// passes over the input for no parallelism whatsoever. Measured on a
+	// 7.8M-row two-relation join: 0.574s at eight buckets on one thread, 0.115s
+	// at one.
+	//
+	// The operator is a parallel source again, so the two halves agree: buckets
+	// are handed to threads that actually exist. What kept them apart was how
+	// the fallback was driven, not the fallback itself.
 	idx_t threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 	if (threads < 1) {
 		threads = 1;
 	}
 	idx_t slices = ParallelSource() ? threads : 1;
-	if (!IsPlainCount()) {
+	if (limited) {
+		// The limited count partitions the join key itself and stops at the
+		// bucket that reaches k, so handing it a second partition on top would
+		// be two schemes fighting over the same key -- and the point of the
+		// limit is the buckets it never builds.
+		slices = 1;
+	} else if (!IsPlainCount()) {
 		// Everything but a single ungrouped count(*) runs on one thread.
 		//
 		// Grouping, because partitioning by the join key puts each group wholly
@@ -249,7 +293,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		lock_guard<mutex> guard(gstate.lock);
 		if (!gstate.groups) {
 			factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
-			                           abandon_after_ms);
+			                           abandon_after_ms, min_rate, second_key);
 			SharedRelations source(client, relations);
 			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
 			                                        group_keys, aggregates);
@@ -309,35 +353,54 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 //! executor, and work until the events report finished.
 SourceResultType PhysicalFactorized::EmitFallback(ExecutionContext &context, DataChunk &chunk,
                                                   FactorizedGlobalSourceState &gstate) const {
-	// Re-entry, not contention, is the hazard here, and the two want opposite
-	// treatment. WorkOnTasks below runs arbitrary tasks from the executor's
-	// queue, and this operator is a parallel source, so one of those tasks can
-	// be another call into GetData on this operator on THIS thread -- which a
-	// held mutex would deadlock against itself. PhysicalRecursiveCTE never has
-	// to think about it: it is a serial source, so a second task for its
-	// pipeline cannot exist.
+	// Re-entry and contention are different hazards and want different answers.
 	//
-	// So a re-entrant call is turned away before any lock is taken, while
-	// another *thread* simply waits on the lock and finds the rows ready. An
-	// earlier version turned both away with an atomic and livelocked: threads
-	// that should have waited kept returning with nothing to do while the owner
-	// span in WorkOnTasks.
+	// Re-entry: WorkOnTasks runs arbitrary tasks from the executor's queue, and
+	// this operator is a parallel source, so one of those tasks can be another
+	// call into GetData on this operator on THIS thread. It is turned away here,
+	// before any lock is taken, because a held mutex would deadlock against
+	// itself and because nesting a helper per task would grow the stack without
+	// bound. PhysicalRecursiveCTE never has to think about it: it is a serial
+	// source, so a second task for its pipeline cannot exist.
+	//
+	// Contention: another *thread* arriving while the fallback runs. It neither
+	// waits nor spins -- both were tried, and both are the same mistake in
+	// different clothes. Waiting on the lock takes a worker out of the pool that
+	// the pipeline being waited for needs (D30), and returning with nothing to
+	// do livelocks. It helps run the pipeline instead.
 	if (fallback_running) {
 		return SourceResultType::FINISHED;
 	}
+	// Exactly one thread drives; the rest help. Claiming the work is the only
+	// part that needs the lock, and it is released before any of it is done.
+	bool drive = false;
 	{
 		lock_guard<mutex> guard(gstate.lock);
-		if (!gstate.fallback_scan) {
-			// Cleared on every exit including the throwing one, or a failed
-			// fallback would leave this thread unable to try again.
-			struct Running {
-				Running() {
-					fallback_running = true;
-				}
-				~Running() {
-					fallback_running = false;
-				}
-			} running;
+		if (gstate.fallback_phase == FactorizedGlobalSourceState::FallbackPhase::NONE) {
+			gstate.fallback_phase = FactorizedGlobalSourceState::FallbackPhase::RUNNING;
+			drive = true;
+		}
+	}
+	if (drive) {
+		DriveFallback(gstate);
+	} else {
+		HelpFallback(gstate);
+	}
+	return ScanFallback(chunk, gstate);
+}
+
+//! Runs the fallback's pipeline to completion, with the source state's lock NOT
+//! held, and leaves its rows ready to scan.
+//!
+//! An earlier version did this under the lock, and that is what forced
+//! `ParallelSource()` to be false: the holder spins in WorkOnTasks while every
+//! other worker parks on the mutex, so at four threads the tasks it is waiting
+//! for had nobody left to run them. Measured then: 40/40 fallbacks at one and
+//! two threads, hung after 24 at four.
+void PhysicalFactorized::DriveFallback(FactorizedGlobalSourceState &gstate) const {
+	FallbackRunning running;
+	try {
+		{
 			// Readied here rather than at build time, because nothing else will:
 			// Executor readies standalone meta pipelines only for recursive
 			// CTEs, by a hard-coded Cast<PhysicalRecursiveCTE> over a list this
@@ -384,16 +447,54 @@ SourceResultType PhysicalFactorized::EmitFallback(ExecutionContext &context, Dat
 			// pipeline has been readied. Reading it any earlier dereferences a
 			// null unique_ptr, which is a crash rather than a wrong answer but
 			// is still not the fallback working.
+			lock_guard<mutex> guard(gstate.lock);
 			gstate.fallback_scan = make_uniq<ColumnDataScanState>();
 			sink_state->Cast<FactorizedGlobalSinkState>().collected.InitializeScan(*gstate.fallback_scan);
+			gstate.fallback_phase = FactorizedGlobalSourceState::FallbackPhase::DONE;
 		}
+	} catch (...) {
+		// The helpers are waiting on a phase they would otherwise never see
+		// change. Saying FAILED releases them; the error itself travels up this
+		// thread, which is where the query fails from.
+		lock_guard<mutex> guard(gstate.lock);
+		gstate.fallback_phase = FactorizedGlobalSourceState::FallbackPhase::FAILED;
+		throw;
 	}
-	return ScanFallback(chunk, gstate);
+}
+
+//! Runs executor tasks until whoever is driving the fallback has finished.
+//!
+//! This is the whole of the fix. A thread that arrives while another is driving
+//! used to park on the source state's lock, and the tasks it could have been
+//! running were the fallback pipeline's own -- so the more threads the query
+//! had, the more certainly it hung. Here it joins in instead, which both
+//! unblocks the driver and runs the stock plan in parallel.
+void PhysicalFactorized::HelpFallback(FactorizedGlobalSourceState &gstate) const {
+	FallbackRunning running;
+	auto &executor = fallback_meta_pipeline->GetExecutor();
+	while (true) {
+		{
+			lock_guard<mutex> guard(gstate.lock);
+			if (gstate.fallback_phase != FactorizedGlobalSourceState::FallbackPhase::RUNNING) {
+				return;
+			}
+		}
+		// Returns as soon as the queue is empty, which it can be while the
+		// driver is still finalizing -- hence the yield rather than a tight
+		// loop on the phase.
+		executor.WorkOnTasks();
+		std::this_thread::yield();
+	}
 }
 
 //! Hands out the fallback's collected rows, a chunk at a time.
 SourceResultType PhysicalFactorized::ScanFallback(DataChunk &chunk, FactorizedGlobalSourceState &gstate) const {
 	lock_guard<mutex> guard(gstate.lock);
+	if (!gstate.fallback_scan) {
+		// The driver threw: its error is what fails the query, and this thread
+		// has nothing to hand out.
+		return SourceResultType::FINISHED;
+	}
 	sink_state->Cast<FactorizedGlobalSinkState>().collected.Scan(*gstate.fallback_scan, chunk);
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
@@ -470,7 +571,8 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	// Set per thread, because the cap is per thread. A worker that never sets it
 	// would run uncapped, which is what thread-local storage trades away for
 	// having no data race.
-	factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression, abandon_after_ms);
+	factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression, abandon_after_ms,
+	                           min_rate, second_key);
 
 	// Read the inputs once, however many threads want them. Every bucket has to
 	// look at every row to find its own, so a private scan per thread would
@@ -483,6 +585,23 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		}
 	}
 	auto &source = *gstate.inputs;
+	if (limited) {
+		// count(*) over `LIMIT k`, which is min(k, |join|). The buckets are
+		// counted one at a time and the walk stops at the one that reaches k,
+		// so a join with a witness early in the partition is answered without
+		// the rest of it ever being built. EXISTS is this with k = 1.
+		const auto result = factorize::ExecuteCountAtMost(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+		                                                  static_cast<size_t>(limit));
+		if (explain_steps) {
+			PrintSteps(result, slice);
+		}
+		if (!result.ok) {
+			throw InvalidInputException("factorize: %s", result.error);
+		}
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(result.count));
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
 	// Bottom-insert is the mode that carries the benefit (FINDINGS F4:
 	// bottom-inserts alone are worth 1.9x, top-inserts 0.98x). Choosing per join
 	// is a later step; this takes the better default.
@@ -497,17 +616,33 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		PrintSteps(result, slice);
 	}
 
-	idx_t completed;
+	idx_t completed = 0;
+	bool abandoned = false;
 	{
 		lock_guard<mutex> guard(gstate.lock);
-		if (!result.ok) {
-			if (gstate.error.empty()) {
-				gstate.error = result.error;
+		// Another thread has handed the query to the stock plan since this one
+		// claimed its bucket. Only possible now that several threads run the
+		// factorized path at once, and it has to be checked *after* the work as
+		// well as before it: this bucket's count belongs to an answer nobody
+		// will use, and counting it towards `slices` would emit a total beside
+		// the fallback's rows -- two answers to one query.
+		abandoned = gstate.fell_back;
+		if (!abandoned) {
+			if (!result.ok) {
+				if (gstate.error.empty()) {
+					gstate.error = result.error;
+				}
+			} else if (gstate.error.empty()) {
+				gstate.total = factorize::CheckedCardinalityAdd(gstate.total, result.count);
 			}
-		} else if (gstate.error.empty()) {
-			gstate.total = factorize::CheckedCardinalityAdd(gstate.total, result.count);
+			completed = ++gstate.completed;
 		}
-		completed = ++gstate.completed;
+	}
+	if (abandoned) {
+		// Join the fallback rather than return: the stock plan is running and
+		// this thread is one more that can help run it.
+		chunk.Reset();
+		return EmitFallback(context, chunk, gstate);
 	}
 
 	// The thread that finishes the last bucket is the one holding the whole sum,

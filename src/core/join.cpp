@@ -27,6 +27,8 @@ thread_local size_t g_memory_limit = 0;
 thread_local size_t g_estimate_budget = 0;
 thread_local double g_min_compression = 0;
 thread_local double g_abandon_after_ms = 0;
+thread_local double g_min_rate = 0;
+thread_local bool g_second_key = false;
 thread_local std::chrono::steady_clock::time_point g_slice_start = std::chrono::steady_clock::now();
 }
 
@@ -61,6 +63,22 @@ double GetGlobalAbandonAfter() {
 	return g_abandon_after_ms;
 }
 
+void SetGlobalMinRate(double tuples_per_ms) {
+	g_min_rate = tuples_per_ms;
+}
+
+double GetGlobalMinRate() {
+	return g_min_rate;
+}
+
+void SetGlobalSecondKey(bool enabled) {
+	g_second_key = enabled;
+}
+
+bool GetGlobalSecondKey() {
+	return g_second_key;
+}
+
 double ElapsedSliceMs() {
 	const auto now = std::chrono::steady_clock::now();
 	return std::chrono::duration<double, std::milli>(now - g_slice_start).count();
@@ -71,13 +89,15 @@ double GetGlobalMinCompression() {
 }
 
 void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression,
-                     double abandon_after_ms) {
+                     double abandon_after_ms, double min_rate, bool second_key) {
 	g_memory_limit = memory_bytes;
 	ThreadBudget().limit = memory_bytes;
 	ThreadBudget().peak.store(ThreadBudget().used.load());
 	g_estimate_budget = estimate_budget_bytes;
 	g_min_compression = min_compression;
 	g_abandon_after_ms = abandon_after_ms;
+	g_min_rate = min_rate;
+	g_second_key = second_key;
 	// The slice's clock starts here, which is where its work does.
 	g_slice_start = std::chrono::steady_clock::now();
 }

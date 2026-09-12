@@ -43,10 +43,10 @@ real difficulty is skew.
 | MCV statistics and cost model | working, measured |
 | gate (fire/decline decision) | working — re-fitted against in-DuckDB timings, no regression on any query it fires on (DECISIONS D19) |
 | `factorized_count()` table function | working — 238 CE queries, 0 mismatches against published sizes and stock DuckDB (DECISIONS D16) |
-| optimizer rule | working — matches inner equi-join `count(*)`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
+| optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
-| memory | no spilling. A representation that will not fit is re-counted over a partition of its join key: slower, never a failure |
-| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20) |
+| memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
+| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried — 1.49x over 42 corpus queries (D54) |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
 v1.5.5.
@@ -57,16 +57,26 @@ SET factorize_explain = true;        -- say what was taken over, or why not
 SELECT count(*) FROM a, b, c WHERE a.x = b.x AND b.y = c.y;
 ```
 
-Shapes the rule takes over: an ungrouped `count(*)` over inner equi-joins of
-stored tables on integer columns, with filters DuckDB pushed into or left above
-the scans. Everything else — outer joins, `GROUP BY`, non-integer keys, cyclic
-join graphs, computed join keys — is declined silently and answered by the
-stock plan. `SET factorize_explain = true` says which, and why.
+Shapes the rule takes over: `count(*)` and `sum()` — several of them at once,
+grouped or not — over inner equi-joins of stored tables on integer columns, with
+filters DuckDB pushed into or left above the scans. Everything else — outer
+joins, non-integer keys, cyclic join graphs, computed join keys — is declined
+silently and answered by the stock plan. `SET factorize_explain = true` says
+which, and why.
+
+`EXISTS` is matched too, since DuckDB plans it as `count(*)` over `LIMIT 1` over
+the join, and so is `count(*)` over any `LIMIT k` — but the gate declines both
+unless `factorize_limit` is set. On all 119 runnable CE queries it agreed with
+stock and was slower on 93 of them, because DuckDB stops its probe at the first
+tuple while this stops at the first non-empty bucket of the join key. On
+epinions-like data it is a 2.5× win; on watdiv it is 33× worse (DECISIONS D53).
 
 ### Beyond counting
 
-Four things the representation can answer that an aggregate cannot, each an
-explicit table function rather than something the optimizer rule fires on:
+Four things the representation can answer that an aggregate cannot. `EXISTS` is
+now reachable through the rule as well (above); the other three are explicit
+table functions, because tuple output would have to carry payload columns the
+representation does not hold:
 
 ```sql
 -- Does this join have any tuple? Stops at the first one it finds.
@@ -87,24 +97,30 @@ SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
 
 - **No spilling.** A representation too large for the memory budget is
   re-counted over a partition of its join key, which costs a pass over the
-  input per partition. Skew is the case that defeats it: no number of buckets
-  separates one value from itself.
-- **An error in the factorized path runs the stock plan instead, and that costs
-  parallelism.** The plan the rule replaces is carried rather than dropped, and
-  built into a pipeline the executor is not given, so it costs nothing until a
-  failure needs it (§7.5). The catch is that an operator which may have to drive
-  that pipeline cannot be a parallel source — several tasks park on its state
-  lock while one drives the fallback, and a parked worker is one the executor
-  cannot use to run the pipeline it is waiting for. So the factorized `count(*)`
-  runs on one thread: measured 7ms against 2–4ms at eight threads.
+  input per partition. Nothing is ever written to disk.
 
-  `factorize_fallback` defaults to **true** because on a 27M-tuple star the
-  engine is 32× faster than stock, and serialising leaves about 11×. Trading 32×
-  for 11× to make failure impossible is a good trade, but it is a trade — set it
-  to `false` to get the parallelism back and have failures surface again. Either
-  way `factorize_mode='off'` remains the blunt recovery. `FATAL` and `INTERRUPT`
-  are never recovered from: the first leaves nothing to fall back to, and the
-  second is you asking it to stop.
+  Skew defeats it, because no number of buckets separates one value from itself
+  and every retry refines the *same* key. `factorize_second_key` reaches for a
+  different one and partitions inside the bucket, which is sound for the same
+  reason the first partition is, and answers queries that otherwise cannot be —
+  but it is **off**, because on the corpus it also spends 269s answering a query
+  the stock plan has in 13 (DECISIONS D55). What has no answer either way is
+  skew on every key at once.
+- **An error in the factorized path runs the stock plan instead.** The plan the
+  rule replaces is carried rather than dropped, and built into a pipeline the
+  executor is not given, so it costs nothing until a failure needs it (§7.5).
+
+  This used to cost the parallelism too, and no longer does. The thread driving
+  the fallback held the operator's state lock across the work, so every other
+  worker parked on it — and a parked worker is one the executor cannot use to
+  run the pipeline being waited for, which hung at four threads. They help run
+  it now instead, and the operator is a parallel source whether or not it
+  carries a fallback (DECISIONS D54). `factorize_fallback` still turns the
+  fallback off, but it is no longer a trade against parallelism.
+
+  `factorize_mode='off'` remains the blunt recovery. `FATAL` and `INTERRUPT` are
+  never recovered from: the first leaves nothing to fall back to, and the second
+  is you asking it to stop.
 - **The cost model's coefficients were fitted on one machine.** They are
   checked in as defaults, not as constants, and they have been wrong in both
   directions (DECISIONS D19, D26). `scripts/calibrate-synthetic.py` re-fits them

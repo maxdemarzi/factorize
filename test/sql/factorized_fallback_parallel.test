@@ -1,0 +1,209 @@
+# name: test/sql/factorized_fallback_parallel.test
+# description: The §7.5 fallback runs on a parallel source, at every thread count
+# group: [sql]
+
+require factorize
+
+# The operator was serial whenever it carried a fallback, because the thread
+# driving the fallback's pipeline held the source state's lock and every other
+# task parked on it -- and a parked worker is one the executor cannot use to run
+# the very pipeline it is waiting for. It hung after 24 fallbacks at four
+# threads (D27, D30).
+#
+# What makes this a test rather than a comment is that the failure is a hang.
+# There is no wrong answer to assert on: either these queries come back or the
+# suite stops here.
+
+statement ok
+CREATE TABLE pf_h AS SELECT i AS k FROM range(200) t(i);
+
+statement ok
+CREATE TABLE pf_a AS SELECT i % 200 AS k, i AS v FROM range(2000) t(i);
+
+statement ok
+CREATE TABLE pf_b AS SELECT i % 200 AS k, i AS v FROM range(2000) t(i);
+
+statement ok
+SET disabled_optimizers = 'compressed_materialization';
+
+statement ok
+SET factorize_mode = 'force';
+
+# Every query below falls back, so every one of them drives the pipeline the
+# rule replaced.
+statement ok
+SET factorize_debug_fail = true;
+
+#-----------------------------------------------------------------------------
+# One thread: the configuration that always worked.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET threads = 1;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+#-----------------------------------------------------------------------------
+# Two, four and eight. Four is where it used to hang.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET threads = 2;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+statement ok
+SET threads = 8;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+# The other aggregate shapes, at eight threads: each drives the same pipeline
+# but emits a different number of columns through it.
+query I
+SELECT sum(pf_a.v) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+19990000
+
+query III
+SELECT count(*), sum(pf_a.v), sum(pf_b.v) FROM pf_h, pf_a, pf_b
+ WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000	19990000	19990000
+
+query III
+SELECT pf_h.k, count(*), sum(pf_a.v) FROM pf_h, pf_a, pf_b
+ WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k GROUP BY 1 ORDER BY 1 LIMIT 3;
+----
+0	100	90000
+1	100	90100
+2	100	90200
+
+# EXISTS falls back the same way, and is the one shape whose answer is a
+# boolean rather than a number.
+query I
+SELECT EXISTS (SELECT * FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k);
+----
+true
+
+#-----------------------------------------------------------------------------
+# With the injection off, the same queries at eight threads take the factorized
+# path -- which is the parallelism the fallback used to cost.
+#-----------------------------------------------------------------------------
+
+statement ok
+SET factorize_debug_fail = false;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+# And the operator is still the one answering, with the fallback carried.
+query II
+EXPLAIN SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# The count does not depend on how many buckets the partition was dealt into,
+# which is what makes the parallel source safe to be parallel.
+statement ok
+SET threads = 3;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+statement ok
+SET threads = 7;
+
+query I
+SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
+----
+20000
+
+statement ok
+RESET threads;
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+SET factorize_mode = 'off';

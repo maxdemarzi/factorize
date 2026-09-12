@@ -412,6 +412,18 @@ MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const 
 ExecuteResult ExecuteExists(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                             PathStrategy strategy = PathStrategy::LEVELWISE);
 
+//! `count(*)` over `LIMIT k`: the join's size, or `k` if it is larger.
+//!
+//! Which k tuples a LIMIT keeps is not defined without an ORDER BY, but how
+//! many there are is: min(k, |join|). That makes the answer reachable the way
+//! EXISTS is -- examine the buckets of the join key one at a time and stop as
+//! soon as k tuples have been seen -- and it never enumerates a tuple, because
+//! each bucket's own count is exact.
+//!
+//! EXISTS is this with k = 1, and is implemented as such.
+ExecuteResult ExecuteCountAtMost(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                 size_t limit, PathStrategy strategy = PathStrategy::LEVELWISE);
+
 //! Counts one bucket of the partition: the tuples whose join key hashes to
 //! `slice` of `slices`. Summing every bucket gives the whole count, and the
 //! buckets are independent, which is what lets them run on separate threads.

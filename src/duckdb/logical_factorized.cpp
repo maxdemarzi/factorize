@@ -118,8 +118,12 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	factorized.estimate_budget_bytes = estimate_budget_bytes;
 	factorized.min_compression = min_compression;
 	factorized.abandon_after_ms = abandon_after_ms;
+	factorized.min_rate = min_rate;
+	factorized.second_key = second_key;
 	factorized.explain_steps = explain_steps;
 	factorized.grouped = grouped;
+	factorized.limited = limited;
+	factorized.limit = limit;
 	factorized.group_types = group_types;
 	factorized.group_keys = group_keys;
 	factorized.aggregates = aggregates;

@@ -21,6 +21,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
@@ -131,6 +132,14 @@ struct FactorizedRegion {
 	//! One per aggregate the query computes, in its own order, which is the
 	//! order the answer's columns come back in.
 	vector<RegionAggregate> aggregates;
+	//! `LIMIT k` standing between the aggregate and the join graph.
+	//!
+	//! Which k tuples a LIMIT keeps is undefined without an ORDER BY, but how
+	//! many of them there are is not: min(k, |join|). That is the shape DuckDB
+	//! plans `EXISTS` into -- count(*) over LIMIT 1 over the join -- and it is
+	//! answerable without enumerating a tuple or counting past k.
+	bool limited = false;
+	idx_t limit = 0;
 };
 
 //! Records why a subtree was turned down and declines it. Always returns false,
@@ -268,10 +277,58 @@ static bool MatchJoinGraph(LogicalOperator &op, FactorizedRegion &region) {
 	return ok && left && right;
 }
 
+static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region);
+
+//! Accepts a `LIMIT k` between the aggregate and the join graph.
+//!
+//! This is the shape `EXISTS (SELECT ... FROM a, b WHERE ...)` is planned into:
+//! DuckDB rewrites it to count(*) over a constant projection over LIMIT 1 over
+//! the join, and compares the count to zero. Before this the rule declined it
+//! with "not a scan: LIMIT" and the whole of EXISTS went to the stock plan,
+//! which builds the join's hash tables to find out whether it has one tuple.
+static bool MatchLimit(LogicalOperator &op, FactorizedRegion &region) {
+	if (op.type != LogicalOperatorType::LOGICAL_LIMIT) {
+		return MatchJoinGraph(op, region);
+	}
+	auto &limit = op.Cast<LogicalLimit>();
+	bool ok = true;
+	if (limit.limit_val.Type() != LimitNodeType::CONSTANT_VALUE) {
+		// A percentage needs the join's size, and an expression is not known
+		// until the query runs -- both are the number the limit exists to avoid
+		// computing.
+		Decline(region, "LIMIT is not a constant count");
+		ok = false;
+	}
+	if (limit.offset_val.Type() != LimitNodeType::UNSET) {
+		// count(*) over `LIMIT k OFFSET m` is clamp(N - m, 0, k), and N is again
+		// the number this path exists not to need.
+		Decline(region, "LIMIT has an OFFSET");
+		ok = false;
+	}
+	if (region.limited) {
+		// Two of them would be min(k1, k2) and nothing else, but the shapes that
+		// produce one are the ones worth having and this is not one.
+		Decline(region, "more than one LIMIT");
+		ok = false;
+	} else if (ok) {
+		region.limited = true;
+		region.limit = limit.limit_val.GetConstantValue();
+	}
+	if (limit.children.size() != 1) {
+		// Has to stop: there is no single child to descend into.
+		Decline(region, "limit has no single child");
+		return false;
+	}
+	// Projections can sit on either side of the limit, so the walk goes back
+	// through them rather than straight to the join graph.
+	const bool below = MatchProjections(*limit.children[0], region);
+	return ok && below;
+}
+
 //! Accepts zero or more pure column-pruning projections above the join graph.
 static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 	if (op.type != LogicalOperatorType::LOGICAL_PROJECTION) {
-		return MatchJoinGraph(op, region);
+		return MatchLimit(op, region);
 	}
 	auto &proj = op.Cast<LogicalProjection>();
 	bool ok = true;
@@ -416,6 +473,15 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 	if (region.relations.size() < 2 || region.edges.empty()) {
 		// A single relation has nothing to factorize.
 		Decline(region, "fewer than two joined relations");
+		ok = false;
+	}
+	if (region.limited && (region.grouped || region.aggregates.size() != 1 ||
+	                       region.aggregates[0].kind != factorize::Aggregate::COUNT)) {
+		// count(*) is the one fold whose answer does not depend on *which* k
+		// tuples the limit kept. A sum over them does, and so does a count per
+		// group, and SQL does not say which k those are -- so there is no
+		// answer to agree with, only the one the stock plan happens to produce.
+		Decline(region, "LIMIT under an aggregate that is not a single count(*)");
 		ok = false;
 	}
 	return ok && below;
@@ -1089,6 +1155,23 @@ static idx_t MemoryBudget(ClientContext &context) {
 static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, const vector<BoundRelation> &relations,
                        const factorize::QueryGraph &graph, const factorize::Plan &plan, string &reason,
                        double &predicted_bytes) {
+	if (region.limited && !BooleanSetting(context, "factorize_limit", false)) {
+		// The one decline the cost model is not consulted about, because it was
+		// measured instead. Rewritten as EXISTS, all 119 runnable CE queries
+		// agreed with stock and 93 of them were slower -- 4.76s of stock work
+		// became 69.47s -- because DuckDB stops its probe at the first tuple
+		// while this stops at the first non-empty bucket of the join key. Gating
+		// it on the cost model brings that to 6.09s, which is still 28% worse
+		// than never firing, and the gate wins 14 of the 35 it takes: it is not
+		// selecting, it is happening to exclude watdiv (D53).
+		//
+		// So the shape matches, is tested, and answers -- under 'force', and
+		// under this setting for anyone whose data looks like epinions, where
+		// firing everywhere is a 2.5x win. It does not fire on its own until
+		// something here can tell those apart.
+		reason = "count over a LIMIT is measured slower than the stock plan; SET factorize_limit=true to fire on it";
+		return false;
+	}
 	CatalogStats stats(context, region, relations);
 	// The statistic D13 asked for and nobody built. Sampled by default because a
 	// gate that scans every relation to decide whether to scan every relation is
@@ -1192,6 +1275,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					auto replacement = make_uniq<LogicalFactorized>(region.aggregate_index, std::move(relations),
 					                                               std::move(graph), std::move(plan));
 					replacement->grouped = region.grouped;
+					replacement->limited = region.limited;
+					replacement->limit = region.limit;
 					replacement->group_index = region.group_index;
 					replacement->group_types = region.group_types;
 					replacement->group_keys = std::move(group_keys);
@@ -1225,6 +1310,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					// the way and covering nothing (D25, D26 again).
 					replacement->min_compression = gated ? DoubleSetting(context, "factorize_min_compression", 0.0) : 0.0;
 					replacement->abandon_after_ms = DoubleSetting(context, "factorize_abandon_after_ms", 2000.0);
+					replacement->min_rate = DoubleSetting(context, "factorize_min_rate", 0.0);
+					replacement->second_key = BooleanSetting(context, "factorize_second_key", false);
 					replacement->explain_steps = explain;
 					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
 					if (slack > 0 && predicted_bytes > 0) {
@@ -1365,6 +1452,22 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "query that compresses badly is left to finish, because finishing is cheap (0 abandons "
 	                          "as soon as the floor is missed)",
 	                          LogicalType::DOUBLE, Value::DOUBLE(2000.0));
+	config.AddExtensionOption("factorize_limit",
+	                          "Let the gate consider count(*) over a LIMIT, which is the shape EXISTS is planned "
+	                          "into. Off because it was measured slower than the stock plan on every corpus dataset "
+	                          "but one (D53); on epinions-like data, firing everywhere is a 2.5x win",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("factorize_second_key",
+	                          "Split a bucket that no modulus of its own join key can divide -- one skewed value "
+	                          "carrying it -- on a different key instead of failing. Off: it answers queries that "
+	                          "otherwise cannot be, and on the corpus it also spends 270s answering one the stock "
+	                          "plan has in 13 (DECISIONS D55)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("factorize_min_rate",
+	                          "Abandon to the stock plan when the last materialized join has delivered fewer than "
+	                          "this many tuples per millisecond -- the unit DuckDB's own cost model is stated in, so "
+	                          "the two can be compared rather than guessed between (0 disables)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
 	config.AddExtensionOption("factorize_memory_slack",
 	                          "How far past the memory budget the predicted f-representation size may go before the "
 	                          "gate declines on size alone; the run time slices or abandons either way, so this only "
