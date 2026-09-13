@@ -52,6 +52,8 @@ public:
 	double min_rate = 0;
 	//! Split a skewed bucket on a different key rather than failing; off (D55).
 	bool second_key = false;
+	//! Be a parallel source even while carrying the fallback; off (D54a).
+	bool parallel_fallback = false;
 	//! Print what each materialized join left behind, for factorize_explain.
 	bool explain_steps = false;
 	bool grouped = false;
@@ -118,24 +120,31 @@ public:
 	//! bottom-inserts into a shared representation; this trades that efficiency
 	//! for not having to make insertion thread-safe, and for an invariance that
 	//! holds by construction rather than by locking discipline.
-	//! Parallel, fallback or no fallback.
+	//! Parallel when there is no fallback to drive, or when asked.
 	//!
-	//! This used to be `children.empty()` -- serial whenever the §7.5 fallback
-	//! was carried, which is the default. The reason was real but was a property
-	//! of how the fallback was driven rather than of driving one: the thread
-	//! running its pipeline held the source state's lock, every other task
-	//! parked on that lock, and a parked worker is one the executor cannot use
-	//! to run the very pipeline it is waiting for. Measured then on a 27M-tuple
-	//! star, 40 fallbacks in a row: 40/40 at one thread and at two, hung after
-	//! 24 at four.
+	//! Carrying the §7.5 fallback used to force this false, and the reason was a
+	//! property of how the fallback was driven rather than of driving one: the
+	//! thread running its pipeline held the source state's lock, every other
+	//! task parked on that lock, and a parked worker is one the executor cannot
+	//! use to run the very pipeline it is waiting for. Measured then on a
+	//! 27M-tuple star, 40 fallbacks in a row: 40/40 at one thread and at two,
+	//! hung after 24 at four. That is fixed -- the lock is not held across the
+	//! work and arriving threads run the pipeline's tasks -- so being parallel
+	//! here is now *possible*.
 	//!
-	//! The lock is no longer held across the work and the threads that arrive
-	//! meanwhile run the pipeline's tasks instead of waiting for them, so the
-	//! starvation has nothing left to starve. What it costs to be wrong about
-	//! this is a hang, so it is measured at 1, 2, 4 and 8 threads rather than
-	//! argued.
+	//! It is not yet *right*, which is a separate question and one measurement
+	//! answered badly. Over 42 mostly-fast corpus queries eight buckets are
+	//! 1.49x one, but `watdiv_acyclic_217_05` goes from 56s to 279s, because a
+	//! query that will exceed the memory budget exceeds it once per bucket:
+	//! eight slices each rebuild the same 361,282-record first step, each peak
+	//! at 800MB, and the query falls back to the stock plan anyway. Dividing
+	//! work helps when it fits and multiplies it when it does not, and the
+	//! regime this engine exists for is the one where it does not (D54a).
+	//!
+	//! So the default is what it was, and `factorize_parallel_fallback` turns it
+	//! on for anyone who wants it before the excluded regime has been measured.
 	bool ParallelSource() const override {
-		return true;
+		return children.empty() || parallel_fallback;
 	}
 	//! One row has no order to preserve.
 	//!

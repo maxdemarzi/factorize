@@ -46,7 +46,7 @@ real difficulty is skew.
 | optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
-| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried — 1.49x over 42 corpus queries (D54) |
+| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20). Carrying the fallback no longer *prevents* it, but `factorize_parallel_fallback` is off: 1.49x on fast queries, 5x the wrong way on one that exceeds memory (D54, D54a) |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
 v1.5.5.
@@ -74,9 +74,9 @@ epinions-like data it is a 2.5× win; on watdiv it is 33× worse (DECISIONS D53)
 ### Settings
 
 Every one has a description in `duckdb_settings()`; these are the ones worth
-knowing about. Four of them — `factorize_limit`, `factorize_second_key` and the
-two abandon floors — are built, tested and **off**, each because turning it on
-was measured and was worse. They are listed because a switch nobody can find is
+knowing about. Five of them — `factorize_limit`, `factorize_second_key`,
+`factorize_parallel_fallback` and the two abandon floors — are built, tested and
+**off**, each because turning it on was measured and was worse. They are listed because a switch nobody can find is
 the same as a switch that does not exist, not because they are recommended.
 
 | setting | default | what it does |
@@ -86,6 +86,7 @@ the same as a switch that does not exist, not because they are recommended.
 | `factorize_fallback` | `true` | carry the stock plan so an internal error costs time rather than the answer (§7.5) |
 | `factorize_limit` | `false` | let the gate consider `EXISTS` and `count(*)` over `LIMIT k` (D53) |
 | `factorize_second_key` | `false` | split a bucket that is one skewed key value on a different key instead of failing (D55) |
+| `factorize_parallel_fallback` | `false` | count one bucket per thread even while carrying the fallback (D54, D54a) |
 | `factorize_min_compression` | `0` (off) | abandon to the stock plan when a materialized join is not compressing (D37, D51) |
 | `factorize_min_rate` | `0` (off) | abandon when the last materialized join is delivering fewer than this many tuples/ms (D56) |
 | `factorize_min_gain` | `1.5` | how much faster the gate must predict this engine to be before firing |
@@ -130,13 +131,17 @@ SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
   rule replaces is carried rather than dropped, and built into a pipeline the
   executor is not given, so it costs nothing until a failure needs it (§7.5).
 
-  This used to cost the parallelism too, and no longer does. The thread driving
-  the fallback held the operator's state lock across the work, so every other
-  worker parked on it — and a parked worker is one the executor cannot use to
-  run the pipeline being waited for, which hung at four threads. They help run
-  it now instead, and the operator is a parallel source whether or not it
-  carries a fallback (DECISIONS D54). `factorize_fallback` still turns the
-  fallback off, but it is no longer a trade against parallelism.
+  This used to make the parallelism impossible, and no longer does. The thread
+  driving the fallback held the operator's state lock across the work, so every
+  other worker parked on it — and a parked worker is one the executor cannot use
+  to run the pipeline being waited for, which hung at four threads. They help
+  run it now instead (DECISIONS D54).
+
+  Possible is not the same as worth it, and `factorize_parallel_fallback` is
+  off. Buckets divide the work when the representation fits and multiply it when
+  it does not: on `watdiv_acyclic_217_05` eight slices each rebuild the same
+  361,282-record first step, each peak at 800MB, and the query exceeds its
+  budget and falls back anyway — 279s against 56s serial (D54a).
 
   `factorize_mode='off'` remains the blunt recovery. `FATAL` and `INTERRUPT` are
   never recovered from: the first leaves nothing to fall back to, and the second

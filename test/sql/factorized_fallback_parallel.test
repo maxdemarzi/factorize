@@ -29,6 +29,14 @@ SET disabled_optimizers = 'compressed_materialization';
 statement ok
 SET factorize_mode = 'force';
 
+# The whole point of this file: with the fallback carried AND the source
+# parallel, several tasks are inside the operator while one drives the stock
+# plan. That combination is what used to hang, and it is only reachable with
+# this setting on -- it is off by default for a reason unrelated to hanging
+# (D54a), so a test that left it off would be testing nothing.
+statement ok
+SET factorize_parallel_fallback = true;
+
 # Every query below falls back, so every one of them drives the pipeline the
 # rule replaced.
 statement ok
@@ -198,6 +206,9 @@ query I
 SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
 ----
 20000
+
+statement ok
+SET factorize_parallel_fallback = false;
 
 statement ok
 RESET threads;

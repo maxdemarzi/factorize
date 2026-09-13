@@ -84,6 +84,8 @@ public:
 	double min_rate = 0;
 	//! Split a skewed bucket on a different key rather than failing; off (D55).
 	bool second_key = false;
+	//! Be a parallel source even while carrying the fallback; off (D54a).
+	bool parallel_fallback = false;
 	//! Print what each materialized join left behind, for factorize_explain.
 	bool explain_steps = false;
 	//! The join order, decided when the region was matched. Ordering at match

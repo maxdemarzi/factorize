@@ -3482,6 +3482,10 @@ clamp is checked at every k either side of the join's own size.
 
 ## D54 — The fallback did not cost the parallelism; holding a lock across it did
 
+**Superseded in part by D54a: the 1.49x below was measured on a sample that
+stopped before the queries where the direction reverses, and the default is now
+off.**
+
 D27 and D30 recorded that carrying the §7.5 fallback makes the operator a serial
 source, and the README has been selling the trade ever since: `factorize_fallback`
 defaults to true because 32x serialised to 11x is still 11x. The measurement
@@ -3551,6 +3555,9 @@ is a hang rather than a wrong answer, so there is nothing to assert on beyond
 the queries coming back.
 
 ## D55 — "No spilling" was one key, not no key
+
+**Corrected by D54a: the two corpus slowdowns below were not caused by this
+mechanism, and one of them was not a slowdown.**
 
 The README has carried this limitation since the memory cap went in: a
 representation too large for the budget is re-counted over a partition of its
@@ -3703,3 +3710,54 @@ because its only join is fused and materializes nothing to judge, and a floor at
 the bottom abandons nothing. Abandoning was checked end to end against a real
 query: `hetio_acyclic_205_11` under an impossible floor falls back and returns
 1813418909, which is the answer.
+
+## D54a — The parallelism D54 restored is off, and D55 was blamed for its regression
+
+D54 made the operator a parallel source whether or not it carried the fallback,
+measured 1.49x over 42 corpus queries, and shipped it on. Two corrections.
+
+**The 1.49x was measured on the wrong half of the corpus.** The run was stopped
+at `watdiv_204_14` "once the direction was unambiguous", and the queries it had
+not reached are the slow ones -- which is where the direction reverses.
+`watdiv_acyclic_217_05`, A/B'd on one binary with only `ParallelSource()`
+changed:
+
+    ParallelSource() == children.empty()   (pre-D54)      56.4s
+    ParallelSource() == true               (D54)         279.4s
+
+**Why, exactly.** `factorize_explain` at eight threads:
+
+    slice 0 (peak 796.8MB): [1: 361282 recs ... 154ms] ...
+    slice 1 (peak 800.8MB): [1: 361282 recs ... 83604ms] ...
+    slice 5 (peak 800.8MB): [1: 361282 recs ... 90372ms] ...
+    ...
+    slice 4 (peak 796.8MB): [1: 361282 recs ... 251926ms] ...
+    fell back to the stock plan: the engine exceeded its per-slice memory budget
+
+Every slice rebuilds the *same* 361,282-record first step, because the slice key
+does not reach that relation and filtering removes none of it. Eight slices each
+peak at 800MB, and the query exceeds its budget and falls back to the stock plan
+anyway. Dividing the work helps when it fits and multiplies it when it does not,
+and the >1e9-tuple regime this engine exists for (D15) is the one where it does
+not. So `factorize_parallel_fallback` defaults to false, which is exactly the
+behaviour before D54, and the lock fix stays because it is what makes the
+setting safe to turn on at all.
+
+**And D55 was blamed for this.** It recorded `watdiv_acyclic_217_05` at 269s and
+`yago_acyclic_Chain_9_71` at 280s as the cost of splitting a skewed bucket on a
+second key. Re-run with `factorize_second_key` off, both are unchanged -- so the
+second key never caused either. 217_05 is D54's, above; Chain_9_71 was already
+timing out at 300s before any of this work, so it is not a regression at all.
+D55's own claim -- that the mechanism converts a query that cannot be answered
+at any memory limit into one that can -- still stands on its fixture, and the
+corpus cost it cites does not. It stays off, now for want of evidence either way
+rather than for evidence against.
+
+**What went wrong in the method, twice.** The D55 numbers came from comparing
+against a table measured with `factorize_min_compression=5` while running at
+default settings, so the baselines were not baselines: `watdiv_210_06`'s "12.4s
+to 0.327s, 38x" was 0.5s to 0.327s, and `218_15` was an improvement from 138.6s
+rather than a regression from 18.9s. A recorded number is only a baseline if the
+settings that produced it are recorded with it. The D54 number came from a
+sample stopped early on the grounds that the direction was clear, which is the
+same error D47 names: a fire count from one dataset generalised to four.

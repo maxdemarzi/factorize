@@ -1312,6 +1312,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					replacement->abandon_after_ms = DoubleSetting(context, "factorize_abandon_after_ms", 2000.0);
 					replacement->min_rate = DoubleSetting(context, "factorize_min_rate", 0.0);
 					replacement->second_key = BooleanSetting(context, "factorize_second_key", false);
+					replacement->parallel_fallback = BooleanSetting(context, "factorize_parallel_fallback", false);
 					replacement->explain_steps = explain;
 					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
 					if (slack > 0 && predicted_bytes > 0) {
@@ -1456,6 +1457,12 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Let the gate consider count(*) over a LIMIT, which is the shape EXISTS is planned "
 	                          "into. Off because it was measured slower than the stock plan on every corpus dataset "
 	                          "but one (D53); on epinions-like data, firing everywhere is a 2.5x win",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("factorize_parallel_fallback",
+	                          "Count one bucket of the join key per thread even while carrying the §7.5 fallback. "
+	                          "Off: worth 1.49x over 42 mostly-fast corpus queries, and 5x the wrong way on a query "
+	                          "that exceeds the memory budget, because each bucket exceeds it separately "
+	                          "(DECISIONS D54a)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("factorize_second_key",
 	                          "Split a bucket that no modulus of its own join key can divide -- one skewed value "

@@ -120,6 +120,7 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	factorized.abandon_after_ms = abandon_after_ms;
 	factorized.min_rate = min_rate;
 	factorized.second_key = second_key;
+	factorized.parallel_fallback = parallel_fallback;
 	factorized.explain_steps = explain_steps;
 	factorized.grouped = grouped;
 	factorized.limited = limited;
