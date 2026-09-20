@@ -3808,3 +3808,63 @@ means choosing a partition that reaches the early steps of the plan rather than
 the most relations overall -- a change to what is partitioned, not to when it is
 given up on. Recorded here rather than attempted: the measurement above says
 what it would be worth.
+
+## D57 — "A hundred rows out of a trillion" was never DuckDB's problem
+
+§10.3's tuple output is the last v2 feature the optimizer rule does not reach,
+and the case for wiring it in has been in the README since the table functions
+shipped:
+
+> a hundred rows out of a join with a trillion, without building the trillion.
+> Stock DuckDB materialises the hash-join intermediates regardless of the LIMIT.
+
+The second sentence is false, and the measurement that says so cost nothing,
+because `factorized_tuples` already exists: the same question can be asked of
+the table function before any of it is wired into the matcher. That order is
+the whole lesson of D53, where the EXISTS shape was built first and measured
+second and turned out to be slower on 93 of 119 queries.
+
+**Every fourth runnable CE query, both engines emitting the same 100 rows of
+the same join:**
+
+    pairs                             39
+    ours faster on                     4
+    ours slower on                    35
+    total, stock                   1.28s
+    total, ours                   83.83s
+
+    worst:  watdiv_acyclic_211_09   0.019s -> 11.004s    579x
+            watdiv_acyclic_218_08   0.074s -> 35.575s    481x
+            yago_acyclic_Tree_6_33  0.031s -> 10.853s    350x
+
+**And on the regime this project exists for**, where DuckDB cannot compute the
+*count* at any cap:
+
+    hetio_acyclic_205_03      stock 0.011s   ours 0.011s
+    hetio_acyclic_216_01      stock 0.001s   ours 0.002s
+    hetio_acyclic_225_02      stock 0.000s   ours 0.002s
+    watdiv_acyclic_205_19     stock 0.000s   ours 0.002s
+
+A query whose result is 1e13 tuples hands back its first hundred in eleven
+milliseconds. DuckDB's probe side streams and stops at k, so the trillion is
+never built by anybody -- the blocking build sides are over base tables, and
+reaching a hundred output rows touches almost none of them.
+
+**Why this engine loses it.** The count is where factorization wins because the
+*whole* join has to be consumed and a representation consumes it in fewer
+records. A prefix is the opposite shape: it needs k tuples and the streaming
+engine stops after k, while this one builds a bucket's entire representation
+before enumerating anything. `ExecuteMaterializeWithinMemory` already stops
+after the bucket that supplies the prefix, and one bucket is still far more
+than a hundred tuples' worth of work.
+
+So §10.3 is not wired into the rule, and the reason is recorded here rather
+than discovered by three more days of binding work: there is nothing to win.
+The table function stays -- it answers a question, and a caller who wants the
+tuples of a representation that is being built anyway should have it -- but the
+README's claim about beating DuckDB to a prefix is removed rather than softened.
+
+What would change this is a limit pushed *into* the join rather than applied
+after it, so the representation is built only as far as k tuples require. That
+is a different algorithm from the one in the paper, and nothing in the corpus
+says it would be worth writing: DuckDB is already at eleven milliseconds.

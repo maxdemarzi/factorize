@@ -95,18 +95,20 @@ the same as a switch that does not exist, not because they are recommended.
 ### Beyond counting
 
 Four things the representation can answer that an aggregate cannot. `EXISTS` is
-now reachable through the rule as well (above); the other three are explicit
-table functions, because tuple output would have to carry payload columns the
-representation does not hold:
+now reachable through the rule as well (above); the other three stay explicit
+table functions. Tuple output would have to carry payload columns the
+representation does not hold — and, measured before building any of it, has
+nothing to win even where it would work (DECISIONS D57):
 
 ```sql
 -- Does this join have any tuple? Stops at the first one it finds.
 SELECT * FROM factorized_exists(['a', 'b'], ['a.x = b.x']);
 
--- The join itself. The third argument is a limit, and it is the interesting
--- part: a hundred rows out of a join with a trillion, without building the
--- trillion. Stock DuckDB materialises the hash-join intermediates regardless
--- of the LIMIT.
+-- The join itself, at most `limit` tuples of it. Not a way to beat DuckDB to a
+-- prefix: its probe side streams and stops at k, so on the CE corpus stock is
+-- faster on 35 of 39 queries and up to 579x faster, and it hands back the first
+-- hundred rows of a 1e13-tuple join in 11ms (DECISIONS D57). This is for the
+-- tuples of a representation that is being built anyway.
 SELECT * FROM factorized_tuples(['a', 'b'], ['a.x = b.x'], 100);
 
 -- One row per group, counted without enumerating the tuples in it. Works when
