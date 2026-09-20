@@ -262,10 +262,21 @@ Also worth knowing before trusting any number here:
 - **O11** — the cost model's coefficients are fitted on one machine and do not
   transfer. `FitEngineCost` and the harness's `--calibrate` mode are the
   supported way to replace them.
-- **O12 / F19** — flat estimation over-predicts on uniform data by up to 84×.
-  Three fixes were measured and rejected; it needs a joint-presence sketch or a
-  runtime bail-out, not a better decision rule. Two run-time bail-outs are now
-  built and neither works, which is why both default to off:
+- **O12 / F19 — closed, negatively (D58).** Flat estimation over-predicts on
+  uniform data by up to 84×, and F19 asked for a joint-presence sketch or a
+  runtime bail-out. Both have now been measured rather than argued about.
+
+  The sketch is aimed at the wrong error. Giving the gate exact statistics —
+  the same estimator, told the truth about the columns instead of a 16,384-row
+  sample — takes the predicted join size from a median of 7.10× the actual to
+  **1.01×**, so most of the over-prediction is sampling, and a sketch built on
+  that sample cannot prove absence anyway. Nor would it pay: exact statistics
+  at their best margin cost 9.46s against sampled statistics' 9.11s, because
+  the coefficients were fitted on top of the over-prediction and a truthful
+  join size makes the gate decline the wins too.
+
+  Two run-time bail-outs are built and neither works, which is why both default
+  to off:
 
   - `factorize_min_compression` abandons when a materialized join is not
     compressing. Measured out of sample it abandons queries DuckDB cannot

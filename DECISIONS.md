@@ -3868,3 +3868,90 @@ What would change this is a limit pushed *into* the join rather than applied
 after it, so the representation is built only as far as k tuples require. That
 is a different algorithm from the one in the paper, and nothing in the corpus
 says it would be worth writing: DuckDB is already at eleven milliseconds.
+
+## D58 — O12's sketch is aimed at an error that is mostly sampling, and fixing it does not help
+
+F19 closed on the one instrument the gate has never had: "a statistic that
+captures *joint* presence across columns (a sketch, not an MCV list)". Six
+estimator fixes have been measured and rejected since (D44a, D45, D46, D48,
+D49, D50), so the question worth answering before building a seventh is not how
+accurate an estimate could be, but what accuracy is worth.
+
+That has a ceiling, and the ceiling is computable from measurements already
+taken. `calibrate-measured.sh` records per query the input rows, the records the
+operator built, the exact result tuples, and both engines' warm times.
+Substituting measured quantities into the cost model is a gate with perfect
+statistics -- better than any sketch, which only estimates them. Scoring each
+gate as what the corpus costs under it, 116 queries:
+
+    gate                    corpus  vs stock  fires  wrong fires  wrong declines
+    never fire              19.37s     1.00x      0            0              26
+    shipped gate             9.59s     2.02x     35           10               2
+    exact statistics         9.47s     2.05x     14            1              13
+    modelled, as shipped     9.77s     1.98x     28            7               5
+    perfect join size        8.65s     2.24x     16            0              10
+    perfect records         22.96s     0.84x     35           12               4
+    oracle statistics        8.62s     2.25x     19            1               8
+    perfect knowledge        8.42s     2.30x     26            0               0
+
+**Three things fall out, and the third is the answer.**
+
+*The headroom is entirely in the join size.* Perfect records alone is 22.96s --
+worse than never firing at all -- while perfect join size alone reaches 8.65s,
+which is nearly all of what perfect knowledge of both is worth. That is D48 and
+D49 quantified: our side is charged per record and DuckDB's per tuple, so a
+better record estimate moves only the side that was already close.
+
+*And the error the sketch targets is real.* All ten of the shipped gate's wrong
+fires are over-predictions of the join size, by 16.7x to 1,076,744x, and every
+one is watdiv -- the dataset F19 named. Assuming a value present in every column
+of its class is what inflates them.
+
+*But it is mostly sampling, not that assumption.* Asked the same questions with
+`factorize_gate_exact_stats` -- the same estimator, told the truth about the
+columns instead of a 16,384-row sample -- the predicted join size goes from a
+median of 7.10x the actual to **1.01x**:
+
+    statistics   median   p90        max          over 1.5x   under
+    sampled       7.10x   1046.22x   88,500,000x     76         24
+    exact         1.01x    438.78x    1,677,000x     48         43
+
+    by dataset      sampled median   exact median
+      epinions          19.41x           0.34x
+      watdiv             5.61x           1.26x
+      hetio              4.40x           2.07x
+      yago               9.91x          12.50x
+
+F19 diagnosed the estimator against exact brute-force sizes, and the diagnosis
+was right about the estimator. On the gate as it actually runs, the dominant
+error is that its statistics come from a sample. A sketch built on that sample
+inherits it exactly: absence from 16,384 rows is not absence from the column,
+and a sketch that cannot prove absence cannot establish joint presence.
+
+**And fixing it does not improve decisions.** Sweeping the margin, which is the
+one knob that moves a gate without changing what it knows:
+
+    margin   sampled statistics        exact statistics
+    1.00      9.36s  fires 30  wf 8     9.46s  fires 17  wf 2
+    1.50      9.77s  fires 28  wf 7     9.47s  fires 14  wf 1
+    3.00      9.16s  fires 24  wf 3     9.47s  fires 14  wf 1
+    5.00      9.11s  fires 23  wf 2    10.02s  fires 11  wf 1
+
+Exact statistics at their best margin (9.46s) are worse than sampled statistics
+at theirs (9.11s). The reason is the one D48 gave: the over-prediction inflates
+DuckDB's predicted cost, and the coefficients were fitted on top of that, so
+telling the truth about the join size makes the gate decline the wins along
+with the losses -- 13 wrong declines against the shipped gate's 2.
+
+**So O12 is closed rather than carried.** The sketch it asks for would address
+an error that is mostly sampling, could not address it from a sample anyway,
+and would not pay for itself if it did. What the table does say is where the
+remaining 1.2 seconds live: a gate with perfect knowledge of the join size
+fires 16 times with *zero* wrong fires. Nothing available before execution
+produces that number, which is the same wall D34 through D56 arrived at from
+six other directions.
+
+Not changed: the margin stays at 1.5. The 9.11s at margin 5.0 is fitted on the
+same 116 queries it is scored against, which is what D38 calls overfit, and the
+modelled gate is 9.77s where the real one measures 9.59s -- a model close
+enough to rank alternatives is not close enough to tune a shipped constant on.
