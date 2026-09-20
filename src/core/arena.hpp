@@ -54,6 +54,24 @@ struct MemoryLimitExceeded : std::runtime_error {
 	}
 };
 
+//! Thrown when another bucket of the same query has already given up.
+//!
+//! Deliberately *not* a MemoryLimitExceeded, because the one thing a caller
+//! must not do with it is subdivide and try again: the query is over, and the
+//! point of the throw is to stop paying for it.
+//!
+//! The buckets of a partition are independent, which is what makes them
+//! parallel -- and it also means each one discovers on its own that the query
+//! does not fit. Measured on `watdiv_acyclic_217_05` at eight threads, that is
+//! eight slices rebuilding the same 361,282-record first step, each peaking at
+//! 800MB, before the query falls back to the stock plan anyway: 279s against
+//! 56s for the same query on one slice (D54a). Independence is worth having
+//! for the work; it is worth giving up for the verdict.
+struct SiblingGaveUp : std::runtime_error {
+	explicit SiblingGaveUp(const std::string &what) : std::runtime_error(what) {
+	}
+};
+
 //! What one slice of the engine may hold, summed across everything it builds.
 //!
 //! The per-slice limit used to be applied to each structure separately -- each
@@ -76,6 +94,13 @@ struct SliceBudget {
 	//! not a control: it is what says whether the memory a process holds is
 	//! memory this account knows about.
 	std::atomic<size_t> peak {0};
+	//! Shared by every slice of one query; set when any of them gives up.
+	//!
+	//! Not owned here, and null unless a caller running several slices points
+	//! it at something that outlives them all. `SetGlobalLimits` clears it, so
+	//! a pointer cannot survive into the next query on the same thread -- which
+	//! is the one way a thread-local like this becomes a use-after-free.
+	std::atomic<bool> *abandoned = nullptr;
 
 	//! Offers `now` as a new high-water mark.
 	void Note(size_t now) {
@@ -91,6 +116,19 @@ struct SliceBudget {
 inline SliceBudget &ThreadBudget() {
 	static thread_local SliceBudget budget;
 	return budget;
+}
+
+//! Stops this slice if a sibling has already given up on the query.
+//!
+//! Checked where the budget is, which is on chunk allocation rather than on
+//! every write: that is often enough to abandon promptly and rare enough to
+//! cost nothing measurable, and a slice doing no allocation is not the one
+//! running up the bill.
+inline void CheckAbandoned(const SliceBudget &slice) {
+	if (slice.abandoned != nullptr && slice.abandoned->load(std::memory_order_relaxed)) {
+		throw SiblingGaveUp("another bucket of this query ran out of memory first, so this one is not worth "
+		                    "finishing");
+	}
 }
 
 class Arena {
@@ -191,6 +229,7 @@ private:
 		// exists. Charged only after it does, so an allocation that fails
 		// charges nothing.
 		SliceBudget &slice = budget != nullptr ? *budget : ThreadBudget();
+		CheckAbandoned(slice);
 		if (slice.limit != 0 && slice.used.load(std::memory_order_relaxed) + bytes > slice.limit) {
 			throw MemoryLimitExceeded("the engine exceeded its per-slice memory budget");
 		}

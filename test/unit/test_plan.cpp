@@ -457,6 +457,70 @@ static void TestCountAtMostClampsToTheLimit() {
 	Expect(nothing.slices == 0, "limit: k=0 must read no bucket of the partition");
 }
 
+//! A slice stops when a sibling has already given up on the query.
+//!
+//! The buckets of a partition are independent, which is what makes them
+//! parallel and also what makes each one discover the same verdict alone:
+//! measured at eight threads, eight slices rebuilt the same first step and each
+//! peaked at 800MB before the query fell back anyway (D54a). Independence is
+//! worth having for the work and not for the verdict.
+//!
+//! Two things have to hold and the second is the one that bites. A raised flag
+//! must stop a slice promptly and as a plain failure, never as a memory problem
+//! -- subdividing in response would be the opposite of the point. And the
+//! pointer must not survive `SetGlobalLimits`, because the flag belongs to one
+//! query's slices while the thread-local outlives them, and a stale pointer
+//! there is a use-after-free rather than a wrong answer.
+static void TestSiblingAbandonStopsASlice() {
+	Group scope("a raised abandon flag stops a slice, and does not survive into the next query");
+
+	MemorySource source;
+	std::vector<int64_t> keys;
+	for (int64_t v = 0; v < 20000; v++) {
+		keys.push_back(v % 500);
+	}
+	source.Add({keys});
+	source.Add({keys});
+	source.Add({keys});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 1, 1};
+	graph.column_types = {{ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	SetGlobalLimits(0, 0, 0);
+	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(whole.ok, "abandon: the query answers with no flag set (" + whole.error + ")");
+
+	// Raised before the query starts, which is the same thing a sibling that
+	// gave up first does.
+	std::atomic<bool> flag {true};
+	SetGlobalLimits(0, 0, 0);
+	SetSharedAbandon(&flag);
+	const auto stopped = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(!stopped.ok, "abandon: a raised flag must stop the slice");
+	Expect(!stopped.out_of_memory,
+	       "abandon: stopping is a plain failure, not a memory problem -- subdividing in response would be the "
+	       "opposite of the point");
+
+	// Lowered again, same pointer: the flag is read rather than remembered.
+	flag.store(false);
+	const auto resumed = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(resumed.ok, "abandon: lowering the flag lets the next query run (" + resumed.error + ")");
+	Expect(resumed.count == whole.count, "abandon: the answer is unchanged by the flag having been raised");
+
+	// And the pointer is gone after SetGlobalLimits, which is what makes it
+	// safe for the flag to live no longer than the query that owns it.
+	SetGlobalLimits(0, 0, 0);
+	Expect(ThreadBudget().abandoned == nullptr,
+	       "abandon: SetGlobalLimits must clear the pointer, or the next query on this thread reads storage that "
+	       "no longer exists");
+	flag.store(true);
+	const auto unaffected = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(unaffected.ok, "abandon: a flag nobody is pointing at cannot stop anything (" + unaffected.error + ")");
+}
+
 //! One value carrying the whole partition is separated by a different key.
 //!
 //! This is the case the README has been calling "no spilling": a bucket too big
@@ -769,6 +833,8 @@ int main() {
 	TestCountAtMostClampsToTheLimit();
 	std::printf("\n");
 	TestRateFloorAbandonsAtTheLastJoin();
+	std::printf("\n");
+	TestSiblingAbandonStopsASlice();
 	std::printf("\n");
 	TestSkewedBucketFallsBackToAnotherKey();
 	std::printf("\n");

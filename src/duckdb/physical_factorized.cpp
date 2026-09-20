@@ -58,6 +58,10 @@ public:
 	//! the whole budget would let N threads use N times it.
 	const size_t memory_per_slice;
 	atomic<idx_t> next_slice {0};
+	//! Raised by whichever slice first runs out of subdivisions to try, and read
+	//! by the others so they stop instead of each reaching the same verdict
+	//! alone. Owned here because it has to outlive every slice pointing at it.
+	std::atomic<bool> abandoned {false};
 	//! Guards the running total. Contended once per bucket, which is nothing
 	//! beside the cost of counting one.
 	mutex lock;
@@ -573,6 +577,10 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	// having no data race.
 	factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression, abandon_after_ms,
 	                           min_rate, second_key);
+	// After SetGlobalLimits, which clears it: the buckets of this query share
+	// one verdict, so the first to give up stops the rest rather than leaving
+	// each to spend the same time reaching it (D54b).
+	factorize::SetSharedAbandon(&gstate.abandoned);
 
 	// Read the inputs once, however many threads want them. Every bucket has to
 	// look at every row to find its own, so a private scan per thread would

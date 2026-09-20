@@ -3761,3 +3761,50 @@ rather than a regression from 18.9s. A recorded number is only a baseline if the
 settings that produced it are recorded with it. The D54 number came from a
 sample stopped early on the grounds that the direction was clear, which is the
 same error D47 names: a fire count from one dataset generalised to four.
+
+## D54b — Eight buckets reaching the same verdict separately, and why stopping seven of them is not enough
+
+D54a left `factorize_parallel_fallback` off because a query that exceeds the
+memory budget exceeds it once per bucket: eight slices, eight subdivision
+ladders, and the stock plan answers in the end anyway. The buckets are
+independent, which is what makes them parallel -- and independence is worth
+having for the work and not for the verdict.
+
+**So they share one.** `SliceBudget` carries a pointer to a flag the query's
+slices hold in common; the first slice to exhaust every subdivision it is
+willing to try raises it, and the others throw `SiblingGaveUp` at the next
+chunk allocation. Deliberately not a `MemoryLimitExceeded`: the one thing a
+caller must not do with this is subdivide and try again.
+
+Checked where the budget already is, on chunk allocation rather than on every
+write -- often enough to stop promptly, rare enough to cost nothing measurable.
+`SetGlobalLimits` clears the pointer, and that is the load-bearing line: the
+flag belongs to one query's slices while the thread-local outlives them, so a
+pointer left behind is a use-after-free rather than a wrong answer. The caller
+sets it again, after, and the test pins both halves.
+
+**Measured on the query D54a was written about**, `watdiv_acyclic_217_05`:
+
+    parallel_fallback = false                       51.5s
+    parallel_fallback = true, before this           279.4s
+    parallel_fallback = true, with the shared flag  113.5s
+
+So the penalty for turning the setting on goes from 5.4x to 2.2x. That is a
+real improvement to the mechanism and it is not enough to change the default,
+which stays off.
+
+**What the remaining 2.2x is, exactly.** The flag can only be raised once some
+slice has spent the whole ladder, and until then the other seven are doing the
+duplicated work D54a measured: all eight rebuild the *same* 361,282-record
+first step, because `ChooseSliceColumns` picks the class reaching the most
+relations and nothing makes that the class reaching the relation the plan
+*starts* with. A bucket of a key that does not touch the first relation does
+not shrink it. Raising the flag on the first out-of-memory instead would cut
+that, and would also abandon every query that subdividing would have recovered,
+which is the capability the ladder exists for.
+
+The root cause is therefore the slice key rather than the abort, and fixing it
+means choosing a partition that reaches the early steps of the plan rather than
+the most relations overall -- a change to what is partitioned, not to when it is
+given up on. Recorded here rather than attempted: the measurement above says
+what it would be worth.

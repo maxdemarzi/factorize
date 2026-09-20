@@ -35,6 +35,7 @@
 #include "layout.hpp"
 #include "materialize.hpp"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -271,6 +272,18 @@ double GetGlobalMinRate();
 //! solved. So the mechanism ships and the switch stays off.
 void SetGlobalSecondKey(bool enabled);
 bool GetGlobalSecondKey();
+
+//! Points this slice at the flag its siblings share, so that when one of them
+//! gives up the rest stop rather than each discovering the same thing.
+//!
+//! The caller owns the flag and must outlive every slice pointing at it.
+//! `SetGlobalLimits` clears the pointer, so it has to be set *after* that call
+//! -- which is also what stops one query's flag being read by the next on the
+//! same thread.
+void SetSharedAbandon(std::atomic<bool> *flag);
+//! Raises the shared flag, if there is one. Called when a slice has exhausted
+//! every subdivision it is willing to try.
+void RaiseSharedAbandon();
 
 void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression,
                      double abandon_after_ms = 0, double min_rate = 0, bool second_key = false);

@@ -1045,6 +1045,10 @@ ExecuteResult ExecuteCountSliceWithinMemory(const QueryGraph &graph, const Plan 
 	if (second.ok) {
 		return second;
 	}
+	// This slice is out of ideas, and the buckets are all the same query. Every
+	// sibling is about to spend what this one just spent to reach the same
+	// verdict, so they are told instead (D54b).
+	RaiseSharedAbandon();
 	return result;
 }
 

@@ -79,6 +79,17 @@ bool GetGlobalSecondKey() {
 	return g_second_key;
 }
 
+void SetSharedAbandon(std::atomic<bool> *flag) {
+	ThreadBudget().abandoned = flag;
+}
+
+void RaiseSharedAbandon() {
+	auto *flag = ThreadBudget().abandoned;
+	if (flag != nullptr) {
+		flag->store(true, std::memory_order_relaxed);
+	}
+}
+
 double ElapsedSliceMs() {
 	const auto now = std::chrono::steady_clock::now();
 	return std::chrono::duration<double, std::milli>(now - g_slice_start).count();
@@ -98,6 +109,11 @@ void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double m
 	g_abandon_after_ms = abandon_after_ms;
 	g_min_rate = min_rate;
 	g_second_key = second_key;
+	// Cleared rather than carried: the flag belongs to one query's set of
+	// slices, and a thread outlives them. A pointer left here would be read by
+	// the next query on this thread, pointing at storage that query never owned.
+	// The caller sets it again, after this, if there is one.
+	ThreadBudget().abandoned = nullptr;
 	// The slice's clock starts here, which is where its work does.
 	g_slice_start = std::chrono::steady_clock::now();
 }

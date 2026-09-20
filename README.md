@@ -46,7 +46,7 @@ real difficulty is skew.
 | optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
-| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20). Carrying the fallback no longer *prevents* it, but `factorize_parallel_fallback` is off: 1.49x on fast queries, 5x the wrong way on one that exceeds memory (D54, D54a) |
+| parallelism | working — one thread per bucket of the join key, 3.4x at 8 threads, same answer at every thread count (DECISIONS D20). Carrying the fallback no longer *prevents* it, but `factorize_parallel_fallback` is off: 1.49x on fast queries, and 2.2x the wrong way on one that exceeds memory even after the buckets learned to stop each other (D54, D54a, D54b) |
 
 CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
 v1.5.5.
@@ -86,7 +86,7 @@ the same as a switch that does not exist, not because they are recommended.
 | `factorize_fallback` | `true` | carry the stock plan so an internal error costs time rather than the answer (§7.5) |
 | `factorize_limit` | `false` | let the gate consider `EXISTS` and `count(*)` over `LIMIT k` (D53) |
 | `factorize_second_key` | `false` | split a bucket that is one skewed key value on a different key instead of failing (D55) |
-| `factorize_parallel_fallback` | `false` | count one bucket per thread even while carrying the fallback (D54, D54a) |
+| `factorize_parallel_fallback` | `false` | count one bucket per thread even while carrying the fallback (D54, D54a, D54b) |
 | `factorize_min_compression` | `0` (off) | abandon to the stock plan when a materialized join is not compressing (D37, D51) |
 | `factorize_min_rate` | `0` (off) | abandon when the last materialized join is delivering fewer than this many tuples/ms (D56) |
 | `factorize_min_gain` | `1.5` | how much faster the gate must predict this engine to be before firing |
@@ -142,6 +142,12 @@ SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
   it does not: on `watdiv_acyclic_217_05` eight slices each rebuild the same
   361,282-record first step, each peak at 800MB, and the query exceeds its
   budget and falls back anyway — 279s against 56s serial (D54a).
+
+  The slices now share one verdict, so the first to give up stops the rest
+  rather than leaving each to reach it alone, which takes that query to 113s
+  (D54b). Still 2.2× the serial time, because the duplicated first step happens
+  before anyone has given up — the remaining cost is in *what* is partitioned,
+  not in when it is abandoned.
 
   `factorize_mode='off'` remains the blunt recovery. `FATAL` and `INTERRUPT` are
   never recovered from: the first leaves nothing to fall back to, and the second

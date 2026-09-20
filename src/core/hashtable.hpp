@@ -203,6 +203,7 @@ private:
 	//! this table's own limit and still take the slice past its budget.
 	void CheckSlice(size_t growing) const {
 		const SliceBudget &slice = budget != nullptr ? *budget : ThreadBudget();
+		CheckAbandoned(slice);
 		if (slice.limit != 0 && slice.used.load(std::memory_order_relaxed) + growing > slice.limit) {
 			throw MemoryLimitExceeded("the engine exceeded its per-slice memory budget");
 		}
