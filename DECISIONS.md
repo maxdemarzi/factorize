@@ -4004,3 +4004,72 @@ undivided -- one full copy per bucket -- and about one copy under the new one.
 The sum is checked rather than one bucket, because a bad key also leaves most
 buckets empty and an empty bucket would pass an assertion about bucket 0 for
 the wrong reason.
+
+## D54d — The parallel fallback goes on, and this time the measurement covers the queries it is for
+
+D54a turned `factorize_parallel_fallback` off on one counter-example and a
+sample that stopped before reaching the queries like it. D54b and D54c fixed
+the two things that counter-example was made of -- buckets each discovering the
+same verdict, and a slice key that partitioned nothing the plan built early --
+so the setting is measured again, over both regimes this time.
+
+**The runnable corpus, comparing the setting rather than the thread count:**
+
+    queries timed                 118 of 119   (watdiv_acyclic_205_02 capped)
+    buckets faster                       103
+    buckets slower                        15
+    total, serial                    428.42s
+    total, buckets                   142.69s      3.00x
+    of the 28 queries over 1s        414.80s -> 134.98s      3.07x
+
+    epinions  n=30     1.25s ->   0.41s   3.05x
+    hetio     n=2      0.18s ->   0.08s   2.28x
+    watdiv    n=39   234.33s ->  77.17s   3.04x
+    yago      n=47   192.66s ->  65.03s   2.96x
+
+Every dataset separately, which is the property F18 says to check before
+believing any corpus-wide ratio. The fifteen losses are all small -- the largest
+absolute one is `yago_acyclic_Chain_6_26` at +1.0s and every other is under
+0.1s.
+
+**And the queries whose outcome is known**, which is the set D54a's objection
+was actually about, since they include the memory-heavy ones where each bucket
+was exceeding the budget separately:
+
+    query                        serial    buckets
+    hetio_acyclic_203_09          0.030      0.013
+    hetio_acyclic_205_03        141.072     51.215
+    hetio_acyclic_205_09        172.874     51.243
+    hetio_acyclic_205_11          0.416      0.092
+    hetio_acyclic_205_15         87.444     22.893
+    hetio_acyclic_210_05        101.768     30.653
+    hetio_acyclic_216_01          0.977      0.190
+    hetio_acyclic_222_07          1.328      0.376
+    hetio_acyclic_225_02          4.332      0.670
+    watdiv_acyclic_210_06         0.400      0.090
+    hetio_acyclic_204_01          9.110      2.247
+    hetio_acyclic_204_08         11.331      3.043
+    watdiv_acyclic_205_19       259.894    106.500
+    watdiv_acyclic_217_10       253.958     90.247
+    watdiv_acyclic_217_15        62.587     33.398
+    yago_acyclic_Chain_12_06     10.083      2.550
+    yago_acyclic_Chain_12_63      0.451      0.357
+    yago_acyclic_Chain_9_71        >300       >300
+
+Eighteen for eighteen, none slower, and the one tie is a query that already
+capped at 300s before any of this work. The hetio queries in that table are the
+ones no stock plan answers at all, and they are where it pays most: 141s to
+51s, 173s to 51s, 87s to 23s, 102s to 31s.
+
+So the default flips to true, and D20's design -- one thread per bucket of the
+join key, with the answer independent of how many threads ran -- is finally what
+the extension does by default rather than what it does when the fallback is
+switched off.
+
+**What the three attempts say about method.** D54 shipped it on a synthetic
+star. D54a took it off on one real query and a sample stopped early. Neither
+measurement was wrong about what it measured; both were wrong about what they
+covered. The rule that would have caught both is the one F18 already states for
+the gate and which this now follows: a corpus-wide ratio means nothing until it
+holds per dataset, and a setting that changes what happens under memory
+pressure has to be measured on the queries that reach it.
