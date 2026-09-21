@@ -457,6 +457,97 @@ static void TestCountAtMostClampsToTheLimit() {
 	Expect(nothing.slices == 0, "limit: k=0 must read no bucket of the partition");
 }
 
+//! The slice key has to partition what the plan builds first.
+//!
+//! Choosing the class that reaches the most relations is the obvious rule and
+//! was the only one. What it misses is *which* relations: a bucket of a key that
+//! does not touch either side of the first join leaves that join's whole output
+//! standing in every bucket. Measured at eight threads on
+//! `watdiv_acyclic_217_05`, that was eight slices each holding an identical
+//! 361,282-record step and each peaking at 800MB (D54a).
+//!
+//! The fixture makes the two rules disagree. `BuildPlan` seeds from
+//! `predicates[0].left_relation`, so the base is r0 by construction; the widest
+//! class reaches r2, r3 and r4 and touches neither r0 nor r1, while the class
+//! that covers the base reaches only two relations. Width alone picks the wide
+//! one and the first join is then identical in every bucket.
+//!
+//! Asserted as a sum over the buckets rather than on one of them, because a
+//! bad key also leaves most buckets empty -- and an empty bucket would let an
+//! assertion about bucket 0 pass for the wrong reason.
+static void TestSliceKeyPartitionsTheFirstJoin() {
+	Group scope("the slice key partitions the first join, not merely the most relations");
+
+	MemorySource source;
+	std::vector<int64_t> r0, r1a, r1c, r2b, r2c, r3, r4;
+	for (int64_t v = 0; v < 800; v++) {
+		r0.push_back(v);         // r0.c0: 800 distinct, class A with r1.c0
+		r1a.push_back(v);        // r1.c0
+		r1c.push_back(v % 4);    // r1.c1: class C with r2.c1
+	}
+	for (int64_t v = 0; v < 100; v++) {
+		r2b.push_back(v % 5);    // r2.c0: class B, only five values
+		r2c.push_back(v % 4);    // r2.c1
+		r3.push_back(v % 5);
+		r4.push_back(v % 5);
+	}
+	source.Add({r0});
+	source.Add({r1a, r1c});
+	source.Add({r2b, r2c});
+	source.Add({r3});
+	source.Add({r4});
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2, 1, 1};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64},
+	                      {ValueType::INT64}};
+	// predicates[0] fixes the base at r0 and forms the narrow class that covers
+	// it. The wide class is r2-r3-r4, reaching three relations and neither of
+	// the first two joined.
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {2, 0, 3, 0}, Predicate {3, 0, 4, 0},
+	                    Predicate {1, 1, 2, 1}};
+
+	const auto plan = BuildPlan(graph);
+	Expect(plan.complete, "slice key: the fixture must be plannable (" + plan.reason + ")");
+	Expect(!plan.steps.empty() && plan.steps[0].relation == 0,
+	       "slice key: the fixture is built around the base being r0");
+
+	SetGlobalLimits(0, 0, 0);
+	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
+	Expect(whole.ok && !whole.steps.empty(), "slice key: the undivided run must record its steps (" + whole.error + ")");
+	if (!whole.ok || whole.steps.empty()) {
+		return;
+	}
+	const size_t undivided_first = whole.steps[0].records;
+
+	// Every bucket, so that an empty one cannot be mistaken for a small one.
+	const size_t slices = 8;
+	size_t summed_first = 0;
+	int64_t summed_count = 0;
+	for (size_t slice = 0; slice < slices; slice++) {
+		const auto part = ExecuteCountSlice(graph, plan, source, JoinMode::BOTTOM_INSERT, slice, slices);
+		Expect(part.ok, "slice key: bucket " + std::to_string(slice) + " runs (" + part.error + ")");
+		if (!part.ok) {
+			return;
+		}
+		summed_count = CheckedCardinalityAdd(summed_count, part.count);
+		if (!part.steps.empty()) {
+			summed_first += part.steps[0].records;
+		}
+	}
+	Expect(summed_count == whole.count, "slice key: the buckets must still sum to the undivided count -- got " +
+	                                        std::to_string(summed_count) + ", want " + std::to_string(whole.count));
+	// A key that partitions the first join spreads those records across the
+	// buckets, so the sum is about one copy of them. A key that does not leaves
+	// a full copy in every non-empty bucket, which on this fixture is five.
+	Expect(summed_first <= 2 * undivided_first,
+	       "slice key: the buckets together must hold about one copy of the first join, not one each -- summed " +
+	           std::to_string(summed_first) + " against " + std::to_string(undivided_first) + " undivided");
+}
+
 //! A slice stops when a sibling has already given up on the query.
 //!
 //! The buckets of a partition are independent, which is what makes them
@@ -833,6 +924,8 @@ int main() {
 	TestCountAtMostClampsToTheLimit();
 	std::printf("\n");
 	TestRateFloorAbandonsAtTheLastJoin();
+	std::printf("\n");
+	TestSliceKeyPartitionsTheFirstJoin();
 	std::printf("\n");
 	TestSiblingAbandonStopsASlice();
 	std::printf("\n");

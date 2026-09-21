@@ -3955,3 +3955,52 @@ Not changed: the margin stays at 1.5. The 9.11s at margin 5.0 is fitted on the
 same 116 queries it is scored against, which is what D38 calls overfit, and the
 modelled gate is 9.77s where the real one measures 9.59s -- a model close
 enough to rank alternatives is not close enough to tune a shipped constant on.
+
+## D54c — The slice key was chosen for width, and width is not what a bucket has to shrink
+
+D54b left the parallel fallback off with its remaining cost named rather than
+fixed: all eight slices rebuild the same 361,282-record first step, because
+`ChooseSliceColumns` picks the equivalence class reaching the most relations and
+nothing makes that the class reaching the relation the plan *starts* from. A
+bucket of a key that does not touch either side of the first join leaves that
+join's whole output standing in every bucket.
+
+So the base relation comes first now and reach breaks the tie. Three lines of
+comparison, and none of them is about accuracy: slicing on *any* single class is
+sound -- the closure argument is about a class, not a particular one -- so this
+moves time and never the answer, which is what makes it safe to decide on a
+measurement.
+
+**Measured on the two queries that were the case against the setting**, forced,
+one binary, same session:
+
+    query                      buckets    serial
+    watdiv_acyclic_217_05       34.9s     61.2s     1.75x
+    watdiv_acyclic_218_15       39.5s    109.5s     2.77x
+
+`watdiv_acyclic_217_05` is the query D54a was written about. Its history:
+
+    D54, width-only key, no shared verdict     279.4s
+    D54b, buckets stop each other              113.5s
+    D54c, key covers the base                   34.9s
+    serial, for comparison                      61.2s
+
+The counter-example is now the evidence for. What was 5.4x the wrong way is
+1.75x the right way, and the thing that changed is not the abandon, the memory
+budget or the thread count -- it is which column the input was bucketed on.
+
+**One coupling had to be broken to do it.** `CountBySecondKey` took the widest
+class as the bucket it was refining, which was the same thing as the caller's
+bucket only because `ChooseSliceColumns` also preferred width. Preferring
+anything else would have silently re-bucketed the input under one key while
+keeping a bucket number computed for another -- a wrong answer, not a slow one.
+It asks for the primary key now instead of inferring it.
+
+Tested, and the test fails against the previous commit rather than being
+asserted to work: a five-relation fixture whose widest class reaches r2, r3 and
+r4 while the base is r0, so width and coverage disagree. Summed over eight
+buckets, the first join holds 12,800 records under the old rule against 1,600
+undivided -- one full copy per bucket -- and about one copy under the new one.
+The sum is checked rather than one bucket, because a bad key also leaves most
+buckets empty and an empty bucket would pass an assertion about bucket 0 for
+the wrong reason.

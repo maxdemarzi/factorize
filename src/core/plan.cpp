@@ -725,11 +725,27 @@ private:
 	std::vector<std::vector<int64_t>> held;
 };
 
-//! Picks the equivalence class to slice on: the one reaching the most
-//! relations, since filtering those is what makes a pass small. Returns the
-//! per-relation column to bucket on, or an empty vector if no class reaches
-//! more than one relation, in which case slicing cannot help.
-std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
+//! Picks the equivalence class to slice on. Returns the per-relation column to
+//! bucket on, or an empty vector if no class reaches more than one relation, in
+//! which case slicing cannot help.
+//!
+//! Reaching the most relations is the obvious criterion and was the only one,
+//! because filtering more relations makes a pass smaller. What it misses is
+//! *which* relations, and the plan says which ones matter: a bucket of a key
+//! that does not touch the relation the join order starts from does not shrink
+//! it, so every slice builds the same first structure whole. Measured at eight
+//! threads on `watdiv_acyclic_217_05`, that was eight slices each holding an
+//! identical 361,282-record step and each peaking at 800MB (D54a).
+//!
+//! So the base relation comes first and reach breaks the tie. `plan` is
+//! optional only because a caller without one still gets the old behaviour;
+//! every caller in this file has one.
+//!
+//! Correctness does not depend on the choice. Slicing on *any* single class is
+//! sound -- the closure argument below is about a class, not about a particular
+//! one -- so this moves time and never the answer, which is what makes it safe
+//! to decide on a measurement.
+std::vector<int> ChooseSliceColumns(const QueryGraph &graph, const Plan *plan) {
 	// The full closure is right here, and only here. Slicing partitions the
 	// INPUT by hashing a column of each relation, and every relation whose
 	// column is transitively equated must land in the same bucket or tuples that
@@ -752,13 +768,35 @@ std::vector<int> ChooseSliceColumns(const QueryGraph &graph) {
 			}
 		}
 	}
+	// Whether a class touches the relation the plan starts from. Everything the
+	// first join builds is made of that relation and one other, so a class that
+	// misses it leaves the first structure at full size in every bucket.
+	const bool have_base = plan != nullptr && !plan->steps.empty();
+	const size_t base = have_base ? plan->steps[0].relation : 0;
+	auto covers_base = [&](size_t root) {
+		return have_base && base < by_class[root].size() && by_class[root][base] >= 0;
+	};
+
 	size_t best = 0;
-	size_t best_reach = 1;
+	size_t best_reach = 0;
+	bool best_covers = false;
 	bool found = false;
 	for (const auto &entry : reach) {
-		if (entry.second > best_reach) {
+		if (entry.second <= 1) {
+			// A class reaching one relation buckets that relation and leaves
+			// every other one whole, so it cannot shrink the join.
+			continue;
+		}
+		const bool covers = covers_base(entry.first);
+		// Covering the base wins outright; reach only breaks the tie. A class
+		// reaching six relations but not the first one still hands every bucket
+		// the whole of the first structure to build.
+		const bool better = !found || (covers && !best_covers) ||
+		                    (covers == best_covers && entry.second > best_reach);
+		if (better) {
 			best = entry.first;
 			best_reach = entry.second;
+			best_covers = covers;
 			found = true;
 		}
 	}
@@ -896,7 +934,7 @@ ExecuteResult ExecuteCountSlice(const QueryGraph &graph, const Plan &plan, Relat
 	if (slices <= 1) {
 		return ExecuteCount(graph, plan, source, mode, strategy);
 	}
-	auto key_column = ChooseSliceColumns(graph);
+	auto key_column = ChooseSliceColumns(graph, &plan);
 	if (key_column.empty()) {
 		ExecuteResult result;
 		result.error = "no join key reaches more than one relation, so slicing cannot shrink anything";
@@ -929,8 +967,27 @@ static ExecuteResult CountBySecondKey(const QueryGraph &graph, const Plan &plan,
 		failed.error = "this bucket does not fit and splitting it on another key is off";
 		return failed;
 	}
+	// The outer bucket has to be the *caller's* bucket, which means the key the
+	// caller's `slice` and `slices` were computed against. Taking the widest
+	// class instead happened to be the same thing while ChooseSliceColumns
+	// preferred width, and would have silently stopped being the same thing the
+	// moment it preferred anything else -- re-bucketing the input under a
+	// different key while keeping the old bucket number is a wrong answer, not
+	// a slow one. So it is asked for rather than inferred.
+	const auto primary = ChooseSliceColumns(graph, &plan);
+	if (primary.empty()) {
+		failed.error = "no join key reaches more than one relation, so slicing cannot shrink anything";
+		return failed;
+	}
 	auto ranked = RankSliceColumns(graph);
-	if (ranked.size() < 2) {
+	// Every class except the one already being bucketed on.
+	std::vector<std::vector<int>> others;
+	for (auto &candidate : ranked) {
+		if (candidate != primary) {
+			others.push_back(candidate);
+		}
+	}
+	if (others.empty()) {
 		failed.error = "only one join key reaches more than one relation, so there is no other key to partition on";
 		return failed;
 	}
@@ -947,9 +1004,9 @@ static ExecuteResult CountBySecondKey(const QueryGraph &graph, const Plan &plan,
 	// (the regression fixture recovers at 8).
 	static const size_t kOtherKeys = 1;
 	static const size_t kMaxParts = 64;
-	const size_t limit_rank = ranked.size() < 1 + kOtherKeys ? ranked.size() : 1 + kOtherKeys;
-	for (size_t rank = 1; rank < limit_rank; rank++) {
-		SlicedSource bucket(source, ranked[0], slice, slices);
+	const size_t tries = others.size() < kOtherKeys ? others.size() : kOtherKeys;
+	for (size_t rank = 0; rank < tries; rank++) {
+		SlicedSource bucket(source, primary, slice, slices);
 		for (size_t parts = 8; parts <= kMaxParts; parts *= 8) {
 			int64_t total = 0;
 			size_t records = 0;
@@ -957,7 +1014,7 @@ static ExecuteResult CountBySecondKey(const QueryGraph &graph, const Plan &plan,
 			std::vector<StepStats> steps;
 			bool fits = true;
 			for (size_t part = 0; part < parts && fits; part++) {
-				SlicedSource inner(bucket, ranked[rank], part, parts);
+				SlicedSource inner(bucket, others[rank], part, parts);
 				auto piece = ExecuteCount(graph, plan, inner, mode, strategy);
 				if (!piece.ok) {
 					if (!piece.out_of_memory) {
@@ -1262,7 +1319,7 @@ MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const 
 	if (result.ok || !result.out_of_memory) {
 		return result;
 	}
-	auto key_column = ChooseSliceColumns(graph);
+	auto key_column = ChooseSliceColumns(graph, &plan);
 	if (key_column.empty()) {
 		return result;
 	}
@@ -1708,7 +1765,7 @@ ExecuteResult ExecuteCountAtMost(const QueryGraph &graph, const Plan &plan, Rela
 	// answer depends on which one supplies the tuples: their counts are added,
 	// and the total is what the limit clamps.
 	static const size_t kProbeSlices = 16;
-	auto key_column = ChooseSliceColumns(graph);
+	auto key_column = ChooseSliceColumns(graph, &plan);
 	const size_t slices = key_column.empty() ? 1 : kProbeSlices;
 
 	// Sixteen, and not the much finer partition that looks obviously better.
