@@ -259,8 +259,13 @@ at a 180-second cap. [DECISIONS](DECISIONS.md) D15 repoints the project there.
 Also worth knowing before trusting any number here:
 
 - **O11** — the cost model's coefficients are fitted on one machine and do not
-  transfer. `FitEngineCost` and the harness's `--calibrate` mode are the
-  supported way to replace them.
+  transfer. `scripts/calibrate-synthetic.py` re-fits them against shapes it
+  generates itself, and it has now been run rather than only offered (D59): its
+  fit decides *better* on the runnable corpus (9.11s against 9.77s modelled,
+  2 wrong fires against 7) and *worse* on the queries whose outcome is known
+  (9 of 18 against 12), because charging our side 4.2× more per record declines
+  nine of ten queries no stock plan answers at all. The tool is usable; its fit
+  is not a drop-in, which is what its own docstring says.
 - **O12 / F19 — closed, negatively (D58).** Flat estimation over-predicts on
   uniform data by up to 84×, and F19 asked for a joint-presence sketch or a
   runtime bail-out. Both have now been measured rather than argued about.

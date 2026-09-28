@@ -4073,3 +4073,65 @@ covered. The rule that would have caught both is the one F18 already states for
 the gate and which this now follows: a corpus-wide ratio means nothing until it
 holds per dataset, and a setting that changes what happens under memory
 pressure has to be measured on the queries that reach it.
+
+## D59 — O11's calibration tool works, and its fit is not an improvement
+
+O11 has stood since D14: the cost model's coefficients are fitted on one machine
+and do not transfer. `scripts/calibrate-synthetic.py` was written to answer it --
+a grid of stars, chains and unique-key joins it generates itself, so a fresh
+checkout can re-fit without the 5.3GB corpus. What had never been done is
+running it and asking whether the fit it produces is one to ship.
+
+**It runs, and the fit is plausible.** On this machine:
+
+    ours    {0.979593, 2.716e-05, 0.0001666 }   held out: median 1.18x, 0.88..1.88
+    duckdb  {0.555054, 1.288e-05, 4.186e-06 }   held out: median 0.85x, 0.49..1.82
+    shipped ours   {0.108542, 2.445e-05, 3.961e-05}
+    shipped duckdb {0,        2.324e-05, 3.981e-06}
+
+The two per-output coefficients -- the ones that carry the decision -- land
+close on DuckDB's side (4.186e-6 against 3.981e-6, 1.05x) and 4.2x high on ours.
+
+**On the runnable corpus it decides better**, scored by substituting each
+coefficient set into the gate's rule against the same sampled predictions and
+the same measured times (116 queries, margin 1.5):
+
+    coefficients   corpus   fires   wrong fires   wrong declines
+    shipped         9.77s      28             7                5
+    synthetic       9.11s      23             2                5
+
+and the synthetic fit is nearly insensitive to the margin -- 9.11s to 9.12s
+across 1.0, 1.5, 2.0 and 3.0 -- where the shipped one swings 9.16s to 9.77s.
+That is a fair comparison in the way margin tuning is not: the fit never saw
+this corpus.
+
+**And on the queries whose outcome is known it is worse.** The eighteen from
+D54d, scored the same way:
+
+    shipped     agrees with the known outcome on 12 of 18
+    synthetic   agrees with the known outcome on  9 of 18
+
+The synthetic fit declines nine of the ten SHOULD-FIREs, against the shipped
+model's six. Charging our side 4.2x more per record makes the gate conservative,
+which removes wrong fires on a corpus whose losses are fractions of a second and
+removes the wins on the queries where no stock plan finishes at all.
+
+So the coefficients are not swapped. What this closes is the question of whether
+O11's tool is *usable*: it is, and its own docstring already says how -- "a way
+to find a coefficient that is wrong by an order of magnitude; not a substitute
+for calibrating against the corpus a user's queries resemble... a floor on the
+error, never a ceiling". That caveat now has a measurement behind it rather than
+a warning label.
+
+**Two limits on the above, both worth stating.** The scoring model omits the
+gate's second opinion -- it asks the catalog whenever the sample says no, and
+fires if either agrees -- which is why it reproduces 28 fires where the real
+gate makes 35. And uniform generated data is the case F18 records our flat
+estimate as weakest on, so a fit from it is calibrated against the friendly
+half of the problem.
+
+O11 therefore stays open, but it is no longer open in the same way: the tool
+exists, works, and produces a fit that is measurably more conservative than the
+shipped one. A user whose workload looks like the runnable corpus would be
+better off with it; a user whose workload is the reason this engine exists would
+not.

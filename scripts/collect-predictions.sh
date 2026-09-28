@@ -14,6 +14,7 @@
 cd "$(dirname "$0")/.."
 D=${BIN:-build/release/duckdb}; DB=${DB:-/tmp/factorize-duckdb/ce.db}; Q="'"
 OUT=${OUT:-tmp/predicted.csv}
+LIST=${LIST:-tmp/ce_runnable_sql.psv}
 echo "query,pred_records,pred_flat" > "$OUT"
 while IFS='|' read -r name expected q; do
   [ -n "$name" ] || continue
@@ -28,5 +29,5 @@ while IFS='|' read -r name expected q; do
   flat=$(echo "$line" | grep -o 'flat [0-9.e+-]*' | awk '{print $2}')
   echo "${name},${recs:-},${flat:-}" >> "$OUT"
   printf '%-28s predicted recs %-12s flat %s\n' "$name" "${recs:-?}" "${flat:-?}"
-done < tmp/ce_runnable_sql.psv
+done < "$LIST"
 echo "=== $(($(wc -l < "$OUT") - 1)) queries written to $OUT"
