@@ -3554,6 +3554,222 @@ and 8 threads, every aggregate shape and EXISTS. The failure it guards against
 is a hang rather than a wrong answer, so there is nothing to assert on beyond
 the queries coming back.
 
+### D54a — The parallelism D54 restored is off, and D55 was blamed for its regression
+
+D54 made the operator a parallel source whether or not it carried the fallback,
+measured 1.49x over 42 corpus queries, and shipped it on. Two corrections.
+
+**The 1.49x was measured on the wrong half of the corpus.** The run was stopped
+at `watdiv_204_14` "once the direction was unambiguous", and the queries it had
+not reached are the slow ones -- which is where the direction reverses.
+`watdiv_acyclic_217_05`, A/B'd on one binary with only `ParallelSource()`
+changed:
+
+    ParallelSource() == children.empty()   (pre-D54)      56.4s
+    ParallelSource() == true               (D54)         279.4s
+
+**Why, exactly.** `factorize_explain` at eight threads:
+
+    slice 0 (peak 796.8MB): [1: 361282 recs ... 154ms] ...
+    slice 1 (peak 800.8MB): [1: 361282 recs ... 83604ms] ...
+    slice 5 (peak 800.8MB): [1: 361282 recs ... 90372ms] ...
+    ...
+    slice 4 (peak 796.8MB): [1: 361282 recs ... 251926ms] ...
+    fell back to the stock plan: the engine exceeded its per-slice memory budget
+
+Every slice rebuilds the *same* 361,282-record first step, because the slice key
+does not reach that relation and filtering removes none of it. Eight slices each
+peak at 800MB, and the query exceeds its budget and falls back to the stock plan
+anyway. Dividing the work helps when it fits and multiplies it when it does not,
+and the >1e9-tuple regime this engine exists for (D15) is the one where it does
+not. So `factorize_parallel_fallback` defaults to false, which is exactly the
+behaviour before D54, and the lock fix stays because it is what makes the
+setting safe to turn on at all.
+
+**And D55 was blamed for this.** It recorded `watdiv_acyclic_217_05` at 269s and
+`yago_acyclic_Chain_9_71` at 280s as the cost of splitting a skewed bucket on a
+second key. Re-run with `factorize_second_key` off, both are unchanged -- so the
+second key never caused either. 217_05 is D54's, above; Chain_9_71 was already
+timing out at 300s before any of this work, so it is not a regression at all.
+D55's own claim -- that the mechanism converts a query that cannot be answered
+at any memory limit into one that can -- still stands on its fixture, and the
+corpus cost it cites does not. It stays off, now for want of evidence either way
+rather than for evidence against.
+
+**What went wrong in the method, twice.** The D55 numbers came from comparing
+against a table measured with `factorize_min_compression=5` while running at
+default settings, so the baselines were not baselines: `watdiv_210_06`'s "12.4s
+to 0.327s, 38x" was 0.5s to 0.327s, and `218_15` was an improvement from 138.6s
+rather than a regression from 18.9s. A recorded number is only a baseline if the
+settings that produced it are recorded with it. The D54 number came from a
+sample stopped early on the grounds that the direction was clear, which is the
+same error D47 names: a fire count from one dataset generalised to four.
+
+### D54b — Eight buckets reaching the same verdict separately, and why stopping seven of them is not enough
+
+D54a left `factorize_parallel_fallback` off because a query that exceeds the
+memory budget exceeds it once per bucket: eight slices, eight subdivision
+ladders, and the stock plan answers in the end anyway. The buckets are
+independent, which is what makes them parallel -- and independence is worth
+having for the work and not for the verdict.
+
+**So they share one.** `SliceBudget` carries a pointer to a flag the query's
+slices hold in common; the first slice to exhaust every subdivision it is
+willing to try raises it, and the others throw `SiblingGaveUp` at the next
+chunk allocation. Deliberately not a `MemoryLimitExceeded`: the one thing a
+caller must not do with this is subdivide and try again.
+
+Checked where the budget already is, on chunk allocation rather than on every
+write -- often enough to stop promptly, rare enough to cost nothing measurable.
+`SetGlobalLimits` clears the pointer, and that is the load-bearing line: the
+flag belongs to one query's slices while the thread-local outlives them, so a
+pointer left behind is a use-after-free rather than a wrong answer. The caller
+sets it again, after, and the test pins both halves.
+
+**Measured on the query D54a was written about**, `watdiv_acyclic_217_05`:
+
+    parallel_fallback = false                       51.5s
+    parallel_fallback = true, before this           279.4s
+    parallel_fallback = true, with the shared flag  113.5s
+
+So the penalty for turning the setting on goes from 5.4x to 2.2x. That is a
+real improvement to the mechanism and it is not enough to change the default,
+which stays off.
+
+**What the remaining 2.2x is, exactly.** The flag can only be raised once some
+slice has spent the whole ladder, and until then the other seven are doing the
+duplicated work D54a measured: all eight rebuild the *same* 361,282-record
+first step, because `ChooseSliceColumns` picks the class reaching the most
+relations and nothing makes that the class reaching the relation the plan
+*starts* with. A bucket of a key that does not touch the first relation does
+not shrink it. Raising the flag on the first out-of-memory instead would cut
+that, and would also abandon every query that subdividing would have recovered,
+which is the capability the ladder exists for.
+
+The root cause is therefore the slice key rather than the abort, and fixing it
+means choosing a partition that reaches the early steps of the plan rather than
+the most relations overall -- a change to what is partitioned, not to when it is
+given up on. Recorded here rather than attempted: the measurement above says
+what it would be worth.
+
+### D54c — The slice key was chosen for width, and width is not what a bucket has to shrink
+
+D54b left the parallel fallback off with its remaining cost named rather than
+fixed: all eight slices rebuild the same 361,282-record first step, because
+`ChooseSliceColumns` picks the equivalence class reaching the most relations and
+nothing makes that the class reaching the relation the plan *starts* from. A
+bucket of a key that does not touch either side of the first join leaves that
+join's whole output standing in every bucket.
+
+So the base relation comes first now and reach breaks the tie. Three lines of
+comparison, and none of them is about accuracy: slicing on *any* single class is
+sound -- the closure argument is about a class, not a particular one -- so this
+moves time and never the answer, which is what makes it safe to decide on a
+measurement.
+
+**Measured on the two queries that were the case against the setting**, forced,
+one binary, same session:
+
+    query                      buckets    serial
+    watdiv_acyclic_217_05       34.9s     61.2s     1.75x
+    watdiv_acyclic_218_15       39.5s    109.5s     2.77x
+
+`watdiv_acyclic_217_05` is the query D54a was written about. Its history:
+
+    D54, width-only key, no shared verdict     279.4s
+    D54b, buckets stop each other              113.5s
+    D54c, key covers the base                   34.9s
+    serial, for comparison                      61.2s
+
+The counter-example is now the evidence for. What was 5.4x the wrong way is
+1.75x the right way, and the thing that changed is not the abandon, the memory
+budget or the thread count -- it is which column the input was bucketed on.
+
+**One coupling had to be broken to do it.** `CountBySecondKey` took the widest
+class as the bucket it was refining, which was the same thing as the caller's
+bucket only because `ChooseSliceColumns` also preferred width. Preferring
+anything else would have silently re-bucketed the input under one key while
+keeping a bucket number computed for another -- a wrong answer, not a slow one.
+It asks for the primary key now instead of inferring it.
+
+Tested, and the test fails against the previous commit rather than being
+asserted to work: a five-relation fixture whose widest class reaches r2, r3 and
+r4 while the base is r0, so width and coverage disagree. Summed over eight
+buckets, the first join holds 12,800 records under the old rule against 1,600
+undivided -- one full copy per bucket -- and about one copy under the new one.
+The sum is checked rather than one bucket, because a bad key also leaves most
+buckets empty and an empty bucket would pass an assertion about bucket 0 for
+the wrong reason.
+
+### D54d — The parallel fallback goes on, and this time the measurement covers the queries it is for
+
+D54a turned `factorize_parallel_fallback` off on one counter-example and a
+sample that stopped before reaching the queries like it. D54b and D54c fixed
+the two things that counter-example was made of -- buckets each discovering the
+same verdict, and a slice key that partitioned nothing the plan built early --
+so the setting is measured again, over both regimes this time.
+
+**The runnable corpus, comparing the setting rather than the thread count:**
+
+    queries timed                 118 of 119   (watdiv_acyclic_205_02 capped)
+    buckets faster                       103
+    buckets slower                        15
+    total, serial                    428.42s
+    total, buckets                   142.69s      3.00x
+    of the 28 queries over 1s        414.80s -> 134.98s      3.07x
+
+    epinions  n=30     1.25s ->   0.41s   3.05x
+    hetio     n=2      0.18s ->   0.08s   2.28x
+    watdiv    n=39   234.33s ->  77.17s   3.04x
+    yago      n=47   192.66s ->  65.03s   2.96x
+
+Every dataset separately, which is the property F18 says to check before
+believing any corpus-wide ratio. The fifteen losses are all small -- the largest
+absolute one is `yago_acyclic_Chain_6_26` at +1.0s and every other is under
+0.1s.
+
+**And the queries whose outcome is known**, which is the set D54a's objection
+was actually about, since they include the memory-heavy ones where each bucket
+was exceeding the budget separately:
+
+    query                        serial    buckets
+    hetio_acyclic_203_09          0.030      0.013
+    hetio_acyclic_205_03        141.072     51.215
+    hetio_acyclic_205_09        172.874     51.243
+    hetio_acyclic_205_11          0.416      0.092
+    hetio_acyclic_205_15         87.444     22.893
+    hetio_acyclic_210_05        101.768     30.653
+    hetio_acyclic_216_01          0.977      0.190
+    hetio_acyclic_222_07          1.328      0.376
+    hetio_acyclic_225_02          4.332      0.670
+    watdiv_acyclic_210_06         0.400      0.090
+    hetio_acyclic_204_01          9.110      2.247
+    hetio_acyclic_204_08         11.331      3.043
+    watdiv_acyclic_205_19       259.894    106.500
+    watdiv_acyclic_217_10       253.958     90.247
+    watdiv_acyclic_217_15        62.587     33.398
+    yago_acyclic_Chain_12_06     10.083      2.550
+    yago_acyclic_Chain_12_63      0.451      0.357
+    yago_acyclic_Chain_9_71        >300       >300
+
+Eighteen for eighteen, none slower, and the one tie is a query that already
+capped at 300s before any of this work. The hetio queries in that table are the
+ones no stock plan answers at all, and they are where it pays most: 141s to
+51s, 173s to 51s, 87s to 23s, 102s to 31s.
+
+So the default flips to true, and D20's design -- one thread per bucket of the
+join key, with the answer independent of how many threads ran -- is finally what
+the extension does by default rather than what it does when the fallback is
+switched off.
+
+**What the three attempts say about method.** D54 shipped it on a synthetic
+star. D54a took it off on one real query and a sample stopped early. Neither
+measurement was wrong about what it measured; both were wrong about what they
+covered. The rule that would have caught both is the one F18 already states for
+the gate and which this now follows: a corpus-wide ratio means nothing until it
+holds per dataset, and a setting that changes what happens under memory
+pressure has to be measured on the queries that reach it.
+
 ## D55 — "No spilling" was one key, not no key
 
 **Corrected by D54a: the two corpus slowdowns below were not caused by this
@@ -3711,104 +3927,6 @@ the bottom abandons nothing. Abandoning was checked end to end against a real
 query: `hetio_acyclic_205_11` under an impossible floor falls back and returns
 1813418909, which is the answer.
 
-## D54a — The parallelism D54 restored is off, and D55 was blamed for its regression
-
-D54 made the operator a parallel source whether or not it carried the fallback,
-measured 1.49x over 42 corpus queries, and shipped it on. Two corrections.
-
-**The 1.49x was measured on the wrong half of the corpus.** The run was stopped
-at `watdiv_204_14` "once the direction was unambiguous", and the queries it had
-not reached are the slow ones -- which is where the direction reverses.
-`watdiv_acyclic_217_05`, A/B'd on one binary with only `ParallelSource()`
-changed:
-
-    ParallelSource() == children.empty()   (pre-D54)      56.4s
-    ParallelSource() == true               (D54)         279.4s
-
-**Why, exactly.** `factorize_explain` at eight threads:
-
-    slice 0 (peak 796.8MB): [1: 361282 recs ... 154ms] ...
-    slice 1 (peak 800.8MB): [1: 361282 recs ... 83604ms] ...
-    slice 5 (peak 800.8MB): [1: 361282 recs ... 90372ms] ...
-    ...
-    slice 4 (peak 796.8MB): [1: 361282 recs ... 251926ms] ...
-    fell back to the stock plan: the engine exceeded its per-slice memory budget
-
-Every slice rebuilds the *same* 361,282-record first step, because the slice key
-does not reach that relation and filtering removes none of it. Eight slices each
-peak at 800MB, and the query exceeds its budget and falls back to the stock plan
-anyway. Dividing the work helps when it fits and multiplies it when it does not,
-and the >1e9-tuple regime this engine exists for (D15) is the one where it does
-not. So `factorize_parallel_fallback` defaults to false, which is exactly the
-behaviour before D54, and the lock fix stays because it is what makes the
-setting safe to turn on at all.
-
-**And D55 was blamed for this.** It recorded `watdiv_acyclic_217_05` at 269s and
-`yago_acyclic_Chain_9_71` at 280s as the cost of splitting a skewed bucket on a
-second key. Re-run with `factorize_second_key` off, both are unchanged -- so the
-second key never caused either. 217_05 is D54's, above; Chain_9_71 was already
-timing out at 300s before any of this work, so it is not a regression at all.
-D55's own claim -- that the mechanism converts a query that cannot be answered
-at any memory limit into one that can -- still stands on its fixture, and the
-corpus cost it cites does not. It stays off, now for want of evidence either way
-rather than for evidence against.
-
-**What went wrong in the method, twice.** The D55 numbers came from comparing
-against a table measured with `factorize_min_compression=5` while running at
-default settings, so the baselines were not baselines: `watdiv_210_06`'s "12.4s
-to 0.327s, 38x" was 0.5s to 0.327s, and `218_15` was an improvement from 138.6s
-rather than a regression from 18.9s. A recorded number is only a baseline if the
-settings that produced it are recorded with it. The D54 number came from a
-sample stopped early on the grounds that the direction was clear, which is the
-same error D47 names: a fire count from one dataset generalised to four.
-
-## D54b — Eight buckets reaching the same verdict separately, and why stopping seven of them is not enough
-
-D54a left `factorize_parallel_fallback` off because a query that exceeds the
-memory budget exceeds it once per bucket: eight slices, eight subdivision
-ladders, and the stock plan answers in the end anyway. The buckets are
-independent, which is what makes them parallel -- and independence is worth
-having for the work and not for the verdict.
-
-**So they share one.** `SliceBudget` carries a pointer to a flag the query's
-slices hold in common; the first slice to exhaust every subdivision it is
-willing to try raises it, and the others throw `SiblingGaveUp` at the next
-chunk allocation. Deliberately not a `MemoryLimitExceeded`: the one thing a
-caller must not do with this is subdivide and try again.
-
-Checked where the budget already is, on chunk allocation rather than on every
-write -- often enough to stop promptly, rare enough to cost nothing measurable.
-`SetGlobalLimits` clears the pointer, and that is the load-bearing line: the
-flag belongs to one query's slices while the thread-local outlives them, so a
-pointer left behind is a use-after-free rather than a wrong answer. The caller
-sets it again, after, and the test pins both halves.
-
-**Measured on the query D54a was written about**, `watdiv_acyclic_217_05`:
-
-    parallel_fallback = false                       51.5s
-    parallel_fallback = true, before this           279.4s
-    parallel_fallback = true, with the shared flag  113.5s
-
-So the penalty for turning the setting on goes from 5.4x to 2.2x. That is a
-real improvement to the mechanism and it is not enough to change the default,
-which stays off.
-
-**What the remaining 2.2x is, exactly.** The flag can only be raised once some
-slice has spent the whole ladder, and until then the other seven are doing the
-duplicated work D54a measured: all eight rebuild the *same* 361,282-record
-first step, because `ChooseSliceColumns` picks the class reaching the most
-relations and nothing makes that the class reaching the relation the plan
-*starts* with. A bucket of a key that does not touch the first relation does
-not shrink it. Raising the flag on the first out-of-memory instead would cut
-that, and would also abandon every query that subdividing would have recovered,
-which is the capability the ladder exists for.
-
-The root cause is therefore the slice key rather than the abort, and fixing it
-means choosing a partition that reaches the early steps of the plan rather than
-the most relations overall -- a change to what is partitioned, not to when it is
-given up on. Recorded here rather than attempted: the measurement above says
-what it would be worth.
-
 ## D57 — "A hundred rows out of a trillion" was never DuckDB's problem
 
 §10.3's tuple output is the last v2 feature the optimizer rule does not reach,
@@ -3955,124 +4073,6 @@ Not changed: the margin stays at 1.5. The 9.11s at margin 5.0 is fitted on the
 same 116 queries it is scored against, which is what D38 calls overfit, and the
 modelled gate is 9.77s where the real one measures 9.59s -- a model close
 enough to rank alternatives is not close enough to tune a shipped constant on.
-
-## D54c — The slice key was chosen for width, and width is not what a bucket has to shrink
-
-D54b left the parallel fallback off with its remaining cost named rather than
-fixed: all eight slices rebuild the same 361,282-record first step, because
-`ChooseSliceColumns` picks the equivalence class reaching the most relations and
-nothing makes that the class reaching the relation the plan *starts* from. A
-bucket of a key that does not touch either side of the first join leaves that
-join's whole output standing in every bucket.
-
-So the base relation comes first now and reach breaks the tie. Three lines of
-comparison, and none of them is about accuracy: slicing on *any* single class is
-sound -- the closure argument is about a class, not a particular one -- so this
-moves time and never the answer, which is what makes it safe to decide on a
-measurement.
-
-**Measured on the two queries that were the case against the setting**, forced,
-one binary, same session:
-
-    query                      buckets    serial
-    watdiv_acyclic_217_05       34.9s     61.2s     1.75x
-    watdiv_acyclic_218_15       39.5s    109.5s     2.77x
-
-`watdiv_acyclic_217_05` is the query D54a was written about. Its history:
-
-    D54, width-only key, no shared verdict     279.4s
-    D54b, buckets stop each other              113.5s
-    D54c, key covers the base                   34.9s
-    serial, for comparison                      61.2s
-
-The counter-example is now the evidence for. What was 5.4x the wrong way is
-1.75x the right way, and the thing that changed is not the abandon, the memory
-budget or the thread count -- it is which column the input was bucketed on.
-
-**One coupling had to be broken to do it.** `CountBySecondKey` took the widest
-class as the bucket it was refining, which was the same thing as the caller's
-bucket only because `ChooseSliceColumns` also preferred width. Preferring
-anything else would have silently re-bucketed the input under one key while
-keeping a bucket number computed for another -- a wrong answer, not a slow one.
-It asks for the primary key now instead of inferring it.
-
-Tested, and the test fails against the previous commit rather than being
-asserted to work: a five-relation fixture whose widest class reaches r2, r3 and
-r4 while the base is r0, so width and coverage disagree. Summed over eight
-buckets, the first join holds 12,800 records under the old rule against 1,600
-undivided -- one full copy per bucket -- and about one copy under the new one.
-The sum is checked rather than one bucket, because a bad key also leaves most
-buckets empty and an empty bucket would pass an assertion about bucket 0 for
-the wrong reason.
-
-## D54d — The parallel fallback goes on, and this time the measurement covers the queries it is for
-
-D54a turned `factorize_parallel_fallback` off on one counter-example and a
-sample that stopped before reaching the queries like it. D54b and D54c fixed
-the two things that counter-example was made of -- buckets each discovering the
-same verdict, and a slice key that partitioned nothing the plan built early --
-so the setting is measured again, over both regimes this time.
-
-**The runnable corpus, comparing the setting rather than the thread count:**
-
-    queries timed                 118 of 119   (watdiv_acyclic_205_02 capped)
-    buckets faster                       103
-    buckets slower                        15
-    total, serial                    428.42s
-    total, buckets                   142.69s      3.00x
-    of the 28 queries over 1s        414.80s -> 134.98s      3.07x
-
-    epinions  n=30     1.25s ->   0.41s   3.05x
-    hetio     n=2      0.18s ->   0.08s   2.28x
-    watdiv    n=39   234.33s ->  77.17s   3.04x
-    yago      n=47   192.66s ->  65.03s   2.96x
-
-Every dataset separately, which is the property F18 says to check before
-believing any corpus-wide ratio. The fifteen losses are all small -- the largest
-absolute one is `yago_acyclic_Chain_6_26` at +1.0s and every other is under
-0.1s.
-
-**And the queries whose outcome is known**, which is the set D54a's objection
-was actually about, since they include the memory-heavy ones where each bucket
-was exceeding the budget separately:
-
-    query                        serial    buckets
-    hetio_acyclic_203_09          0.030      0.013
-    hetio_acyclic_205_03        141.072     51.215
-    hetio_acyclic_205_09        172.874     51.243
-    hetio_acyclic_205_11          0.416      0.092
-    hetio_acyclic_205_15         87.444     22.893
-    hetio_acyclic_210_05        101.768     30.653
-    hetio_acyclic_216_01          0.977      0.190
-    hetio_acyclic_222_07          1.328      0.376
-    hetio_acyclic_225_02          4.332      0.670
-    watdiv_acyclic_210_06         0.400      0.090
-    hetio_acyclic_204_01          9.110      2.247
-    hetio_acyclic_204_08         11.331      3.043
-    watdiv_acyclic_205_19       259.894    106.500
-    watdiv_acyclic_217_10       253.958     90.247
-    watdiv_acyclic_217_15        62.587     33.398
-    yago_acyclic_Chain_12_06     10.083      2.550
-    yago_acyclic_Chain_12_63      0.451      0.357
-    yago_acyclic_Chain_9_71        >300       >300
-
-Eighteen for eighteen, none slower, and the one tie is a query that already
-capped at 300s before any of this work. The hetio queries in that table are the
-ones no stock plan answers at all, and they are where it pays most: 141s to
-51s, 173s to 51s, 87s to 23s, 102s to 31s.
-
-So the default flips to true, and D20's design -- one thread per bucket of the
-join key, with the answer independent of how many threads ran -- is finally what
-the extension does by default rather than what it does when the fallback is
-switched off.
-
-**What the three attempts say about method.** D54 shipped it on a synthetic
-star. D54a took it off on one real query and a sample stopped early. Neither
-measurement was wrong about what it measured; both were wrong about what they
-covered. The rule that would have caught both is the one F18 already states for
-the gate and which this now follows: a corpus-wide ratio means nothing until it
-holds per dataset, and a setting that changes what happens under memory
-pressure has to be measured on the queries that reach it.
 
 ## D59 — O11's calibration tool works, and its fit is not an improvement
 
