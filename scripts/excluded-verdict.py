@@ -35,13 +35,18 @@ The verdict per query is one of four, and the counts of each are the result:
 import csv
 import sys
 
+# "missing" is a query whose tables this database does not have; it is not a
+# cap and not a time, and pairing it with anything would be inventing data.
 CAP_MARKERS = {"to", "timeout", ""}
+SKIP_MARKERS = {"missing"}
 
 
 def read(path, time_column):
     out = {}
     for row in csv.DictReader(open(path)):
         value = (row.get(time_column) or "").strip()
+        if value in SKIP_MARKERS:
+            continue
         out[row["query"]] = None if value in CAP_MARKERS else float(value)
     return out
 

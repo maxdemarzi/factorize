@@ -23,32 +23,60 @@
 # answer to it.
 #
 # The cap is 60s by default rather than 300s: what matters is separating "stock
-# has this" from "stock does not", and the known cases sit far from the line
-# (5.1s, 0.02s, 35.7s on one side; no answer in 300s on the other). A shorter
-# cap makes the run finish, which is the difference between a baseline that
-# exists and one that is described in a decision entry.
+# has this" from "stock does not". Measured, the answers run right up to the cap
+# (hetio_acyclic_203_15 at 59.0s), so a shorter one would misclassify -- and a
+# cap that truncates real answers is the one way this measurement can lie in the
+# direction that flatters us.
+#
+# A query whose tables are not in the database is recorded as `missing`, not as
+# a time. The first version of this took the Run Time that DuckDB prints after a
+# *binder error* as an answer, and so reported that dblp answered 52 of 52
+# queries in a millisecond -- dblp is not loaded here at all. A harness that
+# records a non-answer as a fast answer is the same bug as one that records a
+# timeout as a fast answer, and this file has now had both.
 #
 # No set -e: the caps are the result.
 cd "$(dirname "$0")/.."
 D=${BIN:-build/release/duckdb}; DB=${DB:-/tmp/factorize-duckdb/ce.db}; Q="'"
 CAP=${CAP:-60}
+MODE=${MODE:-off}
 OUT=${OUT:-tmp/excluded_baseline.csv}
 LIST=${LIST:-tmp/excluded_all.psv}
-echo "query,expected,stock_s" > "$OUT"
-n=0; answered=0; capped=0
+
+# The tables this database actually has, so a query naming anything else is
+# skipped rather than timed.
+have=$("$D" -readonly "$DB" -noheader -list -c "select table_name from duckdb_tables();" 2>/dev/null)
+
+echo "query,expected,${MODE}_s" > "$OUT"
+n=0; answered=0; capped=0; missing=0
 while IFS='|' read -r name expected q; do
   [ -n "$name" ] || continue
   q=$(echo "$q" | tr -d '\r')
+  from=${q#*from }; from=${from#*FROM }; from=${from%% where*}; from=${from%% WHERE*}
+  absent=0
+  for t in $(echo "$from" | tr ',' ' '); do
+    echo "$have" | grep -qx "$t" || { absent=1; break; }
+  done
   n=$((n + 1))
-  out=$(printf '%s\n' ".timer on" "SET factorize_mode=${Q}off${Q};" "$q;" |
+  if [ "$absent" -eq 1 ]; then
+    missing=$((missing + 1))
+    echo "${name},${expected},missing" >> "$OUT"
+    printf '%-28s %16s  not loaded\n' "$name" "$expected"
+    continue
+  fi
+  out=$(printf '%s\n' ".timer on" "SET factorize_mode=${Q}${MODE}${Q};" "$q;" |
         timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1)
-  if [ $? -eq 124 ]; then
-    secs=to; capped=$((capped + 1))
-  else
+  status=$?
+  secs=""
+  if [ "$status" -ne 124 ] && ! echo "$out" | grep -qi "error"; then
     secs=$(echo "$out" | grep "Run Time" | sed 's/.*real //' | awk '{print $1}' | tail -1)
-    [ -n "$secs" ] && answered=$((answered + 1)) || { secs=to; capped=$((capped + 1)); }
+  fi
+  if [ -n "$secs" ]; then
+    answered=$((answered + 1))
+  else
+    secs=to; capped=$((capped + 1))
   fi
   echo "${name},${expected},${secs}" >> "$OUT"
   printf '%-28s %16s  stock %s\n' "$name" "$expected" "$secs"
 done < "$LIST"
-echo "=== $n queries: $answered answered within ${CAP}s, $capped capped -> $OUT"
+echo "=== $n queries: $answered answered within ${CAP}s, $capped capped, $missing not loaded -> $OUT"

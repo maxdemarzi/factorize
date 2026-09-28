@@ -252,9 +252,13 @@ code. The one that reframes everything:
 
 **The CE benchmark disables every query whose result exceeds 1e9 tuples**,
 removing 344 of 360 hetio queries. The live corpus is, by construction, the
-regime a flat engine already handles. In the excluded regime the comparison is
-not close — 182 of 344 answered, 0 wrong, and DuckDB times out on eight of nine
-at a 180-second cap. [DECISIONS](DECISIONS.md) D15 repoints the project there.
+regime a flat engine already handles. [DECISIONS](DECISIONS.md) D15 repoints the
+project there, and D60 finally measures it: across 125 of those hetio queries,
+both engines capped at 60s, **76 are answered that stock does not answer at all,
+0 answers are lost, and 21 of the remainder are faster** — the rescued ones in a
+median of 0.23s against a stock plan that has not finished in sixty seconds.
+Only watdiv and yago's excluded queries remain unmeasured, and they are where
+D47's counter-examples came from.
 
 Also worth knowing before trusting any number here:
 

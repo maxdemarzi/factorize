@@ -4135,3 +4135,61 @@ exists, works, and produces a fit that is measurably more conservative than the
 shipped one. A user whose workload looks like the runnable corpus would be
 better off with it; a user whose workload is the reason this engine exists would
 not.
+
+## D60 — The excluded regime has a baseline at last, and D42 and D47 were both half right
+
+D42 wrote that "in the >1e9-tuple regime DuckDB does not finish, so firing more
+is strictly better there", and for months every decision used that corpus's
+*fire count* as the benefit side of a trade. D47 measured nine of those fires,
+found three wins and six losses, rejected the claim, and said what replacing it
+would take: every query timed under `factorize_mode='off'` at a fixed cap, so
+that "fires" could become "answers stock does not produce, minus time lost on
+the ones it does".
+
+That measurement now exists. 125 hetio queries, stock and `auto` both at a 60s
+cap, our side with the parallel default of D54d:
+
+    rescued   stock capped, we answered          76
+    lost      we capped, stock answered           0
+    faster    both answered, we were quicker     21
+    slower    both answered, we were not          2
+    neither   both capped                        26
+
+    on the 23 both answered:   542.8s stock against 130.4s ours
+    the 76 rescued, our times: min 0.01s, median 0.23s, max 59.7s
+    the 2 slower:              +3.13s and +0.56s
+
+Seventy-six answers that do not otherwise exist, for no answer lost and 3.7
+seconds spread over two queries. The rescued median is a quarter of a second
+against a stock plan that has not finished in sixty, and where both engines
+answer the gaps run to 2726x (`hetio_acyclic_203_09`, 32.7s against 0.01s) and
+1554x (`203_15`, 59.0s against 0.04s).
+
+**So D42's claim is true, of hetio, and was never true as stated.** D47 was
+right to reject the generalisation and its sample could not have shown this:
+of the nine queries it measured, the losses were `watdiv_205_19` and two yago
+chains, and the dataset that dominates this corpus -- hetio is 344 of the 481 --
+contributed two. Both entries made the same mistake in opposite directions, and
+it is the mistake D54/D54a made again today with the parallel default: a
+measurement that is sound about what it measured, generalised past what it
+covered.
+
+**What this does not say.** hetio only: 125 of its 344, and none of watdiv's 38
+or yago's 8 excluded queries, which are the ones D47's losses came from -- so
+the corpus-wide question is still open and the answer for those datasets is
+likely to be different. dblp (52) and job (39) cannot be measured here at all;
+they are not in this database, which is worth saying because the first version
+of this run recorded their binder errors as answers in a millisecond and briefly
+had me reporting that dblp answered 52 of 52. A harness that records a
+non-answer as a fast answer is the same defect as one that records a timeout as
+a fast answer, and this measurement has now had both.
+
+And "rescued" means stock did not finish inside sixty seconds, not that it never
+would. The cap cuts close: the slowest stock answer here is 59.0s, so a longer
+cap would move some of the 76 into "faster" -- it would not move any into
+"lost", since that column is empty.
+
+**What it changes.** The excluded corpus can now say a setting is *better* and
+not merely *safe*, for hetio, which is what D47 asked for. Fire counts stay
+retired: the number that matters is 76 rescued against 0 lost, and no count of
+fires would have distinguished that from D47's three-and-six.
