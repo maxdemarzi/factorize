@@ -3765,10 +3765,23 @@ switched off.
 **What the three attempts say about method.** D54 shipped it on a synthetic
 star. D54a took it off on one real query and a sample stopped early. Neither
 measurement was wrong about what it measured; both were wrong about what they
-covered. The rule that would have caught both is the one F18 already states for
-the gate and which this now follows: a corpus-wide ratio means nothing until it
-holds per dataset, and a setting that changes what happens under memory
-pressure has to be measured on the queries that reach it.
+covered. The rule that would have caught both is the one F18 already states for
+the gate and which this now follows: a corpus-wide ratio means nothing until it
+holds per dataset, and a setting that changes what happens under memory
+pressure has to be measured on the queries that reach it.
+
+**And what it is not worth, measured straight afterwards.** The 3.00x above is
+a `force` number over the whole corpus. Under `auto`, which is what a user gets,
+the corpus goes 21.13s to 13.02s -- 1.62x, indistinguishable from the 1.71x the
+README has carried since before any of this. The gain is real and it is where
+the gate fires: those 35 queries go 14.46s to 6.15s, 2.35x. The other 84 are
+declined and contribute 6.67s either way, which bounds the corpus at 3.17x no
+matter how fast the fired ones become.
+
+So the headline did not need rewriting, and the expectation that it would was
+wrong in the direction that flatters the project -- worth recording, because a
+3x improvement that does not move the number a reader sees is exactly the kind
+of thing that gets written up as if it had.
 
 ## D55 — "No spilling" was one key, not no key
 
