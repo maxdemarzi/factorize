@@ -253,12 +253,20 @@ code. The one that reframes everything:
 **The CE benchmark disables every query whose result exceeds 1e9 tuples**,
 removing 344 of 360 hetio queries. The live corpus is, by construction, the
 regime a flat engine already handles. [DECISIONS](DECISIONS.md) D15 repoints the
-project there, and D60 finally measures it: across 125 of those hetio queries,
-both engines capped at 60s, **76 are answered that stock does not answer at all,
-0 answers are lost, and 21 of the remainder are faster** — the rescued ones in a
-median of 0.23s against a stock plan that has not finished in sixty seconds.
-Only watdiv and yago's excluded queries remain unmeasured, and they are where
-D47's counter-examples came from.
+project there, and D60 and D61 measure it: 171 queries across every dataset this
+database holds, both engines capped at 60s. **Above 1e10 expected tuples — 128
+of them — 83 answers exist that stock does not produce, against 1 lost and 2
+slower**, the 83 answered in a median of 0.31s against a stock plan that has
+not finished in sixty. Every one of the 83 is in that band; below it nothing
+is rescued at all.
+
+Below 1e10 it stops being a rescue and becomes a dataset-specific trade: hetio's
+1e9–1e10 band is 16 faster and 0 slower, watdiv and yago's is 10 and 10 and
+loses 46.6s on balance. So "the excluded regime" was never one regime, which is
+why D42 measured it as a free win and D47 measured it as three wins and six
+losses — 109 of hetio's 125 queries sit above 1e10, and 19 of watdiv and yago's
+46 do. Neither had a corpus; both had a dataset. hetio's other 219 queries and
+dblp's and job's (not loaded here) are what remain.
 
 Also worth knowing before trusting any number here:
 

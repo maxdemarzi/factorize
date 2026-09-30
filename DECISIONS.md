@@ -4190,7 +4190,8 @@ covered.
 **What this does not say.** hetio only: 125 of its 344, and none of watdiv's 38
 or yago's 8 excluded queries, which are the ones D47's losses came from -- so
 the corpus-wide question is still open and the answer for those datasets is
-likely to be different. dblp (52) and job (39) cannot be measured here at all;
+likely to be different. **D61 measures them, and it was.** dblp (52) and job
+(39) cannot be measured here at all;
 they are not in this database, which is worth saying because the first version
 of this run recorded their binder errors as answers in a millisecond and briefly
 had me reporting that dblp answered 52 of 52. A harness that records a
@@ -4206,3 +4207,103 @@ cap would move some of the 76 into "faster" -- it would not move any into
 not merely *safe*, for hetio, which is what D47 asked for. Fire counts stay
 retired: the number that matters is 76 rescued against 0 lost, and no count of
 fires would have distinguished that from D47's three-and-six.
+
+## D61 -- The excluded regime is two regimes, and the split is result size
+
+D60 measured hetio and named what it left open: watdiv's 38 and yago's 8, which
+are where D47's counter-examples came from. Both are measured now, same method
+-- stock and `auto` each at a 60s cap, the parallel default of D54d on.
+
+    watdiv, 38                 yago, 8
+    rescued    6               rescued   1
+    lost       2               lost      0
+    faster    15               faster    4
+    slower     9               slower    3
+    neither    6               neither   0
+
+    watdiv, on the 24 both answered: 262.5s stock against 187.8s ours
+    yago,   on the 7  both answered:  11.9s stock against   5.8s ours
+
+**watdiv's +74.7s is two queries.** `210_09` (59.7s -> 0.25s) and `210_10`
+(58.5s -> 0.27s) are 117.7s of it between them. Remove those two and the other
+22 go 144.3s stock against 187.3s ours: we are **43.0s slower** across the rest.
+So watdiv is not hetio. It is a few enormous wins over a long tail of small
+losses, six answers gained and two given up.
+
+**And the split that explains all three datasets is the expected result size,**
+which is the one variable CE itself used to draw this corpus:
+
+    expected result    n   rescued  lost  faster  slower  neither     net
+    >=1e10           128        83     1      10       2       32   +307.4s
+    1e9-1e10          37         0     1      26      10        0   +185.6s
+    <1e9               6         0     0       4       2        0     +0.1s
+
+Above 1e10 the answer is uniform across hetio, watdiv and yago: 83 rescued
+against a single loss, and not one query slower on watdiv or yago. The 83 are
+answered in a median of 0.31s (min 0.01s, max 59.7s), and -- the sharpest thing
+in the table -- **all 83 rescues are in that one band.** Not a single query below
+1e10 expected tuples is answered by us and not by stock. Below it the
+answer is dataset-specific -- hetio's 1e9-1e10 band is 16 faster and 0 slower,
+watdiv and yago's is 10 and 10 and loses 46.6s on balance. So size alone is not
+a gate condition, but it does say where the rescue case lives, and it says
+precisely why D42 and D47 disagreed: **109 of hetio's 125 measured queries are
+in the >=1e10 band, against 19 of watdiv and yago's 46.** Each of them
+sampled a different regime and described it as the regime.
+
+**The query D54 was written about, measured against stock for the first time.**
+`watdiv_acyclic_217_05`: stock 11.7s, ours 55.8s. Its recorded history --
+279.4s, then 113.5s, then 34.9s against a serial 61.2s -- compares us only to
+ourselves, and D47 had stock at 13.3s on the same query all along. Those numbers
+came off a different harness than this one, so they do not chain into a ratio
+with today's 55.8s; what they do show is that every figure D54 through D54d
+recorded for this query was a comparison against another of our own
+configurations, on a query stock has answered in about twelve seconds
+throughout. The improvement is real and it is not a win, and the entry that
+called a 1.75x "the counter-example is now the evidence for" should have said
+against what.
+
+The two lost are `217_10` (stock 6.2s) and `218_15` (stock 17.7s), both of which
+D47 also measured and both of which stock has always answered.
+
+**Two harness defects, both found here, both flattering us.**
+
+1. `excluded-verdict.py` looked the baseline's time up by the fixed name
+   `stock_s`, while `measure-excluded-baseline.sh` names its column after the
+   mode it ran -- `off_s` for this run. Every stock time read as absent, absent
+   read as a cap, and the first verdict off this data was **30 rescued and 0
+   lost** where the truth is 6 and 2. It now takes the last column of both
+   files, and a header it does not recognise can no longer look like data.
+   `scripts/excluded-verdict.py --selftest` pins it: against the pre-fix reader
+   it fails with every time read as `None`, which is the symptom exactly.
+
+2. The table-presence check split the whole FROM clause on whitespace, so an
+   aliased relation (`yago54 yago54_1`) looked like a table named `yago54_1`
+   that does not exist. All 8 yago queries were recorded `not loaded` against a
+   database holding 91 yago tables. It reads one relation per comma now and
+   takes the first token.
+
+With D60's dblp binder errors that is three in one harness, which has now
+recorded a non-answer as a fast answer, a real answer as a cap, and a runnable
+query as unrunnable. Every one of the three moved a number in the project's
+favour, and the third is the worst of them, because a skipped query leaves no
+trace in the verdict at all -- the corpus just silently gets smaller.
+
+**One more thing this corpus is not.** ">1e9 tuples" is how CE describes the
+exclusion and how every entry here has repeated it, but 9 of the 481 queries
+have expected results below 1e9 -- and 5 of those 9 are yago's, so most of
+yago's excluded set is not in that regime at all. The banding above uses the
+expected counts rather than the label.
+
+**What is now settled.** The excluded corpus is measured for every dataset this
+database holds: hetio 125 of 344, watdiv 38 of 38, yago 8 of 8. dblp (52) and
+job (39) are not loaded here and cannot be. Firing in this regime is worth 83
+rescued answers against 1 lost above 1e10, and is a dataset-specific gamble
+below it. Fire counts stay retired.
+
+**What is still open.** hetio's other 219, which is the only remaining gap and
+the cheapest one to close. And the 1e9-1e10 band is a real finding without an
+action yet: the gate does not know the expected result size to the accuracy this
+banding uses -- it knows its own estimate -- so "decline below 1e10" is not
+something that can simply be implemented from this table. What it would take is
+checking whether the *estimate* separates the same way, which is O12's question
+asked against a corpus that can now answer it.

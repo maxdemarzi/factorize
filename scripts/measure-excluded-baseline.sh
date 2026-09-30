@@ -54,7 +54,17 @@ while IFS='|' read -r name expected q; do
   q=$(echo "$q" | tr -d '\r')
   from=${q#*from }; from=${from#*FROM }; from=${from%% where*}; from=${from%% WHERE*}
   absent=0
-  for t in $(echo "$from" | tr ',' ' '); do
+  # One relation per comma, and the table is its FIRST token: `yago54 yago54_1`
+  # is one table with an alias, not two tables. Splitting the whole clause on
+  # whitespace made every aliased query look like it named a table called
+  # `yago54_1`, so all 8 yago queries were recorded as `not loaded` against a
+  # database holding 91 yago tables. That is the dblp defect inverted -- there a
+  # non-answer was recorded as an answer, here a runnable query was recorded as
+  # unrunnable -- and it is worse, because a skipped query leaves no trace in
+  # the verdict at all.
+  for t in $(echo "$from" | tr ',' '
+' | awk '{print $1}'); do
+    [ -n "$t" ] || continue
     echo "$have" | grep -qx "$t" || { absent=1; break; }
   done
   n=$((n + 1))

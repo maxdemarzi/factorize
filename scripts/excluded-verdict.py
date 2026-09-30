@@ -41,33 +41,35 @@ CAP_MARKERS = {"to", "timeout", ""}
 SKIP_MARKERS = {"missing"}
 
 
-def read(path, time_column):
+def read(path):
+    """Times by query, keyed off the file's LAST column whatever it is called.
+
+    measure-excluded-baseline.sh names its column after the mode it ran, so the
+    same script writes `stock_s`, `off_s` or `auto_s` depending on how it was
+    invoked. Looking a fixed name up with .get() returned None for every row of
+    an `off_s` file, which this then read as a cap -- turning 26 stock answers
+    into 26 queries stock could not answer, and a run of 30 rescued that was
+    really 4. A header the reader does not recognise must not be able to look
+    like data, which is the same defect as the binder errors in D60.
+    """
     out = {}
-    for row in csv.DictReader(open(path)):
-        value = (row.get(time_column) or "").strip()
+    reader = csv.reader(open(path))
+    header = next(reader)
+    query_at, time_at = header.index("query"), len(header) - 1
+    for row in reader:
+        if not row:
+            continue
+        value = row[time_at].strip()
         if value in SKIP_MARKERS:
             continue
-        out[row["query"]] = None if value in CAP_MARKERS else float(value)
+        out[row[query_at]] = None if value in CAP_MARKERS else float(value)
     return out
 
 
-def main():
-    baseline_path = sys.argv[1] if len(sys.argv) > 1 else "tmp/excluded_baseline.csv"
-    ours_path = sys.argv[2] if len(sys.argv) > 2 else "tmp/excluded_ours.csv"
-    stock = read(baseline_path, "stock_s")
-
-    # Whatever the second file calls our column, take the last one that parses.
-    header = next(csv.reader(open(ours_path)))
-    ours_column = header[-1]
-    ours = read(ours_path, ours_column)
-
-    shared = [q for q in ours if q in stock]
-    if not shared:
-        print("no queries in common between the two files", file=sys.stderr)
-        return 1
-
+def verdicts(stock, ours):
+    """The four-way classification, over the queries both files time."""
     buckets = {"rescued": [], "lost": [], "faster": [], "slower": [], "neither": []}
-    for q in shared:
+    for q in [q for q in ours if q in stock]:
         s, o = stock[q], ours[q]
         if s is None and o is None:
             buckets["neither"].append((q, s, o))
@@ -79,6 +81,20 @@ def main():
             buckets["faster"].append((q, s, o))
         else:
             buckets["slower"].append((q, s, o))
+    return buckets
+
+
+def main():
+    baseline_path = sys.argv[1] if len(sys.argv) > 1 else "tmp/excluded_baseline.csv"
+    ours_path = sys.argv[2] if len(sys.argv) > 2 else "tmp/excluded_ours.csv"
+    stock = read(baseline_path)
+    ours = read(ours_path)
+
+    buckets = verdicts(stock, ours)
+    shared = [q for b in buckets.values() for q, _, _ in b]
+    if not shared:
+        print("no queries in common between the two files", file=sys.stderr)
+        return 1
 
     print(f"{len(shared)} queries with both times\n")
     for name in ("rescued", "lost", "faster", "slower", "neither"):
@@ -120,5 +136,43 @@ def main():
     return 0
 
 
+def selftest():
+    """The two ways this file has read a measurement wrongly, pinned.
+
+        scripts/excluded-verdict.py --selftest
+
+    Both were found in D61 and both moved the answer our way. The baseline is
+    written with an `off_s` column, not `stock_s`, and looking the old fixed
+    name up returned None for every row -- which this read as a cap, turning
+    every stock answer into a query stock could not answer. On the real data
+    that printed 30 rescued and 0 lost where the truth was 6 and 2.
+    """
+    import tempfile, os
+
+    d = tempfile.mkdtemp()
+    stock = os.path.join(d, "stock.csv")
+    ours = os.path.join(d, "ours.csv")
+    # Column named for the mode, not "stock_s" -- the whole point.
+    eol = chr(10)
+    open(stock, "w").write(eol.join(["query,expected,off_s", "a,1,10.0", "b,1,to", "c,1,missing", "d,1,3.0", "e,1,to", ""]))
+    open(ours, "w").write(eol.join(["query,expected,auto_s", "a,1,2.0", "b,1,4.0", "c,1,1.0", "d,1,to", "e,1,to", ""]))
+
+    got = read(stock)
+    assert got == {"a": 10.0, "b": None, "d": 3.0, "e": None}, got
+    assert "c" not in got, "a `missing` row is not a cap and not a time"
+
+    ours_read = read(ours)
+    assert ours_read["a"] == 2.0 and ours_read["d"] is None, ours_read
+
+    # a faster, b rescued, c skipped, d lost, e neither.
+    counts = verdicts(got, ours_read)
+    expected = {"rescued": 1, "lost": 1, "faster": 1, "slower": 0, "neither": 1}
+    assert {k: len(v) for k, v in counts.items()} == expected, counts
+    print("selftest ok")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     sys.exit(main())
