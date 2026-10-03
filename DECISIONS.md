@@ -4231,7 +4231,10 @@ So watdiv is not hetio. It is a few enormous wins over a long tail of small
 losses, six answers gained and two given up.
 
 **And the split that explains all three datasets is the expected result size,**
-which is the one variable CE itself used to draw this corpus:
+which is the one variable CE itself used to draw this corpus. (The
+1e9-1e10 row below does not survive the full corpus -- it is 37 queries from
+two datasets, and D64 measures 51 across three and finds the opposite sign.
+The >=1e10 row holds.)
 
     expected result    n   rescued  lost  faster  slower  neither     net
     >=1e10           128        83     1      10       2       32   +307.4s
@@ -4499,3 +4502,66 @@ evidence for the override nor against it. D56 timed three of them to 129s, 121s
 and 59s, which at a longer cap would make them rescues. The override's measured
 value -- 5 rescued, 6 faster, 1 slower -- is a floor, and the case for keeping
 it is stronger than the 60s cap can show.
+
+## D64 -- The excluded corpus, measured whole, on one build
+
+D42 asserted this regime was free money, D47 rejected that on nine queries, D60
+measured 125 of hetio, D61 added watdiv and yago and found two regimes, and
+D62 and D63 fixed what those measurements exposed. Every query this database
+can run is now timed on the same build: 390 of the 481, stock and `auto`, 60s
+cap, parallel default on.
+
+    dataset       n  rescued     lost   faster   slower  neither        net
+    hetio       344      214        0       49        2       79   +1142.7s
+    watdiv       38        8        0       16        8        6     +17.5s
+    yago          8        1        0        2        5        0      +8.6s
+    TOTAL       390      223        0       67       15       85   +1168.8s
+
+**223 answers that the stock plan does not produce, and nothing lost.** Not
+one query in 390 is turned from an answer into a non-answer. The rescued are
+not marginal either: median 0.08s, against a plan that has not finished in
+sixty seconds.
+
+**The cost side is 29.5 seconds, total, across the whole corpus**, and three
+quarters of it is one query:
+
+    watdiv_acyclic_218_15   15.06s -> 37.45s   2.5x   -22.4s
+    hetio_acyclic_204_08    26.23s -> 29.35s   1.1x    -3.1s
+    watdiv_acyclic_205_14    7.30s ->  8.90s   1.2x    -1.6s
+    ... 12 more, none over 0.8s, five of them yago queries costing
+        hundredths of a second each
+
+Set against +1168.8s. The ratio is not the point and the shape is: the losses
+are small, bounded, and concentrated, and the one that is not small is the
+query D63 named as the remaining case for fixing the watdiv over-prediction.
+
+**D61's two-regime finding does not survive the full corpus.** It is the entry
+I would most want corrected, and the correction runs both ways:
+
+    expected result    n   rescued  lost  faster  slower        net
+    >=1e10           333       223     0      22       3     +735.2s
+    1e9-1e10          51         0     0      45       6     +433.8s
+    <1e9               6         0     0       0       6       -0.2s
+
+D61 called the 1e9-1e10 band "a dataset-specific trade" that "loses 46.6s on
+balance", because the only queries it had in that band were watdiv's and
+yago's, where it was 10 faster against 10 slower. With hetio's share included
+and D62/D63 applied it is 45 against 6 and gains 433.8s. The band that looked
+like a coin flip was a 37-query sample of one dataset, read as a regime. That
+is the same error D61 convicted D42 and D47 of, committed in the entry making
+the conviction.
+
+What does survive: the rescues live entirely above 1e10, all 223 of them, and
+nothing below 1e9 is worth firing on -- all six are slower, though by a tenth
+of a second in total.
+
+**And the hetio half of D60 was an understatement.** Its 125 gave 76 rescued
+and 2 slower. The other 219, measured here and never used to tune anything,
+gave 138 rescued, 28 faster, and **zero slower and zero lost** -- on the 28
+both engines answered, 759.6s against 29.3s. The sample D60 happened to take
+was the harder half.
+
+**What is still not measured.** dblp's 52 and job's 39, whose tables this
+database does not have; 91 of the 481 queries. Nothing here speaks for them,
+and watdiv is the standing warning against assuming a dataset behaves like the
+ones beside it.

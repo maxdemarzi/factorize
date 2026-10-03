@@ -254,31 +254,36 @@ code. The one that reframes everything:
 **The CE benchmark disables every query whose result exceeds 1e9 tuples**,
 removing 344 of 360 hetio queries. The live corpus is, by construction, the
 regime a flat engine already handles. [DECISIONS](DECISIONS.md) D15 repoints the
-project there, and D60 and D61 measure it: 171 queries across every dataset this
-database holds, both engines capped at 60s. **Above 1e10 expected tuples — 128
-of them — 83 answers exist that stock does not produce, against 1 past the cap
-and 2 slower**, the 83 answered in a median of 0.31s against a stock plan that has
-not finished in sixty. Every one of the 83 is in that band; below it nothing
-is rescued at all. No query in this corpus is made unanswerable: the two the
-60s cap records as lost both finish when it is raised to 300s, 8.1x and 3.1x
-slower than stock (D62). D63 removes the 8.1x one, `watdiv_acyclic_217_10`,
-along with the worst of the merely-slower, by not letting the gate's second
-opinion overrule a first one predicting a 393x or 5025x loss; both now track
-the stock plan to within a fifth of a second. The 3.1x one,
-`watdiv_acyclic_218_15`, is untouched and stays open: it never consults a
-second opinion, because its own estimate fires unaided on a prediction that
-DuckDB needs 99.4s where DuckDB needs 17.8s — the watdiv over-prediction
-F18 and D45 record as known.
+project there, and D64 finally measures all of it — every one of the 390
+queries this database can run, stock and `auto`, on one build, capped at 60s:
 
-Below 1e10 it stops being a rescue and becomes a dataset-specific trade: hetio's
-1e9–1e10 band is 16 faster and 0 slower, watdiv and yago's is 10 and 10 and
-loses 46.6s on balance — 32.0s of it after D62, which found the gate firing on
-estimates that had collapsed to zero predicted tuples and tightened what a
-second opinion has to clear. So "the excluded regime" was never one regime, which is
-why D42 measured it as a free win and D47 measured it as three wins and six
-losses — 109 of hetio's 125 queries sit above 1e10, and 19 of watdiv and yago's
-46 do. Neither had a corpus; both had a dataset. hetio's other 219 queries and
-dblp's and job's (not loaded here) are what remain.
+| dataset | n | rescued | lost | faster | slower | neither | net |
+|---|---|---|---|---|---|---|---|
+| hetio | 344 | 214 | 0 | 49 | 2 | 79 | +1142.7 s |
+| watdiv | 38 | 8 | 0 | 16 | 8 | 6 | +17.5 s |
+| yago | 8 | 1 | 0 | 2 | 5 | 0 | +8.6 s |
+| **total** | **390** | **223** | **0** | **67** | **15** | **85** | **+1168.8 s** |
+
+**223 answers that the stock plan does not produce, and not one query turned
+from an answer into a non-answer.** The rescued are not marginal: a median of
+0.08 s against a plan that has not finished in sixty seconds.
+
+Every slowdown in the corpus costs 29.5 s put together, and 22.4 s of that is
+one query — `watdiv_acyclic_218_15`, which stays open. Its own estimate fires
+unaided, predicting DuckDB needs 99.4 s where DuckDB needs 17.8 s, so no limit
+on second opinions reaches it; the cause is the watdiv over-prediction F18 and
+D45 record as known. The next worst costs 3.1 s and nothing else exceeds 0.8 s.
+
+All 223 rescues sit above 1e10 expected tuples. Below 1e9 firing is never worth
+it — all six such queries are slower, by a tenth of a second between them. The
+middle band is where this project most recently got it wrong: D61 read 37
+queries from two datasets as "a dataset-specific trade" losing 46.6 s, and the
+full 51 across three datasets are 45 faster against 6 slower and gain 433.8 s.
+That is the same error D61 convicted D42 and D47 of, in the entry convicting
+them, which is the most useful thing in this file.
+
+What is still unmeasured: dblp's 52 queries and job's 39, whose tables this
+database does not have.
 
 Also worth knowing before trusting any number here:
 
