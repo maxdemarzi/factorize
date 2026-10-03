@@ -4412,9 +4412,12 @@ the query is hopeless, and those are different sentences.
 
 ## D63 -- A second opinion may overrule a close call, not a rout
 
-D62 shipped two guards and left the corpus's two worst outcomes standing:
-`watdiv_acyclic_217_10` and `217_05`, which D61 recorded as lost and which are
-really 8.1x and 3.1x slower than the stock plan they replace. Making the gate
+D62 shipped two guards and left the corpus's worst outcomes standing:
+`watdiv_acyclic_217_10`, which D61 recorded as lost and which is really 8.1x
+slower than the stock plan it replaces, and `217_05`, recorded as slower and
+really 2.5x. (The other query D61 called lost, `218_15`, is 3.1x slower and is
+not one of these: its own estimate fires unaided, so nothing below applies to
+it. See the closing paragraph.) Making the gate
 print its own two predicted times -- it printed sizes before, and kept the
 arithmetic that decides private -- showed in one line what was wrong with them.
 
@@ -4481,6 +4484,14 @@ known and deliberately unfixed, and that over-prediction is what made these
 bets look good. A fix there would make this limit redundant. Until then it is
 load-bearing, and `factorize_fallback_max_loss=0` restores D41's unconditional
 rule for anyone who wants to measure without it.
+
+**`218_15` is left, and it is a different fault.** It never reaches the
+override: its sampled estimate fires on its own, predicting 64.5s for us
+against 99.4s for DuckDB, and DuckDB takes 17.8s. Our own side was close
+(54.7s measured); DuckDB's was over by 5.6x. No limit on second opinions can
+reach a first opinion, and the over-prediction behind it is the watdiv one
+F18 and D45 both record as known and deliberately unfixed. It is the clearest
+remaining case for doing that work.
 
 One thing the fire counts hide: 9 of the 22 override fires on the measured
 corpus are queries neither engine answers inside 60s, so they are neither

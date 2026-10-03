@@ -261,9 +261,14 @@ and 2 slower**, the 83 answered in a median of 0.31s against a stock plan that h
 not finished in sixty. Every one of the 83 is in that band; below it nothing
 is rescued at all. No query in this corpus is made unanswerable: the two the
 60s cap records as lost both finish when it is raised to 300s, 8.1x and 3.1x
-slower than stock (D62) — and D63 removes both, by not letting the gate's
-second opinion overrule a first one that predicted a 393x and 5025x loss.
-They now run in 7.6s and 12.1s, against stock's 7.6s and 11.9s.
+slower than stock (D62). D63 removes the 8.1x one, `watdiv_acyclic_217_10`,
+along with the worst of the merely-slower, by not letting the gate's second
+opinion overrule a first one predicting a 393x or 5025x loss; both now track
+the stock plan to within a fifth of a second. The 3.1x one,
+`watdiv_acyclic_218_15`, is untouched and stays open: it never consults a
+second opinion, because its own estimate fires unaided on a prediction that
+DuckDB needs 99.4s where DuckDB needs 17.8s — the watdiv over-prediction
+F18 and D45 record as known.
 
 Below 1e10 it stops being a rescue and becomes a dataset-specific trade: hetio's
 1e9–1e10 band is 16 faster and 0 slower, watdiv and yago's is 10 and 10 and
