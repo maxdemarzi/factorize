@@ -4565,3 +4565,97 @@ was the harder half.
 database does not have; 91 of the 481 queries. Nothing here speaks for them,
 and watdiv is the standing warning against assuming a dataset behaves like the
 ones beside it.
+
+## D65 -- The gate's two errors cancel, and the coefficient is load-bearing
+
+D63 left `watdiv_acyclic_218_15` as the clearest case for fixing the watdiv
+over-prediction F18 and D45 record. Taking that on produced a negative result
+worth more than the fix would have been.
+
+**Start with what 218_15 actually gets wrong.** Its cardinality estimate is
+close -- 2.49e10 predicted against 1.78e10 real, 1.4x high. Its *time* estimate
+is not: 99.4s predicted for DuckDB, 17.8s measured. So the error is mostly in
+`duckdb.per_output_ms`, not in the join estimate, which is not where F18 or D45
+pointed.
+
+**Measured across every query both engines answered, the coefficient is wrong
+in the direction the file says it must never be.** cost.hpp states the rule
+itself: "A gate must be pessimistic about the engine it is choosing and
+optimistic about the one it is rejecting, or its errors all point at
+regressions." Dividing each measured stock time by the true result size gives
+what DuckDB actually costs per tuple:
+
+    dataset    n   implied ms/tuple   shipped 3.981e-6 is
+    watdiv    24          1.621e-06   2.4x too high
+    hetio     51          2.766e-06   1.4x too high
+    yago       3          5.003e-05   12.6x too low (n=3)
+    all       78          2.623e-06   1.5x too high
+
+The shipped value over-predicts DuckDB on 62 of 78 queries. It sits at the p75
+of the distribution when the stated rule puts it at p25.
+
+**And correcting it is a clear loss.** p25 is 1.375e-6. Simulated over every
+costed query, that stops 6 of the 35 runnable fires and 21 excluded ones, and
+the 21 are:
+
+    rescued 5    faster 6    slower 1    neither 9
+
+Five rescues given up -- `hetio_acyclic_225_05` at 0.044s, `226_08` at 0.125s,
+`216_01` at 0.239s, all against a stock plan that does not finish in sixty
+seconds -- to avoid one slowdown. Rejected.
+
+**Why a more accurate coefficient makes the gate worse.** Because the decision
+is a ratio, and both sides are wrong in the same direction. On the 57 queries
+both engines answered in over 50ms:
+
+    ours_ms     actual / predicted   0.20x   we over-predict our own cost 5x
+    duckdb_ms   actual / predicted   3.43x   we under-predict DuckDB's 3.4x
+
+    predicted speedup, geomean   0.83x
+    actual speedup,    geomean   9.37x
+
+The over-prediction of our own side is deliberate. The under-prediction of
+DuckDB's is not: `duckdb_ms` is the per-tuple coefficient times the *estimated*
+flat result, and that estimate is low -- geomean 0.08x of truth on the measured
+excluded corpus and 0.01x on the held-out one. The coefficient being 1.5x high
+is partly cancelling a cardinality estimate that is 12x to 100x low. Fix the
+coefficient alone and nothing offsets the cardinality any more, so `duckdb_ms`
+falls further below the truth and the gate declines queries it should take.
+
+This is the same shape as D45, where the tail's max-carrying bug was cancelling
+the containment assumption, and the fix for one alone admitted a query that ran
+133x slower. Two compensating errors, and the compensation is doing real work.
+F18 said the containment fix "belongs with the fix for the over-prediction on
+the runnable corpus, not before it"; this generalises that -- none of these
+three may move alone.
+
+**The calibration gap does not translate into "fire more", and I checked
+rather than assuming.** The gate under-predicts its own advantage by 11x, which
+reads like a gate that declines too much. So every query it declines on the
+excluded corpus -- 84 of the 390 -- was run again under `force`:
+
+    would be rescued (stock caps, firing answers)   15
+    would be worse (slower, or caps when stock did not)   19
+    faster or equal                                  4
+    neither finishes                                46
+
+Firing all 84 buys 15 answers that do not otherwise exist and costs at least
+528s across 19 queries, counting each cap as 60s, which under-states it. That
+is a trade, not a free win, and it is roughly the trade the gate is there to
+make. The conservatism is miscalibrated and still close to right on outcomes,
+because the queries whose estimates are worst are also the ones where firing
+goes worst -- the error and the danger sit on the same queries.
+
+What that leaves is a narrower and more honest claim than the 11x alone
+suggests: the gate's odds are badly calibrated, its decisions are not badly
+wrong, and no single-term fix improves them. D64 measured every slowdown in the
+excluded corpus at 29.5s against +1168.8s gained; the 15 forgone rescues are
+the larger remaining cost, and separating them from the 19 needs a better
+cardinality estimate rather than a better constant.
+
+**What this does not settle.** The yago column is three queries and says the
+coefficient is 12.6x too *low* there, which is the opposite sign to watdiv's
+and hetio's. A single per-tuple constant across datasets whose true values span
+30x is the thing actually being measured here, and O11 already says these
+coefficients do not transfer between machines. They do not transfer between
+datasets either.

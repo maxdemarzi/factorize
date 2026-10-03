@@ -288,7 +288,14 @@ database does not have.
 Also worth knowing before trusting any number here:
 
 - **O11** — the cost model's coefficients are fitted on one machine and do not
-  transfer. `scripts/calibrate-synthetic.py` re-fits them against shapes it
+  transfer between machines, and D65 measures that they do not transfer between
+  *datasets* either: DuckDB's true cost per result tuple is 1.6e-6 ms on watdiv,
+  2.8e-6 on hetio and 5.0e-5 on yago, against one shipped constant of 4.0e-6.
+  Correcting it is a measured loss — the constant is 1.5x high and is partly
+  cancelling a cardinality estimate that is 12x to 100x low, so fixing either
+  alone makes the gate worse. D65 also found the gate under-predicts its own
+  advantage by 11x, and that firing on all 84 queries it declines would buy 15
+  answers and cost at least 528s. `scripts/calibrate-synthetic.py` re-fits them against shapes it
   generates itself, and it has now been run rather than only offered (D59): its
   fit decides *better* on the runnable corpus (9.11s against 9.77s modelled,
   2 wrong fires against 7) and *worse* on the queries whose outcome is known
