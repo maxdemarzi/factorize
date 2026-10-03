@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 D=${BIN:-build/release/duckdb}; DB=${DB:-/tmp/factorize-duckdb/ce.db}; Q="'"
 OUT=${OUT:-tmp/predicted.csv}
 LIST=${LIST:-tmp/ce_runnable_sql.psv}
-echo "query,pred_records,pred_flat" > "$OUT"
+echo "query,pred_records,pred_flat,pred_ours_ms,pred_duckdb_ms,fired" > "$OUT"
 while IFS='|' read -r name expected q; do
   [ -n "$name" ] || continue
   q=$(echo "$q" | tr -d '\r')
@@ -27,7 +27,15 @@ while IFS='|' read -r name expected q; do
   [ -n "$line" ] || { echo "$name: gate printed nothing (declined before costing)" >&2; continue; }
   recs=$(echo "$line" | grep -o '[0-9.e+-]* recs' | awk '{s += $1} END {printf "%.6g", s}')
   flat=$(echo "$line" | grep -o 'flat [0-9.e+-]*' | awk '{print $2}')
-  echo "${name},${recs:-},${flat:-}" >> "$OUT"
-  printf '%-28s predicted recs %-12s flat %s\n' "$name" "${recs:-?}" "${flat:-?}"
+  # The two predicted times, which are what the gate actually compares.
+  # Added in D62: before it, a fired query printed its sizes and kept the
+  # reasoning behind the decision to itself.
+  ours=$(echo "$line" | grep -o 'ours [0-9.]*ms' | tr -dc '0-9.')
+  ddb=$(echo "$line" | grep -o 'duckdb [0-9.]*ms' | tr -dc '0-9.')
+  fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" |
+          timeout 300 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+  echo "${name},${recs:-},${flat:-},${ours:-},${ddb:-},${fired}" >> "$OUT"
+  printf '%-26s recs %-11s flat %-11s ours %-9s duckdb %-9s fired=%s\n' \
+         "$name" "${recs:-?}" "${flat:-?}" "${ours:-?}" "${ddb:-?}" "$fired"
 done < "$LIST"
 echo "=== $(($(wc -l < "$OUT") - 1)) queries written to $OUT"

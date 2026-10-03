@@ -4266,6 +4266,15 @@ against what.
 The two lost are `217_10` (stock 6.2s) and `218_15` (stock 17.7s), both of which
 D47 also measured and both of which stock has always answered.
 
+**"Lost" overstates it, and D62's follow-up says by how much.** Run to a 300s
+cap instead of 60s, both finish: `217_10` in 120.0s against stock's 14.7s, and
+`218_15` in 54.7s against 17.8s. So nothing in this corpus is made
+*unanswerable* -- two queries are made 8.1x and 3.1x slower, far enough past a
+60s cap that a classifier reports them as gone. `218_15` at 54.7s is inside the
+cap and was recorded outside it, which is the single-run noise again: it sits on
+the boundary and one run decided it. Read the "lost" column as "slower than the
+cap can see", and the honest headline is that no answer disappears.
+
 **Two harness defects, both found here, both flattering us.**
 
 1. `excluded-verdict.py` looked the baseline's time up by the fixed name

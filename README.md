@@ -255,10 +255,12 @@ removing 344 of 360 hetio queries. The live corpus is, by construction, the
 regime a flat engine already handles. [DECISIONS](DECISIONS.md) D15 repoints the
 project there, and D60 and D61 measure it: 171 queries across every dataset this
 database holds, both engines capped at 60s. **Above 1e10 expected tuples — 128
-of them — 83 answers exist that stock does not produce, against 1 lost and 2
-slower**, the 83 answered in a median of 0.31s against a stock plan that has
+of them — 83 answers exist that stock does not produce, against 1 past the cap
+and 2 slower**, the 83 answered in a median of 0.31s against a stock plan that has
 not finished in sixty. Every one of the 83 is in that band; below it nothing
-is rescued at all.
+is rescued at all. No query in this corpus is made unanswerable: the two the
+60s cap records as lost both finish when it is raised to 300s, 8.1x and 3.1x
+slower than stock (D62).
 
 Below 1e10 it stops being a rescue and becomes a dataset-specific trade: hetio's
 1e9–1e10 band is 16 faster and 0 slower, watdiv and yago's is 10 and 10 and

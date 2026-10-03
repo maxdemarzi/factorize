@@ -1207,7 +1207,14 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 			line += StringUtil::Format("[%llu: %.4g recs] ", static_cast<uint64_t>(plan.steps[i].relation),
 			                           estimate.step_records[i]);
 		}
-		line += StringUtil::Format("flat %.4g bytes %.4g", estimate.flat_tuples, estimate.bytes);
+		// The two times as well, because they are what the decision is actually
+		// made of: everything else on this line is an input to them. Without
+		// them a fired query prints its sizes and keeps its reasoning private,
+		// so "why did this fire" can only be answered by rebuilding with a
+		// printf -- which is how D62 came to diagnose a collapse from `flat 0`
+		// and a bytes figure alone.
+		line += StringUtil::Format("flat %.4g bytes %.4g ours %.1fms duckdb %.1fms", estimate.flat_tuples,
+		                           estimate.bytes, estimate.ours_ms, estimate.duckdb_ms);
 		Printer::Print(line);
 	}
 	if (estimate.fire || !stats.UsingSample()) {
