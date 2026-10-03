@@ -4385,7 +4385,9 @@ what that costs:
     3.0         119              31          declines
 
 Four of the 35 runnable fires and 11 excluded ones to catch one query. The
-margin is the wrong instrument and this stays open.
+margin is the wrong instrument and this stays open. **D63 closes it with a
+different one**: not how big a win the gate must predict, but how big a loss
+it may be talked out of.
 
 D61's watdiv table predates this and should be read with it: `210_17` was one
 of its 9 slower, so that column is 8 now, and the 43.0s by which watdiv's other
@@ -4407,3 +4409,82 @@ basis for a bet". It declined the three-relation chain in
 the fallback *because* its sampled estimate collapses. The SQL suite caught it
 on the first run. A collapse says this estimator has nothing to offer, not that
 the query is hopeless, and those are different sentences.
+
+## D63 -- A second opinion may overrule a close call, not a rout
+
+D62 shipped two guards and left the corpus's two worst outcomes standing:
+`watdiv_acyclic_217_10` and `217_05`, which D61 recorded as lost and which are
+really 8.1x and 3.1x slower than the stock plan they replace. Making the gate
+print its own two predicted times -- it printed sizes before, and kept the
+arithmetic that decides private -- showed in one line what was wrong with them.
+
+    query                   sample said ours   sample said duckdb
+    watdiv_acyclic_217_10            45247ms                115ms
+    watdiv_acyclic_217_05            55782ms                 11ms
+
+Both fired. The sampled estimator predicted we would lose by 393x and 5025x,
+and D41's or-rule -- consult the catalog when the sample declines, fire if
+either says yes -- overruled it on both.
+
+**The or-rule's premise is sound and its scope was not.** It exists because a
+sample that misses a join under-predicts DuckDB's work, so a declining estimate
+is the likelier mistake. That holds while two estimates are arguing. It stops
+holding when the first is not arguing but shouting: an estimate that says
+"55 seconds against 11 milliseconds" is not a close call the second opinion
+gets to settle.
+
+So the catalog no longer gets a vote when the sample predicts a loss larger
+than `factorize_fallback_max_loss`. The gap this sits in is wide, and it is the
+measurement rather than the argument that chose the number. Across every fire
+that reaches the override:
+
+    predicted loss   outcome
+         0.7 - 25.6  every rescue and every query we ran faster
+                76   the three-chain in factorized_optimizer.test (148ms -> 6ms)
+         392 - 5025  every query firing made worse
+
+173 is the geometric centre of 76 and 392. 150 is the round number inside it,
+more than 2x clear on both sides.
+
+**Held out, not only fitted.** This project has shipped criteria that separated
+the sample they were drawn from and nothing else -- D52's race became D56's rate
+floor, which did not reproduce, and the entry calls it the tenth in a row. So
+the number was chosen on the 171 measured queries and then checked against
+hetio's other 219, costed for this and never used to pick it: 9 of their 180
+fires come through the override, and the largest predicted loss among them is
+3x. The limit declines none of them.
+
+**What it changes, in full:**
+
+    corpus                      fires before   after
+    excluded, measured (171)         130        126
+    runnable (119)                    35         35
+    hetio held out (219)             180        180
+
+Four decisions in 390 queries, and the two that matter:
+
+    query                   stock     before    after
+    watdiv_acyclic_217_05   11.9s     29.1s     12.1s
+    watdiv_acyclic_217_10    7.6s    120.0s      7.6s
+    watdiv_acyclic_217_15   80.1s     79.0s     79.0s   (neither finishes under 60s)
+    hetio_acyclic_211_05    >300s     >300s     >300s   (neither finishes at all)
+
+Both losses now track the plan they would have replaced, which is what
+declining is supposed to look like. Nothing is given up: no rescue, no query
+run faster, and the runnable corpus does not notice.
+
+**What this does not claim.** The limit is empirical, like the 1.5x margin and
+the 5ms floor beside it. It is a bound on how far the gate may be talked out of
+its own best estimate, not a fix for the thing underneath -- the catalog-only
+textbook estimator over-predicts watdiv joins, which F18 and D45 both record as
+known and deliberately unfixed, and that over-prediction is what made these
+bets look good. A fix there would make this limit redundant. Until then it is
+load-bearing, and `factorize_fallback_max_loss=0` restores D41's unconditional
+rule for anyone who wants to measure without it.
+
+One thing the fire counts hide: 9 of the 22 override fires on the measured
+corpus are queries neither engine answers inside 60s, so they are neither
+evidence for the override nor against it. D56 timed three of them to 129s, 121s
+and 59s, which at a longer cap would make them rescues. The override's measured
+value -- 5 rescued, 6 faster, 1 slower -- is a floor, and the case for keeping
+it is stronger than the 60s cap can show.

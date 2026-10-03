@@ -90,6 +90,7 @@ the same as a switch that does not exist, not because they are recommended.
 | `factorize_min_compression` | `0` (off) | abandon to the stock plan when a materialized join is not compressing (D37, D51) |
 | `factorize_min_rate` | `0` (off) | abandon when the last materialized join is delivering fewer than this many tuples/ms (D56) |
 | `factorize_min_gain` | `1.5` | how much faster the gate must predict this engine to be before firing |
+| `factorize_fallback_max_loss` | `150` | how badly the sampled estimate may predict a loss before the catalog's second opinion stops being allowed to overrule it; `0` restores the unconditional rule |
 | `factorize_gate_sample_rows` | `16384` | rows sampled per join column for the MCV list; `factorize_gate_exact_stats` scans instead |
 
 ### Beyond counting
@@ -260,7 +261,9 @@ and 2 slower**, the 83 answered in a median of 0.31s against a stock plan that h
 not finished in sixty. Every one of the 83 is in that band; below it nothing
 is rescued at all. No query in this corpus is made unanswerable: the two the
 60s cap records as lost both finish when it is raised to 300s, 8.1x and 3.1x
-slower than stock (D62).
+slower than stock (D62) — and D63 removes both, by not letting the gate's
+second opinion overrule a first one that predicted a 393x and 5025x loss.
+They now run in 7.6s and 12.1s, against stock's 7.6s and 11.9s.
 
 Below 1e10 it stops being a rescue and becomes a dataset-specific trade: hetio's
 1e9–1e10 band is 16 faster and 0 slower, watdiv and yago's is 10 and 10 and

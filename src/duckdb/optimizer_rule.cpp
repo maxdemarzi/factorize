@@ -1234,6 +1234,37 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// and cost 7 fires out of 248 on the corpus it cannot -- queries where a
 	// decline means 180 seconds instead of one. Consulting both keeps all 249
 	// (D41).
+	// A second opinion overrules a close call, not a rout.
+	//
+	// The or-rule's premise is that a declining estimate is the likelier
+	// mistake, which holds while the two estimates are arguing. It stops
+	// holding when the first one is not arguing but shouting: measured on the
+	// 171, the sample put our time at 45s against DuckDB's 115ms on
+	// `watdiv_acyclic_217_10` and at 55.8s against 11ms on `217_05`, and was
+	// overruled on both. Those are the two worst outcomes in the corpus.
+	//
+	// The limit is empirical and the gap it sits in is wide. Across every
+	// override fire measured, each one that turned out well -- rescued, faster,
+	// or the three-chain in factorized_optimizer.test -- predicted a loss of at
+	// most 76x, and each one that turned out badly predicted at least 392x.
+	// 173 is the geometric centre of that gap; 150 is the round number inside
+	// it, better than 2x clear of the nearest case on either side.
+	//
+	// Held out rather than only fitted, because this project has shipped
+	// criteria that separated the sample they were drawn from and nothing else
+	// (D52, D56). On hetio's other 219 excluded queries -- costed but never
+	// used to choose this number -- 9 fires come through the override and the
+	// largest predicted loss among them is 3x, so the limit declines none of
+	// them. It changes 4 decisions in 390 queries: two queries neither engine
+	// answers, and the two above (D63).
+	const double max_loss = DoubleSetting(context, "factorize_fallback_max_loss", 150.0);
+	if (max_loss > 0 && estimate.duckdb_ms > 0 && estimate.ours_ms > max_loss * estimate.duckdb_ms) {
+		reason = StringUtil::Format(
+		    "declined without a second opinion: predicted %.1fms against DuckDB's %.1fms, a %.0fx loss, "
+		    "past the %.0fx beyond which the catalog does not get to overrule the sample",
+		    estimate.ours_ms, estimate.duckdb_ms, estimate.ours_ms / estimate.duckdb_ms, max_loss);
+		return false;
+	}
 	stats.UseCatalogOnly();
 	const auto fallback = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	if (!fallback.fire) {
@@ -1449,6 +1480,14 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// The margin, not a compression ratio: speedup is compression times a
 	// per-record factor that spans 84x across datasets, so no threshold on
 	// compression alone is right for all of them (DECISIONS D14).
+	// How badly the sampled estimate may predict we lose before the catalog
+	// stops being allowed to overrule it. 0 disables the limit, restoring the
+	// unconditional or-rule of D41. See D63 for the gap this sits in and the
+	// held-out check.
+	config.AddExtensionOption("factorize_fallback_max_loss",
+	                          "Ignore the catalog's second opinion when the sampled estimate predicts we lose "
+	                          "by more than this factor",
+	                          LogicalType::DOUBLE, Value::DOUBLE(150.0));
 	config.AddExtensionOption("factorize_min_gain",
 	                          "Fire only when factorizing is predicted to beat the stock plan by this factor",
 	                          LogicalType::DOUBLE, Value::DOUBLE(1.5));
