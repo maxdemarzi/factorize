@@ -1213,7 +1213,6 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	if (estimate.fire || !stats.UsingSample()) {
 		return estimate.fire;
 	}
-
 	// The sample said no. Ask the catalog too, and fire if either says yes.
 	//
 	// Not symmetry for its own sake -- this is the one direction the estimator's
@@ -1230,12 +1229,59 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// (D41).
 	stats.UseCatalogOnly();
 	const auto fallback = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
-	if (fallback.fire) {
-		reason = fallback.reason;
-		predicted_bytes = fallback.bytes;
-		return true;
+	if (!fallback.fire) {
+		return false;
 	}
-	return false;
+	// The or-rule applies to DuckDB's side of the bet, not to ours.
+	//
+	// What the catalog adds is a second reading of the flat result, and that is
+	// the quantity the argument above is about: a sample that misses a join
+	// under-predicts DuckDB's work and argues wrongly against firing. Our own
+	// cost is not that quantity. It is driven by the records standing in the
+	// f-representation, and there the sample is the better witness by
+	// construction -- it has the MCV lists, so it sees the skew that decides how
+	// many records a class instantiates, and the catalog has only counts.
+	//
+	// This one is a guard and not a measured win, which is worth saying rather
+	// than leaving to be discovered: across both corpora -- 171 excluded
+	// queries and 119 runnable ones -- it changes no decision at all (132 and
+	// 35 fires before and after). It is here because the asymmetry is real and
+	// the cost of being wrong about our own side is the whole of what the
+	// losses in D62 are made of, not because a query was measured to need it.
+	//
+	// The second opinion also has to be decisive, not merely favourable, and
+	// that half does carry its weight. The margin exists to absorb ordinary
+	// estimate noise on an estimator that is being believed; this path is
+	// reached only because the first estimator said no, so firing here means
+	// preferring whichever reading came out optimistic. A tie-break that
+	// barely clears the bar is not a tie-break. Squaring it is the same
+	// statement made twice, once for each estimate being trusted.
+	//
+	// Measured, squaring declines exactly two of the 171 and none of the 119.
+	// `watdiv_acyclic_210_17` is the one that matters: it took 16.3s against a
+	// stock plan's 1.78s, and now declines and runs in 1.79s.
+	// `hetio_acyclic_210_00` neither finishes nor is expected to, either way.
+	// The three-chain in factorized_optimizer.test reaches this path and
+	// clears the squared margin comfortably, which is the shape of the fires
+	// D41 added it to recover -- "180 seconds instead of one", not close calls.
+	//
+	// What it does not catch is `watdiv_acyclic_217_05`, which clears even the
+	// squared margin and still loses (29.1s against stock's 11.6s). Declining
+	// that one needs the margin at 3.0, which costs 4 of the 35 runnable fires
+	// and 11 of the excluded -- so the margin is the wrong instrument for it
+	// and D62 leaves it open rather than paying that.
+	const double ours_ms = std::max(fallback.ours_ms, estimate.ours_ms);
+	const double fallback_margin = thresholds.margin * thresholds.margin;
+	if (fallback.duckdb_ms < fallback_margin * ours_ms) {
+		reason = StringUtil::Format(
+		    "predicted %.1fms against DuckDB's %.1fms once our own cost is taken from whichever estimate "
+		    "reads it higher, under the %.3gx a second opinion has to clear",
+		    ours_ms, fallback.duckdb_ms, fallback_margin);
+		return false;
+	}
+	reason = fallback.reason;
+	predicted_bytes = fallback.bytes;
+	return true;
 }
 
 //===--------------------------------------------------------------------===//

@@ -109,6 +109,12 @@ struct CostEstimate {
 	bool acyclic = true;
 	//! Set when the gate says to factorize.
 	bool fire = false;
+	//! Set when the estimator produced no usable number rather than a small
+	//! one: a flat result of zero tuples. Distinct from `!fire`, because a
+	//! decline that knows what it is declining can be overruled by a second
+	//! opinion and a collapse cannot -- see the gate's catalog fallback (D41)
+	//! and D62.
+	bool collapsed = false;
 	//! Human-readable reason, for EXPLAIN and for diagnosing a decline.
 	std::string reason;
 };

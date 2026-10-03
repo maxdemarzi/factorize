@@ -262,7 +262,9 @@ is rescued at all.
 
 Below 1e10 it stops being a rescue and becomes a dataset-specific trade: hetio's
 1e9–1e10 band is 16 faster and 0 slower, watdiv and yago's is 10 and 10 and
-loses 46.6s on balance. So "the excluded regime" was never one regime, which is
+loses 46.6s on balance — 32.0s of it after D62, which found the gate firing on
+estimates that had collapsed to zero predicted tuples and tightened what a
+second opinion has to clear. So "the excluded regime" was never one regime, which is
 why D42 measured it as a free win and D47 measured it as three wins and six
 losses — 109 of hetio's 125 queries sit above 1e10, and 19 of watdiv and yago's
 46 do. Neither had a corpus; both had a dataset. hetio's other 219 queries and

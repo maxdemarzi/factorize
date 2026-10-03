@@ -4251,7 +4251,8 @@ in the >=1e10 band, against 19 of watdiv and yago's 46.** Each of them
 sampled a different regime and described it as the regime.
 
 **The query D54 was written about, measured against stock for the first time.**
-`watdiv_acyclic_217_05`: stock 11.7s, ours 55.8s. Its recorded history --
+`watdiv_acyclic_217_05`: stock 11.7s, ours 55.8s (D62 remeasures this properly as 11.6s against
+29.1s -- the harness here runs each query once). Its recorded history --
 279.4s, then 113.5s, then 34.9s against a serial 61.2s -- compares us only to
 ourselves, and D47 had stock at 13.3s on the same query all along. Those numbers
 came off a different harness than this one, so they do not chain into a ratio
@@ -4307,3 +4308,93 @@ banding uses -- it knows its own estimate -- so "decline below 1e10" is not
 something that can simply be implemented from this table. What it would take is
 checking whether the *estimate* separates the same way, which is O12's question
 asked against a corpus that can now answer it.
+
+## D62 -- The gate fires on a collapsed estimate, and a tie-break that barely ties
+
+D61 left 16 queries where firing costs us. Asking the gate what it predicted
+for each turns up something worse than a bad estimate: on 7 of the 171 it
+predicts **zero flat tuples**, one of them for a query returning 4.8 billion
+rows. All 7 are watdiv; 4 of them are losses.
+
+Zero is reachable and is not a near miss. `Frequency` hands back
+`TailRows() / TailDistinct()` for a value the MCV list does not name, and
+`TailRows()` is zero whenever the list covers every row of a column -- the
+counts are scaled from a sample, so they can sum past the row count. A value
+held by one relation and not named by another then takes a frequency of zero
+from the second, the per-value product goes to zero, an empty tail adds
+nothing, and `flat = flat * partners` carries the zero through every remaining
+edge. `factorize_gate_exact_stats=true` gives the same zero, so this is the
+estimator and not the sample size.
+
+Three things followed from that zero, and all three are now fixed:
+
+**1. The decline said the wrong thing.** Zero flat tuples is zero predicted
+output work for DuckDB, so the query fell through to the "too small to be worth
+it" floor -- a sentence about a query returning billions of rows. A collapse now
+says so in its own words, and carries a `collapsed` flag so the gate can tell
+the two apart.
+
+**2. The or-rule applied to the wrong term.** D41 consults the catalog when the
+sample declines, and fires if either says yes, because a sample that misses a
+join under-predicts DuckDB's work and so argues wrongly against firing. That
+argument is about DuckDB's side. Our own cost comes from the records standing
+in the f-representation, where the sample is the better witness by construction
+-- it has the MCV lists and the catalog has only counts. The fallback now takes
+whichever estimate reads our own cost *higher*.
+
+This one is a guard, not a win, and the measurement says so plainly: 132 fires
+before and 132 after on the excluded corpus, 35 and 35 on the runnable one. It
+changes no decision anywhere. Kept because the asymmetry is real and
+under-reading our own side is what every loss here is made of -- but recorded
+as unproven rather than credited.
+
+**3. A second opinion was allowed to be a close call.** This path is reached
+only because the first estimator said no, so firing means preferring whichever
+reading came out optimistic. The margin exists to absorb noise on an estimator
+being believed; a tie-break that barely clears it is not a tie-break. The
+fallback now has to clear `margin * margin`.
+
+    corpus      fires before   after   runnable fires
+    excluded         132        130      35 -> 35
+
+Two queries, and one of them is the point: `watdiv_acyclic_210_17` took 16.3s
+against a stock plan's 1.78s and now declines and runs in 1.79s.
+`hetio_acyclic_210_00` neither finishes nor was expected to, either way. The
+runnable corpus is untouched -- 35 fires before and after, and 9.51s end to end
+against the 12.95s on record, which is machine state and not this change.
+
+**What this does not fix, and why not.** `watdiv_acyclic_217_05` -- D54's query,
+and D61's example of us losing to stock -- clears even the squared margin and
+still loses. Declining it needs `factorize_min_gain` at 3.0, and the sweep says
+what that costs:
+
+    gain   excluded fires   runnable fires   217_05
+    1.5         130              35          fires
+    1.8         127              33          fires
+    2.2         125              32          fires
+    2.6         121              31          fires
+    3.0         119              31          declines
+
+Four of the 35 runnable fires and 11 excluded ones to catch one query. The
+margin is the wrong instrument and this stays open.
+
+D61's watdiv table predates this and should be read with it: `210_17` was one
+of its 9 slower, so that column is 8 now, and the 43.0s by which watdiv's other
+22 trailed stock is 28.4s. The bands are unchanged -- `210_17` is a 1.1e9 query,
+in the 1e9-1e10 band that D61 already called a dataset-specific trade.
+
+**And D61 overstated that query.** It reports `217_05` at "stock 11.7s, ours
+55.8s", from `measure-excluded-baseline.sh`, which runs each query once with no
+warm-up because it was built to classify rather than to time. Under the
+project's standard -- a discarded warm-up then two runs, the faster kept -- it
+is 11.6s against 29.1s. Still a loss, 2.5x rather than 4.8x. Every "slower"
+margin in D60 and D61 carries that same single-run noise; the verdicts
+(rescued, lost, faster, slower) are robust to it and the magnitudes are not.
+
+The near-miss in this entry is worth keeping too. The first fix was to decline
+on any collapse, which is the obvious reading of "a zero estimate is not a
+basis for a bet". It declined the three-relation chain in
+`factorized_optimizer.test` -- a measured 148ms-against-6ms win, which reaches
+the fallback *because* its sampled estimate collapses. The SQL suite caught it
+on the first run. A collapse says this estimator has nothing to offer, not that
+the query is hopeless, and those are different sentences.

@@ -281,6 +281,39 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		                  Millis(thresholds.memory_slack) + "x";
 		return estimate;
 	}
+	// Zero flat tuples is not an estimate of a small join. It is the estimator
+	// having collapsed, and it has to be said out loud rather than flowing on
+	// as a number.
+	//
+	// `Frequency` returns `TailRows() / TailDistinct()` for a value it did not
+	// store, and `TailRows()` is zero whenever the MCV list covers every row of
+	// a column -- so a head value held by one relation and not another gets a
+	// frequency of zero from the other, the per-value product goes to zero, and
+	// with an empty tail as well the whole class comes out at zero flat tuples.
+	// `flat = flat * partners` then carries that zero through every remaining
+	// edge. Measured on watdiv, this happens to 7 of the 171 excluded queries,
+	// one of which returns 4.8 billion rows (D62).
+	//
+	// Declining *here* is right whichever way it came about: if the join really
+	// is empty there is nothing to win, and if the estimate collapsed there is
+	// nothing to bet on. It does not follow that the query should not fire at
+	// all, and an earlier version of this made exactly that mistake -- the gate
+	// refused to consult its second opinion on a collapse, which declined the
+	// three-chain in factorized_optimizer.test, a measured 148ms-against-6ms
+	// win that reaches the fallback precisely because its sampled estimate
+	// collapses. A collapse says this estimator has nothing to offer, not that
+	// the query is hopeless.
+	//
+	// What it replaces is a decline that said the wrong thing: zero flat tuples
+	// means zero predicted output work for DuckDB, so the query used to fall
+	// through to the floor below and decline as "too small to be worth it" --
+	// a sentence about a query returning billions of rows.
+	if (!(estimate.flat_tuples > 0)) {
+		estimate.collapsed = true;
+		estimate.reason = "no usable estimate: the predicted flat result is empty, which for a join this "
+		                  "size means the estimator collapsed rather than that the answer is zero";
+		return estimate;
+	}
 	// Before the margin, because a query too small to matter is not a query we
 	// lost a bet on -- and because the margin alone would fire on it, cleared by
 	// a startup constant rather than by anything about the query.

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace factorize;
@@ -423,6 +424,58 @@ static void TestEmptyMcvDegradesToTextbook() {
 	Check(size.records > 0, "records must be positive");
 }
 
+//! A flat estimate of zero is the estimator collapsing, not a small join, and
+//! the gate has to be able to tell the difference.
+//!
+//! The shape that produces it: MCV frequencies are scaled up from a sample, so
+//! they can sum to more than the relation's row count. `TailRows()` clamps at
+//! zero, `Frequency` hands back `TailRows() / TailDistinct()` -- zero -- for
+//! every value the list does not name, and the column is thereby declared to
+//! contain none of the values its own `distinct` says it has. One such column
+//! in a class drives every per-value product to zero, the empty tail adds
+//! nothing, and `flat = flat * partners` carries the zero through every
+//! remaining edge of the query.
+//!
+//! Measured, this is 7 of the 171 excluded queries, including one returning 4.8
+//! billion rows that the gate costed as though DuckDB had no output to produce
+//! (D62).
+static void TestCollapsedEstimateIsNotASmallJoin() {
+	std::printf("a flat estimate of zero must declare itself a collapse, not a cheap query\n");
+	// Two relations on one key. Both over-covered: the MCV counts sum past
+	// `rows`, while `distinct` says 500 values exist that are not named.
+	std::vector<ColumnStats> group;
+	for (int i = 0; i < 2; i++) {
+		ColumnStats column;
+		column.rows = 1000;
+		column.distinct = 500;
+		// Disjoint heads, so no value is named by both.
+		column.mcv = {{i * 2 + 1, 600}, {i * 2 + 2, 500}};
+		Check(column.TailRows() == 0, "the over-covered head must leave no tail");
+		group.push_back(column);
+	}
+	const auto size = EstimateGroup(group);
+	Check(size.flat == 0, "this is the shape that collapses the estimate");
+
+	std::vector<CostStep> steps;
+	for (int i = 0; i < 2; i++) {
+		CostStep step;
+		step.key = group[i];
+		step.key_group = 0;
+		step.parent_step = i == 0 ? -1 : 0;
+		step.parent_key = group[0];
+		steps.push_back(step);
+	}
+	const auto estimate = EstimateCost(steps, true);
+	std::printf("  -> %s (%s)\n", estimate.fire ? "FIRE" : "decline", estimate.reason.c_str());
+	Check(!estimate.fire, "a collapsed estimate must not fire");
+	Check(estimate.collapsed, "and must say it collapsed, not that the query is too small");
+	// The distinction the gate acts on: a collapse is not a second opinion's to
+	// overrule. Before this, the decline read "too small to be worth it" about
+	// a query returning billions, and the catalog fallback duly overruled it.
+	Check(estimate.reason.find("too small") == std::string::npos,
+	      "a collapse must not be reported as a query too small to matter");
+}
+
 int main() {
 	TestUniformIsUnchanged();
 	TestSkewIsRecovered();
@@ -433,6 +486,7 @@ int main() {
 	TestMemoryBudget();
 	TestFusedLastJoinIsNotCharged();
 	TestEmptyMcvDegradesToTextbook();
+	TestCollapsedEstimateIsNotASmallJoin();
 	std::printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
 }
