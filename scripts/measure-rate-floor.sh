@@ -21,6 +21,11 @@
 #
 # No set -e: hitting the cap is the result for some of these.
 cd "$(dirname "$0")/.."
+# Clear any spill a previous capped run left behind, and again at the end:
+# `timeout` kills DuckDB before it cleans up after itself (scripts/clean-spill.sh).
+. "$(dirname "$0")/clean-spill.sh"
+CleanSpill
+trap CleanSpill EXIT
 D=${BIN:-build/release/duckdb}; DB=${DB:-/tmp/factorize-duckdb/ce.db}; Q="'"
 CAP=${CAP:-300}
 FLOOR=${FLOOR:-70000}

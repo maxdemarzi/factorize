@@ -12,6 +12,11 @@
 # Records are deterministic, so this is not a timing and needs no warm-up.
 # Query names are looked up in tmp/ce_runnable_sql.psv and tmp/excluded_all.psv.
 cd "$(dirname "$0")/.."
+# Clear any spill a previous capped run left behind, and again at the end:
+# `timeout` kills DuckDB before it cleans up after itself (scripts/clean-spill.sh).
+. "$(dirname "$0")/clean-spill.sh"
+CleanSpill
+trap CleanSpill EXIT
 D=${BIN:-build/release/duckdb}; DB=/tmp/factorize-duckdb/ce.db; Q="'"
 OUT=${OUT:-tmp/rec_steps.csv}
 echo "query,step,relation,predicted,measured" > "$OUT"
