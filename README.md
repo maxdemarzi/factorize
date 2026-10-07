@@ -90,6 +90,9 @@ the same as a switch that does not exist, not because they are recommended.
 | `factorize_min_compression` | `0` (off) | abandon to the stock plan when a materialized join is not compressing (D37, D51) |
 | `factorize_min_rate` | `0` (off) | abandon when the last materialized join is delivering fewer than this many tuples/ms (D56) |
 | `factorize_min_gain` | `1.5` | how much faster the gate must predict this engine to be before firing |
+| `factorize_containment_exponent` | `0` | discount a head value in a column that did not store it by that column's share of the class domain, raised to this power — instrumentation for D66, `0` is shipped behaviour |
+| `factorize_tail_min_domain` | `false` | carry `min(V_R, V_S)` as the surviving tail domain instead of `max` (the textbook rule, D45) — instrumentation for D66 |
+| `factorize_duckdb_per_tuple_ms` | `3.981e-6` | milliseconds the gate charges DuckDB per result tuple |
 | `factorize_fallback_max_loss` | `150` | how badly the sampled estimate may predict a loss before the catalog's second opinion stops being allowed to overrule it; `0` restores the unconditional rule |
 | `factorize_gate_sample_rows` | `16384` | rows sampled per join column for the MCV list; `factorize_gate_exact_stats` scans instead |
 
@@ -282,8 +285,8 @@ full 51 across three datasets are 45 faster against 6 slower and gain 433.8 s.
 That is the same error D61 convicted D42 and D47 of, in the entry convicting
 them, which is the most useful thing in this file.
 
-What is still unmeasured: dblp's 52 queries and job's 39, whose tables this
-database does not have.
+dblp's 52 queries are now loaded and run correctly (D66) but are not yet
+timed; job's 39 have no CSVs here and stay unmeasurable.
 
 Also worth knowing before trusting any number here:
 

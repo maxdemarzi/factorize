@@ -1190,6 +1190,16 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// Predicted not to fit is no longer a refusal -- ExecuteCountWithinMemory
 	// slices instead -- but it is still a reason to decline: every slice is
 	// another pass over the input, and the gate is a bet about time.
+	// The three terms D65 found to be wrong and mutually cancelling: the
+	// containment assumption (F18), the tail's max-carrying (D45) and DuckDB's
+	// per-tuple cost. Settings so they can be swept together, which is the only
+	// way to find out whether they cancel exactly; defaults are what ships.
+	thresholds.estimator.containment_exponent =
+	    DoubleSetting(context, "factorize_containment_exponent", thresholds.estimator.containment_exponent);
+	thresholds.estimator.tail_min_domain =
+	    BooleanSetting(context, "factorize_tail_min_domain") ? true : thresholds.estimator.tail_min_domain;
+	thresholds.duckdb.per_output_ms =
+	    DoubleSetting(context, "factorize_duckdb_per_tuple_ms", thresholds.duckdb.per_output_ms);
 	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
 	thresholds.memory_slack = DoubleSetting(context, "factorize_memory_slack", thresholds.memory_slack);
 	// The operator's IsPlainCount, restated: only then is the last join fused.
@@ -1484,6 +1494,20 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// stops being allowed to overrule it. 0 disables the limit, restoring the
 	// unconditional or-rule of D41. See D63 for the gap this sits in and the
 	// held-out check.
+	// D65's three interacting terms. Each default is the shipped value, so
+	// setting none of them changes nothing; see DECISIONS D65 for why none of
+	// them may be moved on its own.
+	config.AddExtensionOption("factorize_containment_exponent",
+	                          "Discount a head value in a column that did not store it by that column's share of "
+	                          "the class domain, raised to this power (0 = off, the shipped behaviour)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
+	config.AddExtensionOption("factorize_tail_min_domain",
+	                          "Carry min(V_R, V_S) forward as the surviving tail domain instead of max, which is "
+	                          "the textbook rule (D45)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("factorize_duckdb_per_tuple_ms",
+	                          "Milliseconds the gate charges DuckDB per result tuple",
+	                          LogicalType::DOUBLE, Value::DOUBLE(3.981e-6));
 	config.AddExtensionOption("factorize_fallback_max_loss",
 	                          "Ignore the catalog's second opinion when the sampled estimate predicts we lose "
 	                          "by more than this factor",

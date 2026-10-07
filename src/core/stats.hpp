@@ -58,6 +58,10 @@ struct ColumnStats {
 	//! it did not store, and pretending otherwise is what made the oracle
 	//! version of this estimator look better than it is (F14 corrected).
 	double Frequency(int64_t value) const;
+	//! Whether the MCV list names this value, i.e. whether `Frequency` is an
+	//! exact count rather than the tail average. The containment weighting
+	//! applies only to the latter.
+	bool Stored(int64_t value) const;
 };
 
 //! Both sizes of one join equivalence class, in one pass.
@@ -110,8 +114,33 @@ struct GroupSize {
 	double FlatFor(int64_t value) const;
 };
 
+//! The two known-wrong pieces of EstimateGroup, as knobs rather than constants.
+//!
+//! Both are recorded as deliberately unfixed -- the containment assumption in
+//! FINDINGS F18, the tail's max-carrying in D45 -- and D65 measured why: each
+//! one is partly cancelling the other, so fixing either alone makes the gate
+//! worse. Settings, not edits, because the only way to find out whether they
+//! cancel *exactly* is to sweep them together, and a rebuild per combination
+//! costs thirteen minutes.
+//!
+//! The defaults reproduce the shipped behaviour bit for bit.
+struct EstimatorOptions {
+	//! How much to discount a head value in a column that did not store it, by
+	//! the share of the class's domain that column covers. 0 is the shipped
+	//! behaviour: a value the column did not store is still counted as present
+	//! at the tail average, so a relation holding 1,659 of a 125,145-value
+	//! domain is credited with every head value in the class (F18's
+	//! watdiv_acyclic_212_15, which came out 84x high). 1 is full containment.
+	double containment_exponent = 0.0;
+	//! Carry min(V_R, V_S) forward as the surviving tail domain rather than
+	//! max. The textbook rule is min; max is what ships, which divides a narrow
+	//! relation following a wide one by the wide domain a second time and makes
+	//! a class's size depend on the order of its relations (D45).
+	bool tail_min_domain = false;
+};
+
 //! Estimates one equivalence class exactly over the union of the stored MCVs
 //! and uniformly over the tail.
-GroupSize EstimateGroup(const std::vector<ColumnStats> &group);
+GroupSize EstimateGroup(const std::vector<ColumnStats> &group, const EstimatorOptions &options = {});
 
 } // namespace factorize

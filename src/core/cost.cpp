@@ -135,7 +135,7 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	// cannot represent.
 	std::vector<GroupSize> sizes(group_columns.size());
 	for (size_t g = 0; g < group_columns.size(); g++) {
-		sizes[g] = EstimateGroup(group_columns[g]);
+		sizes[g] = EstimateGroup(group_columns[g], thresholds.estimator);
 	}
 
 	// Edges that cross classes, in plan order. Each is the single point where

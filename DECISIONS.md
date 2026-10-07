@@ -23,7 +23,7 @@ Per plan §0.4, every §0.2-class decision lands here.
 | # | Question | Owner | Blocking |
 |---|---|---|---|
 | O8 | **Is the flat baseline fair?** Every factorized-vs-flat ratio assumes the flat baseline is competent. If it is unusually slow, the ratio flatters factorization. Resolve by comparing the flat baseline against stock DuckDB at `threads=1` on the same queries and machine; a baseline more than ~2-3x off DuckDB would invalidate the headline ratio. | — | Phase 1.5 verdict |
-| O9 | `estimates.db` download has failed twice (curl 56, then 2). Section 0.6's oracle-vs-estimates control experiment is blocked until it lands. | — | Phase 6 report |
+| O9 | **RESOLVED (D66).** The download had failed a third time, silently: the file on disk was 847MB of a 5.94GB target, valid SQLite magic but truncated mid-page, which is why it read as "malformed" rather than as missing. Resumed with `curl -C -`; `pragma quick_check` passes and it holds 5,441,808 CE estimates. | — | — |
 | O1 | Email Lehner (`s.lehner@tum.de`) / Neumann (`neumann@in.tum.de`): how much of the speedup is codegen vs container design? Did they ever run a non-generated factorized path? | — | Nothing (informs Phase 1 expectations) |
 | O2 | Locate Kalumin & Deshpande's artifact — head start, baseline, and the concrete claim to beat (they cannot do bottom-inserts; FINDINGS.md F4 shows that puts them at 0.98x, i.e. no benefit). | — | Phase 6 comparison |
 | O3 | Upstream posture: community extension, private fork, or upstream PR? Changes whether to adapt DuckDB's `JoinHashTable` over a bespoke chaining HT. | — | Phase 1.3 |
@@ -4659,3 +4659,77 @@ and hetio's. A single per-tuple constant across datasets whose true values span
 30x is the thing actually being measured here, and O11 already says these
 coefficients do not transfer between machines. They do not transfer between
 datasets either.
+
+## D66 — The two deferred estimator fixes are worth 18% of a 12x-to-100x error
+
+D65 said the containment assumption (F18), the tail's max-carrying (D45) and
+DuckDB's per-tuple coefficient were wrong and mutually cancelling, and that
+none could move alone. The way to test that is to move them together, so all
+three are settings now — `factorize_containment_exponent`,
+`factorize_tail_min_domain`, `factorize_duckdb_per_tuple_ms`, every default the
+shipped value, verified by test_cost's randomised brute-force check reporting a
+worst error of 1.00x against the previous build.
+
+**First, the headroom is real.** Giving the gate the true result size and
+changing nothing else — the final flat count substituted into `duckdb_ms` —
+flips 55 of 390 decisions and is worth **+426.2s**. It fires on queries now
+declined that turn out to be rescues (`watdiv_211_03` 60s to 4.1s,
+`hetio_226_02` 60s to 10.0s) and it declines `watdiv_218_15`, the query open
+since D63. So a better flat estimate is worth having, which is what justified
+going on.
+
+**Then the sweep, and it is a flat no.** Both terms, both corpora, scored as
+geomean(predicted flat / true flat), where 1.00 is perfect:
+
+    tail   exp      171 excluded     219 held out     119 runnable   fires
+    max    0            0.083x           0.010x           7.661x     126/180/35   <- shipped
+    max    1.0          0.071x           0.005x           4.472x     126/180/35
+    min    0            0.097x           0.023x          17.542x     126/180/35
+    min    1.0          0.086x           0.020x          12.598x     126/180/35
+
+Each term does what it should. Containment pushes estimates down, which helps
+the runnable corpus (7.66x to 4.47x) and hurts the excluded one. The tail's min
+pushes them up, which helps the excluded corpus (0.083x to 0.097x) and sends
+runnable from 7.66x to 17.5x. They are opposites, which is the cancellation
+D65 inferred, now seen directly.
+
+**But the fire counts do not move. Not one decision, in any combination, on
+any of the 509 queries.** The reason is magnitude, and it is the whole entry:
+
+    tail=min         flat x1.175   records x1.000   decision ratio x1.174
+    containment=1    flat x0.859   records x0.999   decision ratio x0.861
+    both             flat x1.036   records x0.999   decision ratio x1.037
+
+The terms move the estimate by 17% up or 14% down. The error they are being
+asked to fix is 12x on the measured excluded corpus and 100x on the held-out
+one. Reaching 1.00x from 0.083x needs about 10x and these two offer 1.17x.
+
+**So F18 and D45 were right to defer them and wrong about why.** Both entries
+read as "this fix is correct but something else cancels it" — D45's phrasing is
+that the max "had been cancelling" the containment assumption. The measurement
+says something less interesting and more useful: they are both correct, they do
+cancel, and both are rounding errors on a number that is wrong by two orders of
+magnitude. Fixing a 14% term in a 100x error is not a fix that was blocked, it
+is a fix that was never going to register.
+
+**It also corrects D65's own explanation.** D65 argued the coefficient is
+load-bearing because `duckdb_ms` and `ours_ms` err together, so correcting one
+side breaks a balance. The sweep shows `records` does not move at all when
+these terms change (x1.000), so the two sides are not coupled through the
+estimator the way that entry implies. The coefficient result stands — p25 costs
+5 rescues, measured — but the mechanism offered for it does not, and the honest
+version is simpler: every one of these levers is too small to reach the error.
+
+**Where the error actually is.** Not in sampling: `factorize_gate_exact_stats`
+produces the same collapse to zero on the same seven watdiv queries (D62). Not
+in these two terms. What is left is the cross-class recurrence itself —
+`flat = flat * partners` over the edges between equivalence classes, which is
+where a single zero or a single bad `partners` multiplies through everything
+downstream. That is a structural change to how the estimate is computed, not a
+constant, and it is the only remaining route to the +426.2s above.
+
+**What ships.** Nothing changes: all three defaults are the shipped values, the
+SQL suite passes unchanged, and fire counts are identical on all three corpora.
+The knobs stay as instrumentation, because they are what made this measurable,
+and because the next person to wonder about F18 or D45 can answer it in an
+afternoon with a sweep instead of a fortnight with a rewrite.

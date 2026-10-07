@@ -27,7 +27,16 @@ double ColumnStats::Frequency(int64_t value) const {
 	return TailRows() / TailDistinct();
 }
 
-GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
+bool ColumnStats::Stored(int64_t value) const {
+	for (const auto &entry : mcv) {
+		if (entry.first == value) {
+			return true;
+		}
+	}
+	return false;
+}
+
+GroupSize EstimateGroup(const std::vector<ColumnStats> &group, const EstimatorOptions &options) {
 	GroupSize size;
 	if (group.empty()) {
 		return size;
@@ -68,6 +77,21 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
 	// while hetio degraded 3.2x -> 6.3x and a systematic under-prediction bias
 	// appeared (1.07x -> 0.39x). Not worth taking (FINDINGS F18).
 
+	// Containment weight per column: the share of the class's domain it covers,
+	// raised to `containment_exponent`. At the default exponent of 0 every
+	// weight is 1 and the loop below is the shipped arithmetic unchanged.
+	double widest_domain = 1;
+	for (const auto &column : group) {
+		widest_domain = std::max(widest_domain, column.distinct);
+	}
+	std::vector<double> containment(group.size(), 1.0);
+	if (options.containment_exponent > 0) {
+		for (size_t i = 0; i < group.size(); i++) {
+			const double share = std::min(1.0, std::max(0.0, group[i].distinct / widest_domain));
+			containment[i] = std::pow(share, options.containment_exponent);
+		}
+	}
+
 	double head_flat = 0;
 	double head_records = 0;
 	double head_distinct = 0;
@@ -76,7 +100,12 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
 		double product = 1;
 		double sum = 0;
 		for (size_t i = 0; i < group.size(); i++) {
-			const double frequency = group[i].Frequency(value);
+			double frequency = group[i].Frequency(value);
+			// Only a value this column did not store is discounted. One it did
+			// store is an exact count and containment has nothing to say.
+			if (containment[i] < 1.0 && !group[i].Stored(value)) {
+				frequency *= containment[i];
+			}
 			product *= frequency;
 			sum += frequency;
 			column_records[i] += frequency;
@@ -105,7 +134,8 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
 	for (size_t i = 1; i < group.size(); i++) {
 		const double divisor = std::max(group[i].TailDistinct(), tail_domain);
 		tail_flat = tail_flat * group[i].TailRows() / divisor;
-		tail_domain = std::max(tail_domain, group[i].TailDistinct());
+		tail_domain = options.tail_min_domain ? std::min(tail_domain, group[i].TailDistinct())
+		                                      : std::max(tail_domain, group[i].TailDistinct());
 	}
 
 	// Records in the tail: each relation contributes the rows that survive,
@@ -132,8 +162,12 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group) {
 	size.flat_by_value.reserve(values.size());
 	for (int64_t value : values) {
 		double product = 1;
-		for (const auto &column : group) {
-			product *= column.Frequency(value);
+		for (size_t i = 0; i < group.size(); i++) {
+			double frequency = group[i].Frequency(value);
+			if (containment[i] < 1.0 && !group[i].Stored(value)) {
+				frequency *= containment[i];
+			}
+			product *= frequency;
 		}
 		size.flat_by_value.emplace_back(value, product);
 	}

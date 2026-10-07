@@ -139,6 +139,9 @@ struct EngineCost {
 //! Thresholds the gate applies. Exposed because they are the knobs Phase 5
 //! tunes, and because a constant tuned on one machine mis-gates on another.
 struct CostThresholds {
+	//! The two known-wrong estimator terms, as knobs (see EstimatorOptions).
+	//! Defaults reproduce shipped behaviour.
+	EstimatorOptions estimator;
 	//! Our own cost, fitted to sit *above* 75% of observed runs. A gate must be
 	//! pessimistic about the engine it is choosing and optimistic about the one
 	//! it is rejecting, or its errors all point at regressions.
