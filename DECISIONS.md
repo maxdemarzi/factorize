@@ -4733,3 +4733,76 @@ SQL suite passes unchanged, and fire counts are identical on all three corpora.
 The knobs stay as instrumentation, because they are what made this measurable,
 and because the next person to wonder about F18 or D45 can answer it in an
 afternoon with a sweep instead of a fortnight with a rewrite.
+
+## D67 — Two different estimator failures, and the collapse traced to its source
+
+D66 sent the next person at the cross-class recurrence. That was half right, and
+splitting the corpus by the number of equivalence classes a query has says which
+half. A one-class query has no cross-class step at all, so its error is
+`EstimateGroup` alone:
+
+    classes   runnable error   excluded error
+    1              0.31x           0.0084x
+    2             14.36x           0.0252x
+    3             22.31x           0.0437x
+    4             27.26x           0.1304x
+    5              9.36x           0.0804x
+    6              0.58x           0.0020x
+    7              1.36x           0.0030x
+
+**These are two different bugs.** On the runnable corpus `EstimateGroup` is
+roughly right on its own (0.31x) and the recurrence over-predicts by up to 27x,
+which is D66's story. On the excluded corpus `EstimateGroup` is already 119x low
+with no recurrence involved, and *adding* cross-class edges makes the estimate
+better, not worse -- 1 class is 0.0084x and 4 classes is 0.1304x. The
+recurrence's over-prediction is partly repairing the class estimator's
+under-prediction. That is the cancellation D65 and D66 were both circling, in
+its real location: not between two constants, but between two stages.
+
+**"Ask for perfect statistics" is not available.** `factorize_gate_exact_stats`
+is the obvious control and it is broken in the direction that matters: it
+produces a flat estimate of zero on **43 of 171** excluded queries against 7 for
+the sampled path, and values like 3.005e-06 tuples for a query returning
+billions. Exact statistics make the estimate worse because the MCV list is
+capped at 128 entries (`MCV_ENTRIES`): with exact counts on a skewed column
+those 128 account for nearly every row, so the tail empties and every value
+outside the top 128 is assigned frequency zero.
+
+This does not overturn D58, which measured exact statistics on the *runnable*
+corpus and found them slightly better there (9.47s against 9.59s); the same
+measurement here shows multi-class runnable error falling from 14-27x to
+0.7-3.6x. It does mean the excluded corpus has no perfect-statistics control,
+and the +426.2s headroom figure in D66 -- true result size substituted into
+`duckdb_ms` -- is the instrument to use instead.
+
+**Where the collapse actually comes from.** Traced rather than guessed:
+`GroupSize::FlatFor` returns `tail_flat_per_value` for any value the child
+class's MCV union does not name, and `tail_flat` is a chained product over the
+class's columns, so a single narrow column zeroes it. `watdiv1052572` is such a
+column -- 240 rows, 24 distinct values on `d`, so its MCV list is complete and
+its tail is genuinely empty. Every parent value outside the child's small MCV
+union is then told it has no partners, `partners` goes to zero, and
+`flat = flat * partners` carries that to the end of the query. The seven
+collapses are all watdiv, which is where the narrow relations are.
+
+**One fix shipped, and it is honest about its size.** `TailRows()` clamped at
+zero, which let `Frequency` report that a column contains none of the
+`distinct - mcv.size()` values it is on record as having. It now returns at
+least one row per unnamed value, which is an identity about a column rather than
+an estimate. Tested both ways: the over-covered shape that used to collapse now
+costs, and a genuinely complete MCV list with no shared value still collapses
+and still says so.
+
+**It changes nothing measurable.** Geomean error identical to four decimal
+places on all three corpora, the same seven queries still collapse, fire counts
+unchanged at 126/180/35. The real statistics never violated the invariant --
+`rows - covered` was already above the unnamed count -- so the guard is correct,
+cheap and currently inert. It is kept because the next change to the sampling
+path can violate it, and because an estimator that denies a column holds values
+its own `distinct` reports is wrong whether or not today's data notices.
+
+**What is left.** The zero propagates through `tail_flat_per_value`, and the
+honest fix is that a class's tail being empty must not imply that values outside
+its head have no partners -- the head is a 128-entry summary of a 150,000-value
+column, not a complete enumeration. That is the same shape of error as the one
+this entry fixed, one level up, and it is where the +426.2s is.

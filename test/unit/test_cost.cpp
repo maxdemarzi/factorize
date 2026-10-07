@@ -440,9 +440,11 @@ static void TestEmptyMcvDegradesToTextbook() {
 //! billion rows that the gate costed as though DuckDB had no output to produce
 //! (D62).
 static void TestCollapsedEstimateIsNotASmallJoin() {
-	std::printf("a flat estimate of zero must declare itself a collapse, not a cheap query\n");
-	// Two relations on one key. Both over-covered: the MCV counts sum past
-	// `rows`, while `distinct` says 500 values exist that are not named.
+	std::printf("an over-covered MCV list must leave the tail its unnamed values\n");
+	// Two relations on one key, both over-covered: the MCV counts sum past
+	// `rows` while `distinct` says 500 values exist that the list does not name.
+	// The sampled path reaches this by scaling its counts up; the exact path
+	// reaches it on a skewed column whose top MCV_ENTRIES hold nearly every row.
 	std::vector<ColumnStats> group;
 	for (int i = 0; i < 2; i++) {
 		ColumnStats column;
@@ -450,11 +452,14 @@ static void TestCollapsedEstimateIsNotASmallJoin() {
 		column.distinct = 500;
 		// Disjoint heads, so no value is named by both.
 		column.mcv = {{i * 2 + 1, 600}, {i * 2 + 2, 500}};
-		Check(column.TailRows() == 0, "the over-covered head must leave no tail");
+		// 498 unnamed values, so at least 498 rows, however the arithmetic of
+		// `rows - covered` comes out. Zero here is what used to make
+		// `Frequency` deny every value the column is on record as holding.
+		CheckClose(column.TailRows(), 498, 1.001, "the tail keeps one row per unnamed value");
 		group.push_back(column);
 	}
 	const auto size = EstimateGroup(group);
-	Check(size.flat == 0, "this is the shape that collapses the estimate");
+	Check(size.flat > 0, "this shape must no longer collapse the estimate");
 
 	std::vector<CostStep> steps;
 	for (int i = 0; i < 2; i++) {
@@ -466,12 +471,41 @@ static void TestCollapsedEstimateIsNotASmallJoin() {
 		steps.push_back(step);
 	}
 	const auto estimate = EstimateCost(steps, true);
-	std::printf("  -> %s (%s)\n", estimate.fire ? "FIRE" : "decline", estimate.reason.c_str());
-	Check(!estimate.fire, "a collapsed estimate must not fire");
-	Check(estimate.collapsed, "and must say it collapsed, not that the query is too small");
-	// The distinction the gate acts on: a collapse is not a second opinion's to
-	// overrule. Before this, the decline read "too small to be worth it" about
-	// a query returning billions, and the catalog fallback duly overruled it.
+	std::printf("  over-covered: flat %.4g -> %s\n", estimate.flat_tuples,
+	            estimate.collapsed ? "COLLAPSED" : "costed");
+	Check(!estimate.collapsed, "and the gate must get a number it can cost");
+}
+
+//! The guard D62 added is still needed, for the case that is genuinely empty.
+//! A complete MCV list -- every distinct value named -- leaves nothing unnamed,
+//! so the tail is empty and a value absent from it really is absent. Two such
+//! columns sharing no value describe a join with no rows, and the gate must
+//! still decline that without calling it "too small to be worth it".
+static void TestGenuinelyEmptyClassStillCollapses() {
+	std::printf("a complete MCV list with no shared value is empty, and must say so\n");
+	std::vector<ColumnStats> group;
+	for (int i = 0; i < 2; i++) {
+		ColumnStats column;
+		column.rows = 1000;
+		column.distinct = 2;  // exactly what the list names: nothing unnamed
+		column.mcv = {{i * 2 + 1, 600}, {i * 2 + 2, 400}};
+		Check(column.TailRows() == 0, "a complete list leaves a genuinely empty tail");
+		group.push_back(column);
+	}
+	Check(EstimateGroup(group).flat == 0, "no shared value means no rows");
+
+	std::vector<CostStep> steps;
+	for (int i = 0; i < 2; i++) {
+		CostStep step;
+		step.key = group[i];
+		step.key_group = 0;
+		step.parent_step = i == 0 ? -1 : 0;
+		step.parent_key = group[0];
+		steps.push_back(step);
+	}
+	const auto estimate = EstimateCost(steps, true);
+	Check(!estimate.fire, "an empty class must not fire");
+	Check(estimate.collapsed, "and must report it as a collapse");
 	Check(estimate.reason.find("too small") == std::string::npos,
 	      "a collapse must not be reported as a query too small to matter");
 }
@@ -487,6 +521,7 @@ int main() {
 	TestFusedLastJoinIsNotCharged();
 	TestEmptyMcvDegradesToTextbook();
 	TestCollapsedEstimateIsNotASmallJoin();
+	TestGenuinelyEmptyClassStillCollapses();
 	std::printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
 }

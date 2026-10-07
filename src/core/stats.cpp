@@ -11,7 +11,31 @@ double ColumnStats::TailRows() const {
 	for (const auto &entry : mcv) {
 		covered += entry.second;
 	}
-	return std::max(0.0, rows - covered);
+	// The tail holds at least one row for each value the MCV list does not
+	// name, because a distinct value occurs at least once. That is an identity
+	// about the column, not an estimate, and it has to be enforced here because
+	// `rows - covered` can violate it from either direction: the sampled path
+	// scales its MCV counts up and can over-shoot `rows`, and the exact path
+	// stores only the top MCV_ENTRIES, so on a skewed column those few exact
+	// counts can account for nearly every row on their own.
+	//
+	// Clamping at zero instead made `Frequency` return zero for every value
+	// outside the list, which says the column contains none of the
+	// `distinct - mcv.size()` values it is on record as having. In
+	// `EstimateGroup` that zero multiplies through the per-value product, so one
+	// such column collapses the whole class, and `flat = flat * partners`
+	// carries the zero to the end of the query.
+	//
+	// Measured, the collapse hits 7 of 171 excluded queries on sampled
+	// statistics and 43 of 171 on exact ones -- exact statistics make it worse,
+	// which is why "ask for perfect statistics" was never the fix (D67).
+	//
+	// The unnamed count is used raw rather than through TailDistinct(), which
+	// clamps to 1 so it is always safe to divide by. A genuinely complete MCV
+	// list leaves nothing unnamed and must still report an empty tail, not a
+	// phantom row.
+	const double unnamed = std::max(0.0, distinct - static_cast<double>(mcv.size()));
+	return std::max(unnamed, rows - covered);
 }
 
 double ColumnStats::TailDistinct() const {
