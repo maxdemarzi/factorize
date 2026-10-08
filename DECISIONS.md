@@ -4801,8 +4801,20 @@ cheap and currently inert. It is kept because the next change to the sampling
 path can violate it, and because an estimator that denies a column holds values
 its own `distinct` reports is wrong whether or not today's data notices.
 
-**What is left.** The zero propagates through `tail_flat_per_value`, and the
-honest fix is that a class's tail being empty must not imply that values outside
-its head have no partners -- the head is a 128-entry summary of a 150,000-value
-column, not a complete enumeration. That is the same shape of error as the one
-this entry fixed, one level up, and it is where the +426.2s is.
+**What is left — and the prescription this entry first gave was wrong.** It
+said a class's empty tail must not imply that values outside its head have no
+partners. A probe built from the real shape refutes that. A class of one wide
+column (40,297 rows, 128-entry MCV) and one narrow one (240 rows, 24 distinct,
+complete MCV) does not collapse at all: it estimates flat 240, returns 10 for a
+value the narrow column names, and 0 for one it does not. The zero is correct.
+The narrow column really does hold only 24 values, so the class really does
+produce nothing for any other key, and `tail_flat_per_value` is 0 because a
+complete MCV list really does leave no unnamed values to match. A class of two
+wide columns gives 3.62 per unnamed value, as it should.
+
+So `FlatFor` is not the bug, and the seven collapses are not explained by this
+mechanism. What the probe establishes is narrower and still useful: a complete
+MCV list is load-bearing information, not a degenerate case, and an estimate of
+zero from one is a statement about the data rather than a failure. Where the
++426.2s is remains open, and the next probe should instrument a real collapsing
+query per class rather than reason from a reconstruction of it.
