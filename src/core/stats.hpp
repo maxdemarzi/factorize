@@ -109,6 +109,18 @@ struct GroupSize {
 	//! for the same reason it is right inside a class: the tail is what is left
 	//! once the skew has been taken out.
 	double tail_flat_per_value = 0;
+	//! What one connecting value contributes when the class has no head at all:
+	//! `flat / distinct`, the uniform rate.
+	//!
+	//! `flat_by_value` is the union of this class's columns' MCV lists, and the
+	//! gate drops any entry its sample saw fewer than 30 times (noise scaled up
+	//! is how noise becomes a hub, D41). On a column with no value frequent
+	//! enough to survive that, the list comes back empty -- and then every
+	//! lookup falls through to `tail_flat_per_value`, which is zero whenever
+	//! some column's head accounts for all of its rows. A class with no head
+	//! has no per-value information, and answering "zero" to every question
+	//! about it is the one answer that is certainly wrong (D70).
+	double uniform_flat_per_value = 0;
 
 	//! Flat tuples this class contributes for one connecting value.
 	double FlatFor(int64_t value) const;

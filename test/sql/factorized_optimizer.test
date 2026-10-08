@@ -1567,23 +1567,24 @@ EXPLAIN SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d =
 ----
 physical_plan	<REGEX>:.*FACTORIZED.*
 
-# This chain is also the held example for factorize_fallback_max_loss. Its
-# sampled estimate collapses to zero flat tuples, so it reaches the gate's
-# second opinion and fires from there, predicting a 76x loss on the way -- the
-# largest predicted loss of any override fire that turned out to be a win. The
-# limit must sit above it: the two queries it exists to stop predict 392x and
-# 5025x. Lower the limit under that and this query, a measured 148ms against
-# 6ms, is the first thing to go (D63).
-statement ok
-SET factorize_fallback_max_loss = 50;
-
+# This chain used to be the held example for factorize_fallback_max_loss: its
+# estimate collapsed to zero flat tuples, so it reached the gate's second
+# opinion and fired from there, predicting a 76x loss on the way. D70 removed
+# the collapse -- every class of one relation was answering "no tuples" for
+# every value, which zeroed the cross-class product -- and the estimate is now
+# 5.556e7 against a true 5.0e7, so the query fires on its own numbers at a
+# predicted 9.7x win and never consults the second opinion at all.
+#
+# The limit is therefore pinned on the estimate instead, which is the stronger
+# property: the gate should not need a fallback to see a 24x win.
 query II
 EXPLAIN SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*FACTORIZED.*
 
-# And zero restores D41's unconditional or-rule rather than meaning "no second
-# opinion at all", which is the reading the name invites.
+# Zero restores D41's unconditional or-rule rather than meaning "no second
+# opinion at all", which is the reading the name invites. This query no longer
+# exercises that path, but the setting must still be accepted and harmless.
 statement ok
 SET factorize_fallback_max_loss = 0;
 

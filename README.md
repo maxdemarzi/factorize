@@ -268,7 +268,10 @@ queries this database can run, stock and `auto`, on one build, capped at 60s:
 | **total** | **390** | **223** | **0** | **67** | **15** | **85** | **+1168.8 s** |
 
 **223 answers that the stock plan does not produce, and not one query turned
-from an answer into a non-answer.** The rescued are not marginal: a median of
+from an answer into a non-answer.** (D70 then fixed a long-standing estimator
+bug and changed seven of these decisions, four for the better and three for
+the worse, for a net gain of about 88 s — one query, `watdiv_217_10`, now runs
+past a 60 s cap that stock answers in 15 s. The table below predates that.) The rescued are not marginal: a median of
 0.08 s against a plan that has not finished in sixty seconds.
 
 Every slowdown in the corpus costs 29.5 s put together, and 22.4 s of that is

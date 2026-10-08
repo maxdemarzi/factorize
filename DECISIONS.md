@@ -4936,3 +4936,91 @@ lesson D67 and D68 both paid for.
 **Kept:** the per-edge breakdown. Three entries guessed at this mechanism and
 got it wrong; one build's worth of printing settled it, and the numbers above
 are now reproducible from any `EXPLAIN` with `factorize_explain` on.
+
+## D70 — Every class of one relation answered "no tuples" for every value
+
+Chasing D69's open question -- why three parent columns reached the gate with
+an empty MCV list -- turned up the answer to a different and larger one.
+
+The empty lists are deliberate. The gate drops any MCV entry its sample saw
+fewer than 30 times, because scaling a handful of sightings up by the sample
+ratio is how noise becomes a hub (D41: unfiltered, that fired on 49 of 119
+queries against an oracle of 23). On a column with no value frequent enough to
+survive, the list is empty and the uniform model is correct. Not a bug.
+
+**The bug is in `EstimateGroup`'s early return for a class of one relation:**
+
+    if (group.size() == 1) {
+        size.flat = group[0].rows;
+        size.records = group[0].rows;
+        size.distinct = group[0].distinct;
+        size.column_records.assign(1, group[0].rows);
+        return size;          // flat_by_value, tail_flat_per_value: untouched
+    }
+
+Both per-value fields keep their zero defaults, and `FlatFor` reads them. So
+every single-relation class answered *zero tuples for every value it was asked
+about*, while holding `rows` of them. Every cross-class edge attaching to such
+a class got nothing back.
+
+Measured on `watdiv_acyclic_217_05`, the edge joining `watdiv1052578.d` to
+`watdiv1052572.d` asked about each of the parent's 24 values and was told zero
+for all 24. Those two columns share all 24 values and their join is 3,855,683
+rows. That single zero multiplied through `flat = flat * partners` and ended
+the query at zero flat tuples -- the collapse D62 guarded, D67 mis-diagnosed,
+D68 located to one edge, and D69 traced to the head term.
+
+**Fixed** by giving that branch the per-value rate it needs,
+`flat / max(1, distinct)`. The accuracy change is the largest this estimator
+has seen:
+
+    corpus            before     after
+    171 excluded      0.0211x    0.5883x      47x low -> 1.7x low
+    219 held out      0.0102x    0.0528x      98x low -> 19x low
+    119 runnable      7.6609x   12.3833x      7.7x high -> 12.4x high
+    flat == 0              1          0
+
+The three-relation chain in `factorized_optimizer.test` is the clearest case:
+it predicted zero flat tuples and now predicts 5.556e7 against a true 5.0e7.
+It used to reach the gate's second opinion and fire from there; it now fires on
+its own numbers and never consults it.
+
+**And the outcome is net positive but not clean.** Seven excluded queries change
+decision, four for the better and three for the worse:
+
+    hetio_204_01     63.2s -> 4.8s      +58.4s
+    hetio_210_00     cap   -> 38.6s     rescued
+    hetio_211_05     cap   -> 160.9s    rescued
+    watdiv_217_15   117.5s -> 47.2s     +70.4s
+    watdiv_210_17     3.7s -> 16.4s     -12.7s
+    watdiv_217_05    28.1s -> 75.7s     -47.6s
+    watdiv_217_10    15.4s -> 156.0s   -140.6s
+
+Net +87.9s counting a cap as 180s, which under-states the two rescues. The
+three losses are the queries D62 and D63 declined, and they fire again because
+their estimates are no longer collapsed. D64's "no query made unanswerable"
+becomes "one past a 60s cap": `watdiv_217_10` at 156s against stock's 15.4s.
+
+**The reason is worth more than the fix.** Ranking those seven by the speedup
+the gate predicted:
+
+    predicted   outcome   actual
+      1.98x     rescue     4.66x
+      2.02x     win       13.17x
+      2.92x     win        2.49x
+      3.86x     rescue     1.12x
+      7.73x     LOSS       0.23x
+      7.78x     LOSS       0.37x
+      8.19x     LOSS       0.10x
+
+**The gate is wrong exactly where it is confident.** Every modest prediction is
+right and every large one is wrong, and all three large ones are watdiv, where
+D65 measured DuckDB's per-tuple cost over-predicted 2.4x. Removing a 47x
+under-prediction did not create that; it uncovered it. The two errors were
+cancelling, which is what D65 and D66 kept asserting without being able to name
+the mechanism -- and the mechanism was this early return all along.
+
+No threshold on predicted speedup can separate those two groups in the right
+direction, since declining the confident ones means declining 8x predictions
+and keeping 2x ones. The watdiv over-prediction has to be fixed on its own
+terms now, with nothing left masking it.

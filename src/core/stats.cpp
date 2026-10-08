@@ -70,6 +70,19 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group, const EstimatorOp
 		size.records = group[0].rows;
 		size.distinct = group[0].distinct;
 		size.column_records.assign(1, group[0].rows);
+		// A single relation needs no per-value table -- every value it holds it
+		// holds by itself -- but `FlatFor` is still asked about it by every
+		// cross-class edge that attaches here, and leaving the per-value fields
+		// at their zero defaults made it answer "no tuples" for every value of a
+		// class holding `rows` of them.
+		//
+		// Measured on `watdiv_acyclic_217_05`: the edge joining
+		// watdiv1052578.d to watdiv1052572.d asked for each of the parent's 24
+		// values and was told zero for all of them, which zeroed `partners` and
+		// so the whole query. Those two columns share all 24 values and their
+		// join is 3,855,683 rows (D70).
+		size.uniform_flat_per_value = size.flat / std::max(1.0, size.distinct);
+		size.tail_flat_per_value = size.uniform_flat_per_value;
 		return size;
 	}
 
@@ -200,6 +213,7 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group, const EstimatorOp
 		          return a.first < b.first;
 	          });
 	size.tail_flat_per_value = tail_flat / std::max(1.0, surviving);
+	size.uniform_flat_per_value = size.flat / std::max(1.0, size.distinct);
 	return size;
 }
 
@@ -210,6 +224,13 @@ double GroupSize::FlatFor(int64_t value) const {
 	                                    });
 	if (found != flat_by_value.end() && found->first == value) {
 		return found->second;
+	}
+	// No head at all means no per-value information, so the uniform rate is
+	// the whole of what is known. Falling through to the tail rate instead
+	// answers zero whenever a column's head covers all its rows, and zero
+	// multiplies through `flat = flat * partners` to end the query (D70).
+	if (flat_by_value.empty()) {
+		return uniform_flat_per_value;
 	}
 	return tail_flat_per_value;
 }
