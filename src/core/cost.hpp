@@ -123,8 +123,30 @@ struct CostEstimate {
 		double tail_per_value = 0;
 	};
 	std::vector<ClassSize> class_sizes;
-	//! One per cross-class edge: what `flat` was multiplied by.
-	std::vector<double> edge_partners;
+	//! One per cross-class edge: what `flat` was multiplied by, and the terms
+	//! it is made of. D68 established that the edges carry the whole error on
+	//! `watdiv_acyclic_217_05` -- the root class is exact at 1.836e5 against a
+	//! true 183,550, while the product of the five edge factors is 0.577
+	//! against a true 26,198 -- so the breakdown is what the next fix needs.
+	struct EdgeFactor {
+		double partners = 0;
+		//! The share of parent rows its MCV list accounts for, and what the
+		//! head and tail halves of `partners` each contributed.
+		double head_share = 0;
+		double head_term = 0;
+		double tail_term = 0;
+		//! The tail half is `child_flat / divisor`, and `divisor` is
+		//! max(parent distinct, child distinct) -- the textbook per-tuple rate,
+		//! and the third place in this estimator where a max is carried where
+		//! the textbook rule says min (see D45).
+		double child_flat = 0;
+		double divisor = 0;
+		//! The parent column the head half is read from. An empty list means
+		//! D41's seam correction cannot contribute at all on this edge.
+		double parent_mcv_entries = 0;
+		double parent_rows = 0;
+	};
+	std::vector<EdgeFactor> edge_partners;
 	//! Set when the estimator produced no usable number rather than a small
 	//! one: a flat result of zero tuples. Distinct from `!fire`, because a
 	//! decline that knows what it is declining can be overruled by a second

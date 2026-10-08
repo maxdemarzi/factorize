@@ -243,8 +243,19 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		// queries past D62's collapse guard into the "too small to be worth it"
 		// floor, which is the misleading message that guard exists to prevent.
 		const double tail_share = std::max(0.0, 1.0 - head_share);
-		partners += tail_share * child.flat / std::max(parent_distinct, child.distinct);
-		estimate.edge_partners.push_back(partners);
+		const double head_term = partners;
+		const double divisor = std::max(parent_distinct, child.distinct);
+		partners += tail_share * child.flat / divisor;
+		CostEstimate::EdgeFactor factor;
+		factor.partners = partners;
+		factor.head_share = head_share;
+		factor.head_term = head_term;
+		factor.tail_term = partners - head_term;
+		factor.child_flat = child.flat;
+		factor.divisor = divisor;
+		factor.parent_mcv_entries = static_cast<double>(edge.parent_column.mcv.size());
+		factor.parent_rows = edge.parent_column.rows;
+		estimate.edge_partners.push_back(factor);
 		flat = flat * partners;
 
 		// Each context carries one connecting value, so it instantiates the

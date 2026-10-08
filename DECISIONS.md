@@ -4876,3 +4876,63 @@ across them, which is the statistic F19 named and O12 still has open.
 **Kept from this entry:** the per-class and per-edge diagnostics. They took one
 build to add and settled in one run what two entries had guessed at, and the
 cost of not having them is three commits of plausible wrong answers.
+
+## D69 — The edges carry the whole error, and the seam correction never fires
+
+D68 showed one edge of five zeroes `watdiv_acyclic_217_05`. Two things make that
+precise: the true size of every prefix of the join, counted from the data, and a
+breakdown of each `partners` factor into the terms it is made of.
+
+**The classes are not the problem. The root class is exact.**
+
+    step  relations joined   true count      true factor
+    1     1                     183,550      --
+    3     3                   6,994,917      38.1
+    6     6                  21,640,013      21.0
+    7     7               3,190,578,232     147.4
+    8     8               4,808,768,787       1.5
+
+The gate sizes that root class at 1.836e5 against a true 183,550. The product of
+its five edge factors is **0.577 against a true 26,198** -- low by 45,000x. All
+of the error for this query is in the recurrence, none of it in `EstimateGroup`.
+
+**And every edge's head term is zero:**
+
+    edge 0: partners 0.0003611 = head 0 (share 1.000,  9 mcv of  90,000 rows) + tail 0.0003611 (325 / 10)
+    edge 1: partners 3.07      = head 0 (share 0.000,  0 mcv of     325 rows) + tail 3.07      (4943 / 1610)
+    edge 2: partners 0         = head 0 (share 1.000, 24 mcv of 183,550 rows) + tail 0         (240 / 23)
+    edge 3: partners 139.9     = head 0 (share 0.000,  0 mcv of     240 rows) + tail 139.9     (4.03e4 / 288)
+    edge 4: partners 3.722     = head 0 (share 0.000,  0 mcv of  40,297 rows) + tail 3.722     (1.5e5 / 4.03e4)
+
+D41 added the head term for exactly this situation -- "the connecting value is
+not interchangeable on graph data, a hub value appears in the parent thousands
+of times *and* carries thousands of child tuples, so the two skews multiply
+exactly where the average says they cancel". It recovered 17 wins worth 5.4s on
+the runnable corpus. On this query it contributes nothing at all, on any edge,
+and what is left is the uniform estimate it was introduced to replace.
+
+**Two reasons, both visible above.** Three of the five parent columns arrive with
+an empty MCV list, including one of 40,297 rows, so there is no head to sum
+over. The other two report a head share of 1.000 from 9 and 24 entries, which
+makes `tail_share` zero and deletes the tail term as well -- and when the head
+term is also zero, as it is here, `partners` is exactly zero. That is the
+collapse D62 guarded and D68 located, now explained: not a bad estimate but two
+empty halves.
+
+**What is not the cause.** `SharedRelations::Stats` is a stub -- it reports
+`distinct = rows`, claiming every value unique, and never builds an MCV list at
+all. It looked like the obvious culprit and it is not on this path: it is
+constructed only in `physical_factorized.cpp`, at execution time, where the
+relations are already in hand. Recorded because it is a real latent trap for
+anyone who later routes gate statistics through it.
+
+**What is still unknown.** Why three parent columns reach the gate without an
+MCV list. `plan.cpp` fills `parent_key` from `source.Stats(attach_relation,
+attach_column)`, the same call that gives the other two edges their 9 and 24
+entries, and all five report non-zero row counts, so the columns were read. The
+next step is to instrument the sampler rather than reason about it, which is the
+lesson D67 and D68 both paid for.
+
+**Kept:** the per-edge breakdown. Three entries guessed at this mechanism and
+got it wrong; one build's worth of printing settled it, and the numbers above
+are now reproducible from any `EXPLAIN` with `factorize_explain` on.

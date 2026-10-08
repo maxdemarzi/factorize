@@ -1236,8 +1236,12 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 			                              c.tail_per_value);
 		}
 		for (idx_t i = 0; i < estimate.edge_partners.size(); i++) {
-			classes += StringUtil::Format("[edge %llu: partners %.4g] ", static_cast<uint64_t>(i),
-			                              estimate.edge_partners[i]);
+			const auto &e = estimate.edge_partners[i];
+			classes += StringUtil::Format(
+			    "[edge %llu: partners %.4g = head %.4g (share %.3f, %.0f mcv of %.0f rows) + tail %.4g "
+			    "(child flat %.4g / %.4g)] ",
+			    static_cast<uint64_t>(i), e.partners, e.head_term, e.head_share, e.parent_mcv_entries,
+			    e.parent_rows, e.tail_term, e.child_flat, e.divisor);
 		}
 		Printer::Print(classes);
 	}
