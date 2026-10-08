@@ -109,6 +109,22 @@ struct CostEstimate {
 	bool acyclic = true;
 	//! Set when the gate says to factorize.
 	bool fire = false;
+	//! What each equivalence class estimated, and what each cross-class edge
+	//! multiplied by, in the order the recurrence visits them.
+	//!
+	//! `flat = flat * partners` is one multiplication per edge and a single zero
+	//! anywhere in it ends the query at zero, so a total of 0 says nothing about
+	//! which step produced it. D67 reasoned from a reconstruction instead of
+	//! measuring and got the answer wrong; this is what it should have had.
+	struct ClassSize {
+		double flat = 0;
+		double records = 0;
+		double distinct = 0;
+		double tail_per_value = 0;
+	};
+	std::vector<ClassSize> class_sizes;
+	//! One per cross-class edge: what `flat` was multiplied by.
+	std::vector<double> edge_partners;
 	//! Set when the estimator produced no usable number rather than a small
 	//! one: a flat result of zero tuples. Distinct from `!fire`, because a
 	//! decline that knows what it is declining can be overruled by a second

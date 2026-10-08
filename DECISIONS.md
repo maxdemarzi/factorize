@@ -4818,3 +4818,61 @@ MCV list is load-bearing information, not a degenerate case, and an estimate of
 zero from one is a statement about the data rather than a failure. Where the
 +426.2s is remains open, and the next probe should instrument a real collapsing
 query per class rather than reason from a reconstruction of it.
+
+## D68 — The collapse is one edge, and the obvious repair is worthless
+
+D67 guessed where the zero came from and was wrong. This is what instrumenting
+it says instead. `EXPLAIN` now prints every class the estimator sized and every
+factor the cross-class recurrence multiplied by, because `flat = flat *
+partners` ends at zero if any single factor is zero and the total cannot say
+which. On `watdiv_acyclic_217_05`:
+
+    classes  [0: flat 1.836e+05] [1: 325] [2: 4943] [3: 240] [4: 4.03e+04] [5: 1.5e+05]
+    edges    [0: partners 0.0003611] [1: 3.07] [2: partners 0] [3: 139.9] [4: 3.722]
+
+**No class collapsed.** All six have a positive estimate. The whole query is
+zeroed by one edge out of five, and D67's candidate -- a class losing its flat
+to a narrow complete-MCV column -- is not what happened.
+
+**Why that edge is zero.** `partners` is a sum over the parent column's MCV of
+`share * child.FlatFor(value)`, plus `tail_share * child.flat / distinct`, with
+`tail_share = 1 - head_share` and `head_share` summed from the same list. The
+list is the top 128 entries (MCV_ENTRIES), so on a skewed column those alone
+can account for every row: `head_share` reaches 1, the tail term disappears,
+and the edge contributes only whatever the child class happens to name among
+those 128 values. When it names none of them, the answer is zero — for a parent
+column with 30,925 distinct values, 128 of which were consulted.
+
+**The repair that follows is worthless, and that is the finding.** `TailRows()`
+already enforces the identity this needs (D67: a column holds at least one row
+per value its list does not name), so taking `tail_share` from there instead
+cannot report an empty tail for a column that has unnamed values. Built,
+tested, measured:
+
+    171 excluded    collapses 7 -> 1    fires 126 -> 126
+    219 held out    unchanged           fires 180 -> 180
+    119 runnable    unchanged           fires  35 -> 35
+
+    on the 164 queries costed both ways: not one estimate moved
+    the 6 rescued from zero: flat 1.75e-10 against a true 4.8e9
+
+Zero became effectively zero. The six queries now decline through the "too
+small to be worth it" floor rather than through D62's collapse guard, which is
+precisely the misleading message that guard was added to prevent. Reverted, and
+the reasoning left in the code where the next person will look.
+
+**What it shows about the real error.** Edge 0 multiplies by 0.0003611 and no
+zero is involved. A chain of five such factors is how an estimate reaches
+1e-20, and how the corpus reaches 0.08x of truth. The collapse to exactly zero
+is the visible extreme of a recurrence that is producing absurd factors
+throughout — fixing the zero without fixing the magnitudes converts one wrong
+answer into another.
+
+So the target is not the zero. It is why an edge between two classes of 1.8e5
+and 4943 tuples multiplies by three ten-thousandths. That is `partners` as a
+whole: a 128-entry summary on each side, asked a question about joint presence
+across them, which is the statistic F19 named and O12 still has open.
+
+**Kept from this entry:** the per-class and per-edge diagnostics. They took one
+build to add and settled in one run what two entries had guessed at, and the
+cost of not having them is three commits of plausible wrong answers.

@@ -186,6 +186,14 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 			node_records[i] = root_size.column_records[slot_of_step[i]];
 		}
 	}
+	for (const auto &size : sizes) {
+		CostEstimate::ClassSize row;
+		row.flat = size.flat;
+		row.records = size.records;
+		row.distinct = size.distinct;
+		row.tail_per_value = size.tail_flat_per_value;
+		estimate.class_sizes.push_back(row);
+	}
 	double flat = root_size.flat;
 	double records = root_size.records;
 
@@ -223,8 +231,20 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		// Whatever the MCV list did not cover is uniform, which is what it is
 		// for. Clamped because an MCV list that covers everything must leave
 		// nothing for the tail, and rounding must not make that negative.
+		//
+		// Taking this share from `TailRows()` instead was tried and reverted
+		// (D68). It is the more defensible reading -- `TailRows` enforces that a
+		// column holds a row for every value its list does not name, so the
+		// share cannot be zero for a column that has unnamed values -- and on
+		// this corpus it buys nothing. Of 164 queries costed both ways not one
+		// estimate moved, and the six it rescued from exactly zero came back
+		// with 1.75e-10 flat tuples against a true 4.8e9. Zero became
+		// effectively zero, and the only measurable effect was to route those
+		// queries past D62's collapse guard into the "too small to be worth it"
+		// floor, which is the misleading message that guard exists to prevent.
 		const double tail_share = std::max(0.0, 1.0 - head_share);
 		partners += tail_share * child.flat / std::max(parent_distinct, child.distinct);
+		estimate.edge_partners.push_back(partners);
 		flat = flat * partners;
 
 		// Each context carries one connecting value, so it instantiates the

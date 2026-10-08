@@ -1226,6 +1226,20 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 		line += StringUtil::Format("flat %.4g bytes %.4g ours %.1fms duckdb %.1fms", estimate.flat_tuples,
 		                           estimate.bytes, estimate.ours_ms, estimate.duckdb_ms);
 		Printer::Print(line);
+		// Per class and per edge, because `flat = flat * partners` ends at zero
+		// if any one factor is zero and the total cannot say which (D68).
+		string classes = "[factorize] gate classes: ";
+		for (idx_t i = 0; i < estimate.class_sizes.size(); i++) {
+			const auto &c = estimate.class_sizes[i];
+			classes += StringUtil::Format("[%llu: flat %.4g recs %.4g distinct %.4g tail/val %.4g] ",
+			                              static_cast<uint64_t>(i), c.flat, c.records, c.distinct,
+			                              c.tail_per_value);
+		}
+		for (idx_t i = 0; i < estimate.edge_partners.size(); i++) {
+			classes += StringUtil::Format("[edge %llu: partners %.4g] ", static_cast<uint64_t>(i),
+			                              estimate.edge_partners[i]);
+		}
+		Printer::Print(classes);
 	}
 	if (estimate.fire || !stats.UsingSample()) {
 		return estimate.fire;
