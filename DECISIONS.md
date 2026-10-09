@@ -5024,3 +5024,63 @@ No threshold on predicted speedup can separate those two groups in the right
 direction, since declining the confident ones means declining 8x predictions
 and keeping 2x ones. The watdiv over-prediction has to be fixed on its own
 terms now, with nothing left masking it.
+
+## D71 — No global scalar can fix what D70 uncovered
+
+D70 left three watdiv regressions and a reason to expect they were reachable:
+the gate's two deferred estimator terms had been judged "too small to matter"
+against a 12x-to-100x error (D66), and that error is now 1.7x. A lever worth
+18% of a broken number can be worth a great deal of a nearly-right one. Both
+levers were re-tested on the fixed estimator. Neither works.
+
+**The estimator knobs behave exactly as they did before.**
+
+    tail   exp      171 excluded    219 held out    119 runnable    fires
+    max    0            0.5883x         0.0528x        12.3833x     133/180/36  <- shipped
+    max    1.0          0.5085x         0.0274x         7.2289x     133/180/36
+    min    0            0.6893x         0.1204x        28.3547x     133/180/36
+    min    1.0          0.6106x         0.1050x        20.3631x     133/180/36
+
+Containment still pulls the runnable corpus toward truth and the excluded ones
+away; the tail's min still does the reverse. And the fire counts are identical
+in all eight combinations, on all three corpora, exactly as in D66 -- 133, 180
+and 36 throughout. The estimate moves and no decision follows it.
+
+That is now a held-out result rather than a single observation. D66 measured it
+on an estimator that was wrong by two orders of magnitude; this measures it on
+one that is wrong by 70%, and the conclusion does not move. These two terms do
+not reach the gate's decisions at any accuracy the estimator has had.
+
+**The coefficient is worse: it acts in the wrong order.** Scaling DuckDB's
+per-tuple cost, and watching what happens to D70's four gains and three losses:
+
+    scale   gains kept   losses stopped
+    1.000      4 of 4         0 of 3
+    0.700      2 of 4         0 of 3
+    0.500      1 of 4         0 of 3
+    0.345      0 of 4         0 of 3     <- D65's p25
+    0.190      0 of 4         2 of 3
+    0.120      0 of 4         3 of 3
+
+Every gain is gone before the first loss is touched. (Absolute fire counts from
+this simulation are not comparable to the gate's, which applies a memory check,
+a work floor and a second opinion as well; the ordering is, because all of them
+move monotonically with the same ratio.)
+
+**Why both fail is the same reason, and it is D70's finding generalised.** The
+three losses predict speedups of 7.73x, 7.78x and 8.19x; the four gains predict
+1.98x to 3.86x. A global scalar multiplies every prediction equally, so it
+always reaches the modest ones first. The gate is wrong where it is confident,
+and every lever available acts on confidence rather than on correctness.
+
+**So the next thing is not a constant.** What separates these groups is that
+all three losses are watdiv, where DuckDB's measured cost per result tuple is
+1.6e-6 ms against hetio's 2.8e-6 and yago's 5.0e-5 (D65), and where the join
+estimate over-predicts for reasons F18 and D45 both describe and neither fixed.
+Something has to tell those cases apart from the inside -- joint presence
+across columns, which is F19's named statistic and O12's open question, or a
+per-dataset calibration the gate has no way to perform at plan time.
+
+Recorded so the next person does not spend the afternoon I just spent: the
+knobs are instrumented, the sweep takes fifteen minutes, and it has now
+returned the same answer twice from very different starting points.
