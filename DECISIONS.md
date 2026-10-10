@@ -5295,3 +5295,34 @@ is the expensive part and the next attempt -- keyed on the join shape rather
 than the tables -- can reuse all of it. The store is process-global, which is
 acceptable while it is inert and would need revisiting before it ever shipped
 on.
+
+**Follow-up: keyed on join shape instead, which is worse.** D75 closed by saying
+the next attempt should key on the join's shape rather than its tables, and
+reuse the plumbing. Tested offline over the same 390 queries, shape is by far
+the better description of the error:
+
+    model                            explains   residual spread
+    dataset                             20.1%             x10.8
+    number of relations                 12.2%             x12.2
+    number of equivalence classes       46.8%              x7.0
+    class-size signature                53.7%              x6.1
+    dataset + class-size signature      63.2%              x5.0
+
+Three times what the table-keyed model managed, and the first description of
+this error that accounts for a majority of it. Simulated leave-one-out on the
+decisions, it is *worse than useless*:
+
+    gained 1    lost 1    bad stopped 0    bad started 3
+
+**A better-calibrated estimator made worse decisions.** That is the finding, and
+it is sharper than another null result. Correcting toward the group mean moves
+hetio's predictions up by about tenfold, which is right -- they are
+under-predicted -- and firing follows the correction into three queries that
+then lose. What decides a bet is where the error sits relative to the 1.5x
+margin, not how large it is, and a correction that halves the error while moving
+it across that line is a regression.
+
+So the whole line is closed, and the three attempts together say something none
+of them says alone. D73 tried the query's inputs, D75 the tables it reads, and
+this its shape; the best of them explains 63% of the variance and is the one
+that does most damage. Accuracy is not the binding constraint on this gate.
