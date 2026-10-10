@@ -41,6 +41,8 @@ public:
 	//! Set for `GROUP BY g1, ..., gn`: one row per group rather than one row.
 	//! Bytes the gate predicted, times a slack factor; 0 = unbounded.
 	idx_t estimate_budget_bytes = 0;
+	//! Flat tuples the gate predicted, for the calibration store (D75).
+	double predicted_flat = 0;
 	//! Least compression a materialized join must reach for the plan to carry
 	//! on; 0 = no check. Measured after the join rather than predicted before it.
 	double min_compression = 0;

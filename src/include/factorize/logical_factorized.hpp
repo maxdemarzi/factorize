@@ -43,6 +43,9 @@ public:
 	//! moment it has seen k tuples.
 	bool limited = false;
 	idx_t limit = 0;
+	//! Flat tuples the gate predicted, carried down so the operator can tell
+	//! the calibration store how wrong it was once the answer is known.
+	double predicted_flat = 0;
 	idx_t group_index = 0;
 	//! One per key, in the aggregate's own order, which is the order the answer
 	//! columns come back in. Kept as the types the aggregate bound rather than

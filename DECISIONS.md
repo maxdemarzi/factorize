@@ -5234,3 +5234,64 @@ attached.
 median 0.09s against a plan that has not finished in sixty; one query lost;
 every slowdown in 442 queries costing 87.1s together against +1160.7s gained.
 job's 39 queries remain unmeasurable here for want of data.
+
+## D75 — Runtime calibration, built and measured: the error is not per table
+
+D73 left two options: measure DuckDB's per-tuple cost at runtime and feed it
+back, or accept the six losses. The first is built here, and it does nothing.
+
+**The signal is free and exactly the missing one.** For a `count(*)` over a
+join the answer *is* the number of flat tuples, so every query this engine
+finishes reports the true cardinality of its own join, and the relations it ran
+over say which data that was. That is a measurement on the finished join rather
+than an estimate from its inputs -- the one thing no amount of plan-time
+statistics can supply, and the thing D73 found missing.
+
+`calibration.hpp` keeps, per table, a running mean of log(actual/predicted) and
+a count. The gate multiplies its predicted flat result by the geometric mean of
+the corrections for the tables a query touches, once each has at least
+`factorize_learn_min_queries` behind it. `factorize_learn_cardinality` is off by
+default, because it makes the gate's decisions depend on what it has already
+run, which is a property this project has never had.
+
+**It changes nothing, and the reason is measurable.** Warming the store with
+eight fast watdiv queries -- which between them teach four to six of the eight
+tables each of the known losers uses -- then re-explaining those losers in the
+same session: all four still fire.
+
+The reason is that a per-table model does not describe the error:
+
+    dataset   queries   mean ratio   spread   variance a per-table model explains
+    watdiv         38        0.25x    x11.2                                   33%
+    hetio         344       10.19x     x9.7                                   20%
+
+The dataset means point the right way -- watdiv over-predicted fourfold, hetio
+under-predicted tenfold, which is D65's finding arrived at from the other end --
+but the spread *within* a dataset is x10, and a per-table average removes only a
+fifth to a third of it. The residual is still x7, which is far too coarse to
+move a decision that turns on a factor of 1.5.
+
+Simulated leave-one-out over the whole excluded corpus, so a query never
+benefits from its own observation:
+
+    good outcomes gained    1
+    good outcomes lost      1
+    bad outcomes stopped    1
+    bad outcomes started    1
+
+Four decisions change and they cancel exactly. `watdiv_218_15`, the worst
+remaining slowdown, is correctly declined; `watdiv_217_15`, a 2.5x win, is
+wrongly declined with it.
+
+**What this rules out.** Not runtime calibration as an idea -- the signal is
+real, free, and correctly signed. What it rules out is *the table* as the thing
+to key it on. The estimator's error varies more between two queries over the
+same tables than it does between datasets, which also explains why D73's four
+plan-time features failed: they were all properties of the query's inputs, and
+the error lives in how those inputs combine.
+
+Kept behind the default-off setting rather than reverted, because the plumbing
+is the expensive part and the next attempt -- keyed on the join shape rather
+than the tables -- can reuse all of it. The store is process-global, which is
+acceptable while it is inert and would need revisiting before it ever shipped
+on.

@@ -116,6 +116,7 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 		factorized.children.push_back(planner.CreatePlan(*fallback));
 	}
 	factorized.estimate_budget_bytes = estimate_budget_bytes;
+	factorized.predicted_flat = predicted_flat;
 	factorized.min_compression = min_compression;
 	factorized.abandon_after_ms = abandon_after_ms;
 	factorized.min_rate = min_rate;

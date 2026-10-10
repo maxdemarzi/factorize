@@ -1,6 +1,7 @@
 #include "factorize/optimizer_rule.hpp"
 
 #include "factorize/logical_factorized.hpp"
+#include "factorize/calibration.hpp"
 #include "factorize/storage_source.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1154,7 +1155,7 @@ static idx_t MemoryBudget(ClientContext &context) {
 //! Whether factorizing this region is predicted to beat the stock plan.
 static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, const vector<BoundRelation> &relations,
                        const factorize::QueryGraph &graph, const factorize::Plan &plan, string &reason,
-                       double &predicted_bytes) {
+                       double &predicted_bytes, double &predicted_flat) {
 	if (region.limited && !BooleanSetting(context, "factorize_limit", false)) {
 		// The one decline the cost model is not consulted about, because it was
 		// measured instead. Rewritten as EXISTS, all 119 runnable CE queries
@@ -1200,6 +1201,18 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	    BooleanSetting(context, "factorize_tail_min_domain") ? true : thresholds.estimator.tail_min_domain;
 	thresholds.duckdb.per_output_ms =
 	    DoubleSetting(context, "factorize_duckdb_per_tuple_ms", thresholds.duckdb.per_output_ms);
+	// What earlier queries over these same tables turned out to be, against
+	// what this estimator said they would be (D75). Off unless asked for.
+	if (BooleanSetting(context, "factorize_learn_cardinality")) {
+		std::vector<std::string> tables;
+		for (const auto &bound : relations) {
+			if (bound.entry) {
+				tables.push_back(bound.entry->name);
+			}
+		}
+		const double min_obs = DoubleSetting(context, "factorize_learn_min_queries", 3.0);
+		thresholds.flat_correction = factorize::Calibration::Get().CorrectionFor(tables, min_obs);
+	}
 	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
 	thresholds.memory_slack = DoubleSetting(context, "factorize_memory_slack", thresholds.memory_slack);
 	// The operator's IsPlainCount, restated: only then is the last join fused.
@@ -1209,6 +1222,7 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	reason = estimate.reason;
 	predicted_bytes = estimate.bytes;
+	predicted_flat = estimate.flat_tuples;
 	// What the gate expects standing after each step, printed in the same shape
 	// as the operator's measured steps so the two can be laid side by side.
 	if (ExplainRequested(context)) {
@@ -1347,6 +1361,7 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	}
 	reason = fallback.reason;
 	predicted_bytes = fallback.bytes;
+	predicted_flat = fallback.flat_tuples;
 	return true;
 }
 
@@ -1372,10 +1387,11 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 			} else {
 				string gate_reason;
 				double predicted_bytes = 0;
+				double predicted_flat = 0;
 				// FORCE skips this and only this: the matcher's refusals are
 				// about what the engine can compute at all, while the gate is
 				// about whether computing it that way is a good idea.
-				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason, predicted_bytes);
+				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason, predicted_bytes, predicted_flat);
 				if (!fire) {
 					region.decline = "gate says no: " + gate_reason;
 				} else {
@@ -1386,6 +1402,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					}
 					auto replacement = make_uniq<LogicalFactorized>(region.aggregate_index, std::move(relations),
 					                                               std::move(graph), std::move(plan));
+					replacement->predicted_flat = predicted_flat;
 					replacement->grouped = region.grouped;
 					replacement->limited = region.limited;
 					replacement->limit = region.limit;
@@ -1515,6 +1532,17 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// D65's three interacting terms. Each default is the shipped value, so
 	// setting none of them changes nothing; see DECISIONS D65 for why none of
 	// them may be moved on its own.
+	// Learn each table's cardinality-estimate error from the queries already
+	// answered over it, and correct later predictions by it (D75). Off by
+	// default: it makes the gate's decisions depend on what it has run before,
+	// which is a property this project has not had and should be opted into.
+	config.AddExtensionOption("factorize_learn_cardinality",
+	                          "Correct the predicted flat result by what earlier queries over the same tables "
+	                          "turned out to be",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("factorize_learn_min_queries",
+	                          "How many finished queries a table needs before its correction is trusted",
+	                          LogicalType::DOUBLE, Value::DOUBLE(3.0));
 	config.AddExtensionOption("factorize_containment_exponent",
 	                          "Discount a head value in a column that did not store it by that column's share of "
 	                          "the class domain, raised to this power (0 = off, the shipped behaviour)",

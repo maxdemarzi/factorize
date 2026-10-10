@@ -278,7 +278,9 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		estimate.step_records.push_back(standing);
 	}
 
-	estimate.flat_tuples = std::max(0.0, flat);
+	// The correction is applied here rather than inside the recurrence because
+	// it is measured on the finished join, which is what this quantity is.
+	estimate.flat_tuples = std::max(0.0, flat) * (thresholds.flat_correction > 0 ? thresholds.flat_correction : 1.0);
 	estimate.factorized_records = std::max(1.0, records);
 	estimate.ratio = estimate.flat_tuples / estimate.factorized_records;
 

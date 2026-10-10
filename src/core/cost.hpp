@@ -180,6 +180,10 @@ struct CostThresholds {
 	//! The two known-wrong estimator terms, as knobs (see EstimatorOptions).
 	//! Defaults reproduce shipped behaviour.
 	EstimatorOptions estimator;
+	//! Multiplier applied to the predicted flat result, learned from queries
+	//! already answered over the same tables (see calibration.hpp). 1.0 is
+	//! "nothing known", which is what ships.
+	double flat_correction = 1.0;
 	//! Our own cost, fitted to sit *above* 75% of observed runs. A gate must be
 	//! pessimistic about the engine it is choosing and optimistic about the one
 	//! it is rejecting, or its errors all point at regressions.

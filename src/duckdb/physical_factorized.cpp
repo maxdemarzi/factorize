@@ -1,4 +1,5 @@
 #include "factorize/physical_factorized.hpp"
+#include "factorize/calibration.hpp"
 #include "../core/arena.hpp"
 #include <atomic>
 #include <string>
@@ -605,6 +606,20 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		}
 		if (!result.ok) {
 			throw InvalidInputException("factorize: %s", result.error);
+		}
+		// For a plain count over a join the answer *is* the flat tuple count, so
+		// this is the one place the gate can learn what its own estimate was
+		// worth -- measured on the finished join rather than guessed from its
+		// inputs (D75). Only here: a grouped or limited query does not produce
+		// the whole join's cardinality.
+		if (predicted_flat > 0) {
+			std::vector<std::string> tables;
+			for (const auto &bound : relations) {
+				if (bound.entry) {
+					tables.push_back(bound.entry->name);
+				}
+			}
+			factorize::Calibration::Get().Observe(tables, predicted_flat, static_cast<double>(result.count));
 		}
 		chunk.SetCardinality(1);
 		chunk.SetValue(0, 0, Value::BIGINT(result.count));
