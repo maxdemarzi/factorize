@@ -257,8 +257,8 @@ code. The one that reframes everything:
 **The CE benchmark disables every query whose result exceeds 1e9 tuples**,
 removing 344 of 360 hetio queries. The live corpus is, by construction, the
 regime a flat engine already handles. [DECISIONS](DECISIONS.md) D15 repoints the
-project there, and D64 and D72 measure all of it — every one of the 390
-queries this database can run, stock and `auto`, on one build, capped at 60s:
+project there, and D64, D72 and D74 measure it — every one of the 442
+queries this database can run, stock and `auto`, capped at 60s:
 
 | dataset | n | rescued | lost | faster | slower | neither | net |
 |---|---|---|---|---|---|---|---|
