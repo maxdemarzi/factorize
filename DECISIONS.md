@@ -26,7 +26,7 @@ Per plan §0.4, every §0.2-class decision lands here.
 | O9 | **RESOLVED (D66).** The download had failed a third time, silently: the file on disk was 847MB of a 5.94GB target, valid SQLite magic but truncated mid-page, which is why it read as "malformed" rather than as missing. Resumed with `curl -C -`; `pragma quick_check` passes and it holds 5,441,808 CE estimates. | — | — |
 | O1 | Email Lehner (`s.lehner@tum.de`) / Neumann (`neumann@in.tum.de`): how much of the speedup is codegen vs container design? Did they ever run a non-generated factorized path? | — | Nothing (informs Phase 1 expectations) |
 | O2 | Locate Kalumin & Deshpande's artifact — head start, baseline, and the concrete claim to beat (they cannot do bottom-inserts; FINDINGS.md F4 shows that puts them at 0.98x, i.e. no benefit). | — | Phase 6 comparison |
-| O3 | Upstream posture: community extension, private fork, or upstream PR? Changes whether to adapt DuckDB's `JoinHashTable` over a bespoke chaining HT. | — | Phase 1.3 |
+| O3 | **RESOLVED (D76): community extension.** The engine replaces a plan through the optimizer and reads storage through the internal C++ API (D5), which is the contract community extensions are built around and the one an upstream PR would have to dismantle. `packaging/description.yml` is the submission. | — | — |
 | O4 | Many-core machine for Phases 4–6. Dev box is 8 logical cores; Phase 4's exit criterion (≥8× at 32 threads) is unmeasurable on it. | — | Phase 4 exit |
 | O5 | CE **data** acquisition. The local `../FactDB` checkout supplies the query corpus, schema and result oracles, but `bench/data` is absent: the CSVs are a download from `db.in.tum.de/~birler/dbgen/cebench.tar.zst`, and `estimates.db` from `db.in.tum.de/~lehner/estimates.db`. Both need an explicit go-ahead to fetch. | — | Phase 1.4 |
 | O6 | **Phase 1 exit/kill criterion is mis-specified** (FINDINGS.md F3): as written, FactDB itself fails it. Adopt the replacement bar (factorized vs own flat baseline) before Phase 1.5. | — | Phase 1.5 |
@@ -5326,3 +5326,58 @@ So the whole line is closed, and the three attempts together say something none
 of them says alone. D73 tried the query's inputs, D75 the tables it reads, and
 this its shape; the best of them explains 63% of the variance and is the one
 that does most damage. Accuracy is not the binding constraint on this gate.
+
+## D76 — O3 answered: a community extension, and what shipping one needs
+
+O3 has been open since Phase 1.3: community extension, private fork, or upstream
+PR. The measurement programme is finished (D73, D75 and its follow-up all return
+negative, and the last of them shows accuracy is not the binding constraint), so
+the question is now live rather than deferred.
+
+**A community extension.** Upstream is ruled out by what this is: the engine
+replaces a plan through the optimizer and reads storage through DuckDB's
+internal C++ API, which D5 chose knowingly and which means recompilation against
+each release. That is exactly the contract the community-extensions repository
+is built around, and exactly what an upstream PR would have to dismantle. A
+private fork ships nothing to anyone.
+
+**What was already in place**, and is better than expected: the distribution
+pipeline builds the six-platform matrix, runs `format` and `tidy`, and pins both
+`extension-ci-tools` and its workflow to the exact commit the submodule carries
+rather than to a branch name, so CI cannot drift from the vendored engine. WASM
+is excluded deliberately, with the reason recorded in the workflow (§7.6: the
+representation sizes itself against `memory_limit` and holds no spill, which
+under wasm32 is meaningless).
+
+**What was missing** is the submission itself. `packaging/description.yml` is
+the file the community-extensions repository wants at
+`extensions/factorize/description.yml`; it is kept here so the text describing
+the extension lives beside the thing it describes, and so `ref` can be updated
+in the same commit as the tag it points at. `ref` is a commit rather than a
+branch for the same reason the CI pins are: the community build checks it out
+verbatim, and a branch would let the published binary drift from the reviewed
+source.
+
+**Version 0.1.0, not 1.0.0.** The engine is correct -- `auto` is bit-exact
+against `off`, verified on five datasets including two it had never seen -- but
+the gate it ships with has measured faults that no amount of tuning has fixed:
+coefficients that transfer between neither machines nor datasets, estimates that
+are wrong where they are most confident, and six queries on the benchmark corpus
+that run slower than the plan they replace, one past a sixty-second cap. A 1.0.0
+would be claiming those are settled.
+
+**The description says so.** Its "known limitations" paragraph carries the same
+numbers as DECISIONS.md rather than a softened version, including the 87s of
+slowdown against the 1160s gained and the fact that firing on everything is 25x
+slower than not firing at all. An extension whose whole value is knowing when
+*not* to run itself cannot usefully be advertised as always faster.
+
+One error caught on the way, which is the reason for checking: the first draft
+claimed `min` and `max` among the supported aggregates. Only `COUNT` and `SUM`
+exist. It would have been a false claim in the one document a user reads before
+installing.
+
+**What remains to ship**, none of it measurement: tag a release at the commit
+`ref` names, confirm the six-platform matrix is green at that tag, fork
+duckdb/community-extensions and open the pull request with this file. The README
+serves as the extension's front page and already leads with what it is not for.

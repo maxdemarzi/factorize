@@ -1,0 +1,79 @@
+# Submission for the DuckDB Community Extensions repository.
+#
+# Copied to extensions/factorize/description.yml in a fork of
+# duckdb/community-extensions and opened as a pull request there. Kept in this
+# repo so the text that describes the extension lives beside the thing it
+# describes, and so `ref` can be updated in the same commit as the tag it
+# points at.
+#
+# `ref` must be a commit on this repository that builds green on the six-platform
+# matrix in .github/workflows/MainDistributionPipeline.yml. The community build
+# checks it out verbatim; a branch name here would let the published binary drift
+# from the reviewed source, which is the same failure the CI pins already guard
+# against.
+extension:
+  name: factorize
+  description: Answers count(*) over many-to-many equi-join graphs without materialising the join
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: MIT
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads"
+  maintainers:
+    - maxdemarzi
+
+repo:
+  github: maxdemarzi/factorize
+  ref: f5968f10423cfe3e6ddab842fc3180a348d1d505
+
+docs:
+  hello_world: |
+    -- The engine keeps intermediate joins in a factorised representation and
+    -- counts from it, so a result too large to materialise is still countable.
+    -- With factorize_mode='auto' an ordinary count(*) is taken over only where
+    -- a cost model predicts a win, and left alone otherwise.
+    SET factorize_mode = 'auto';
+
+    SELECT count(*)
+      FROM edges a, edges b, edges c, edges d
+     WHERE a.src = b.src AND b.src = c.src AND c.src = d.src;
+
+    -- EXPLAIN shows a FACTORIZED operator where it fired, and
+    -- SET factorize_explain = true prints why it did or did not.
+
+  extended_description: |
+    A clean-room implementation of Lehner & Neumann, *The Data World Is Not
+    Flat: Efficient Factorized Execution for Relational Systems* (PVLDB
+    19(11):3006-3019, 2026), derived from the paper only.
+
+    A join's result can be exponentially larger than the data it comes from. A
+    factorised representation keeps it as a product of independent parts rather
+    than writing every combination out: records grow by sum where tuples grow
+    by product. For an aggregate that only needs the count, the count can be
+    read from that representation without ever materialising it.
+
+    **What it is for.** Queries whose join result is too large to produce. On
+    the 442 queries of the cardinality-estimation benchmark whose results exceed
+    1e9 tuples, this answers 244 that stock DuckDB does not finish in sixty
+    seconds, in a median of 0.09 s. One query it answers counts 10.8 trillion
+    results in 24 seconds where the stock plan produces nothing in 180.
+
+    **What it is not for.** Queries DuckDB already handles. For a plain
+    count(\*) DuckDB carries no payload columns through a join and counts empty
+    tuples faster than this engine can build a representation: firing on every
+    eligible query is about 25x *slower* on the benchmark's live corpus. The
+    cost model exists to tell those regimes apart, and `auto` declines far more
+    often than it fires.
+
+    **Scope.** count(\*) and sum over acyclic many-to-many equi-join graphs on
+    integer and DECIMAL columns, with GROUP BY, EXISTS and LIMIT.
+    Anything else is declined and the stock plan runs unchanged. `auto` is
+    bit-exact against `off`; if the factorised path raises, the replaced plan
+    answers instead.
+
+    **Known limitations**, measured rather than assumed, with the numbers in
+    DECISIONS.md: the cost model's coefficients are fitted on one machine and do
+    not transfer between machines or datasets; its estimates are wrong where it
+    is most confident; and on the benchmark corpus six queries run slower than
+    the plan they replace, one of them past a sixty-second cap. Those cost 87 s
+    in total against 1160 s gained.
