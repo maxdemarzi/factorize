@@ -263,28 +263,31 @@ queries this database can run, stock and `auto`, on one build, capped at 60s:
 | dataset | n | rescued | lost | faster | slower | neither | net |
 |---|---|---|---|---|---|---|---|
 | hetio | 344 | 223 | 0 | 48 | 1 | 72 | +1123.0 s |
+| dblp | 52 | 12 | 0 | 11 | 8 | 21 | +0.8 s |
 | watdiv | 38 | 8 | 1 | 10 | 14 | 5 | +30.7 s |
 | yago | 8 | 1 | 0 | 1 | 6 | 0 | +6.3 s |
-| **total** | **390** | **232** | **1** | **59** | **21** | **77** | **+1160.0 s** |
+| **total** | **442** | **244** | **1** | **70** | **29** | **98** | **+1160.7 s** |
 
-**232 answers that the stock plan does not produce**, in a median of 0.07 s
+**244 answers that the stock plan does not produce**, in a median of 0.09 s
 against a plan that has not finished in sixty. One query is lost:
-`watdiv_217_10`, which stock answers in 7.3 s and this engine no longer
-finishes — the price of the D70 estimator fix, which bought nine further
-rescues for it (D72).
+`watdiv_217_10`, which stock answers in 7.3 s — the price of the D70
+estimator fix, which bought nine further rescues for it (D72).
 
-Every slowdown together costs 71.7 s against that +1160.0 s. The worst is
-`watdiv_218_15` at 3.1x; past the top three nothing exceeds 1.4x, and every
-one over 2x is watdiv, where DuckDB's cost per tuple is over-predicted and no
-global constant separates the cases (D71).
+Every slowdown across all 442 costs 87.1 s together against that +1160.7 s.
+The worst is `watdiv_218_15` at 3.1x, and every one over 2x is watdiv, where
+DuckDB's cost per tuple is over-predicted. Four plan-time features were tried
+as a way to decline those and every one cost four to five good fires per bad
+one stopped (D73), so they are accepted rather than gated out.
 
-All 232 rescues sit above 1e10 expected tuples. Below 1e9 firing is never
-worth it. The middle band is 36 faster against 14 slower for +433.6 s — still
-the opposite sign to what D61 read from watdiv and yago alone, which remains
-the most useful mistake in this file.
+242 of the 244 rescues sit above 1e10 expected tuples and nothing below 1e9 is
+worth firing on. It was *all* of them until dblp was measured, which is the
+third rule in this project to be generalised past its evidence and corrected
+by the next dataset (D74) — after D42's "strictly better" and D61's two
+regimes. The statements that have survived here are the ones with a count
+attached.
 
-dblp's 52 queries are now loaded and run correctly (D66) but are not yet
-timed; job's 39 have no CSVs here and stay unmeasurable.
+job's 39 queries have no CSVs in this database and stay unmeasurable; they
+are the only part of the excluded corpus still unmeasured.
 
 Also worth knowing before trusting any number here:
 

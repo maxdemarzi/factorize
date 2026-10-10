@@ -5184,3 +5184,53 @@ six losses costing 71.7s against 232 rescues and +1160.0s, which is the current
 state and a defensible one. This entry exists so the next person does not
 re-derive the four tables above: the search for a plan-time discriminator is
 finished, and it came back empty.
+
+## D74 — dblp joins the corpus, and breaks the band rule
+
+dblp's 52 excluded queries have been loadable since D66 and untimed since.
+Measured now, same method, they make the corpus 442 of the 481 — everything
+but job's 39, which have no CSVs here.
+
+    dataset       n  rescued     lost   faster   slower  neither        net
+    hetio       344      223        0       48        1       72   +1123.0s
+    dblp         52       12        0       11        8       21      +0.8s
+    watdiv       38        8        1       10       14        5     +30.7s
+    yago          8        1        0        1        6        0      +6.3s
+    TOTAL       442      244        1       70       29       98   +1160.7s
+
+**dblp is a third pattern, and a mild one.** Twelve answers that do not
+otherwise exist, no losses, and on the nineteen queries both engines answer it
+is a dead heat: 222.9s stock against 222.2s ours. Eleven faster and eight
+slower, with the worst slowdown 1.2x and all eight together costing 15.4s.
+Where hetio is a rout and watdiv a brawl, dblp is a draw with twelve free
+answers on the side.
+
+The gate fires on 13 of its 52, against hetio's 82%. A low fire rate that costs
+almost nothing and collects every available rescue is the gate working as
+intended, and it is the first dataset where that is cleanly visible.
+
+**And it falsifies the band rule.** Across 390 queries every rescue sat above
+1e10 expected tuples, stated as such in D64, D72 and the README. Two of dblp's
+do not:
+
+    dblp_acyclic_212_00   expected 1,252,330,602   stock cap -> 1.849s
+    dblp_acyclic_212_17   expected 4,016,459,225   stock cap -> 0.913s
+
+Both are comfortably inside the 1e9-1e10 band, and both are answered in under
+two seconds against a stock plan that does not finish in sixty. So "all rescues
+are above 1e10" was a property of three datasets, not of the regime, and it
+lasted exactly as long as it took to measure a fourth. The weaker claim
+survives and is the useful one: rescues concentrate heavily above 1e10 -- 242
+of 244 -- and nothing below 1e9 is worth firing on.
+
+That is the third time a claim in this file has been generalised past its
+evidence and corrected by the next dataset, after D42's "strictly better" and
+D61's two regimes. The pattern is consistent enough to be worth naming: every
+rule here that was derived from the datasets at hand has failed on the next
+one, and the only statements that have survived are the ones with a count
+attached.
+
+**Where it leaves the project.** 244 answers the stock plan does not produce,
+median 0.09s against a plan that has not finished in sixty; one query lost;
+every slowdown in 442 queries costing 87.1s together against +1160.7s gained.
+job's 39 queries remain unmeasurable here for want of data.
