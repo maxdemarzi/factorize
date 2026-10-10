@@ -5084,3 +5084,53 @@ per-dataset calibration the gate has no way to perform at plan time.
 Recorded so the next person does not spend the afternoon I just spent: the
 knobs are instrumented, the sweep takes fifteen minutes, and it has now
 returned the same answer twice from very different starting points.
+
+## D72 — The corpus after D70: nine more answers, and the first one lost
+
+D64's table was measured before D70 fixed the single-relation class estimate,
+and seven decisions changed under it. Re-measured whole, same method, one
+build, 60s cap:
+
+    dataset       n  rescued     lost   faster   slower  neither        net
+    hetio       344      223        0       48        1       72   +1123.0s
+    watdiv       38        8        1       10       14        5     +30.7s
+    yago          8        1        0        1        6        0      +6.3s
+    TOTAL       390      232        1       59       21       77   +1160.0s
+
+Against D64:
+
+                  D64      now   change
+    rescued       223      232       +9
+    lost            0        1       +1
+    faster         67       59       -8
+    slower         15       21       +6
+    net        1168.8   1160.0     -8.8
+    slowdowns    29.5s    71.7s    +42.2
+
+**So D70 bought nine answers that did not previously exist, for one answer
+given up and 42 seconds of extra slowdown, at the same total time.** Whether
+that is a good trade is a judgement rather than a measurement, and it is worth
+stating in the open: this project has valued rescues above everything since
+D60, because an answer that does not otherwise exist cannot be obtained by
+waiting, while a query made 3x slower can. Nine for one is consistent with
+that. It is also the first time the corpus has a query in the "lost" column.
+
+That query is `watdiv_acyclic_217_10`: stock answers in 7.3s, we no longer
+finish in 60. It is one of the three D62 and D63 declined and D70 re-admitted,
+and D71 established that no global constant can decline it without costing
+more than it saves.
+
+**The bands are unchanged in shape.** All 232 rescues are above 1e10 expected
+tuples, nothing below 1e9 is worth firing on (one faster, five slower, -0.2s
+between them), and the middle band is 36 faster against 14 slower for +433.6s
+-- still the opposite sign to what D61 read from watdiv and yago alone.
+
+**The slowdowns are more numerous and still small.** 21 of them costing 71.7s
+together, against +1160.0s gained. The worst is `watdiv_218_15` at 3.1x, then
+`217_05` at 2.9x and `210_17` at 2.7x; past those nothing exceeds 1.4x. Every
+one over 2x is watdiv, which is the over-prediction D71 ends on.
+
+**One thing this run proved incidentally.** `scripts/clean-spill.sh`, added when
+the measurement directory had quietly grown to 23GB of orphaned DuckDB spill,
+removed 18GB during the stock pass and 28GB during the `auto` pass. Without it
+this single run would have left 46GB behind.
