@@ -5134,3 +5134,53 @@ one over 2x is watdiv, which is the over-prediction D71 ends on.
 the measurement directory had quietly grown to 23GB of orphaned DuckDB spill,
 removed 18GB during the stock pass and 28GB during the `auto` pass. Without it
 this single run would have left 46GB behind.
+
+## D73 — Four plan-time features, none of which separates a loss from a rescue
+
+D71 ended by saying the watdiv over-prediction needs something that tells the
+cases apart from the inside rather than another constant. Before building that,
+it is worth knowing whether anything the gate already has would do. Four
+candidates, scored over the 330 queries the gate fires on, against the
+D72 outcomes:
+
+    feature                         to stop all 6 bad     fires it costs
+    predicted compression           cutoff 65             29
+    predicted own work              never does            --
+    predicted speedup               >= 12x                26
+    DuckDB per-tuple cost (D71)     scale 0.19            all 4 gains first
+
+Four to five good fires surrendered per bad one stopped, every time, and the
+losses are only six queries costing 71.7s together.
+
+**They fail for the same reason and it is not arbitrary.** On every axis the
+gate can see, the six losses sit among the rescues rather than apart from them:
+
+  - *Compression.* The losses run 21 to 64. So do rescues:
+    `hetio_226_13` at 10.0, `204_01` at 17.2, `210_00` at 17.3. D14 rejected
+    compression thresholds because speedup is compression times a per-record
+    factor spanning 84x across datasets; this is that rejection re-confirmed on
+    a corpus 20 times larger.
+
+  - *Predicted own work.* The losses predict about 45s of it. The queries
+    predicting the most are rescues -- `hetio_211_10` at 736s, `211_08` at
+    700s, `210_16` at 460s -- because a query where we expect to work for ten
+    minutes and the stock plan never finishes is exactly the case this engine
+    exists for. A ceiling here cuts off the top of the value, not the bottom.
+
+  - *Predicted speedup.* Good outcomes have a median of 425x and the losses
+    5-11x, which looks decisive until the low end is read: `hetio_210_00` at
+    1.98x and `204_01` at 2.02x are rescues, and a 12x bar takes both.
+
+**So the gate has no feature that is about being right.** It has features about
+size and features about confidence, and the six losses are ordinary on all of
+them. What makes them lose is not visible at plan time: all six are watdiv,
+where DuckDB costs 1.6e-6 ms per result tuple against hetio's 2.8e-6 and yago's
+5.0e-5 (D65), so the same predicted tuple count means something different
+depending on a property of the dataset the gate never sees.
+
+**Which leaves two honest options.** Measure the per-tuple cost at runtime and
+feed it back, which is a different architecture and not a constant; or accept
+six losses costing 71.7s against 232 rescues and +1160.0s, which is the current
+state and a defensible one. This entry exists so the next person does not
+re-derive the four tables above: the search for a plan-time discriminator is
+finished, and it came back empty.
