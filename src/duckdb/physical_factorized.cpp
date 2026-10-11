@@ -76,6 +76,8 @@ public:
 	//! For a grouped query: the groups, and how many have been handed out. There
 	//! can be more of them than fit one vector.
 	unique_ptr<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>> groups;
+	//! Tuples per group, parallel to `groups`: an AVG's denominator.
+	std::vector<int64_t> counts;
 	idx_t handed_out = 0;
 	//! Set once the factorized path has failed and the plan it replaced is
 	//! answering instead (§7.5). Under `lock`, because several threads can be
@@ -306,10 +308,12 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 				throw InvalidInputException("factorize: %s", result.error);
 			}
 			gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
+			gstate.counts = std::move(result.counts);
 		}
 	}
 
 	auto &groups = *gstate.groups;
+	const auto &counts = gstate.counts;
 	idx_t produced = 0;
 	lock_guard<mutex> guard(gstate.lock);
 	if (!grouped && groups.empty() && gstate.handed_out == 0) {
@@ -341,10 +345,22 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			chunk.SetValue(key, produced, Value::Numeric(group_types[key], group.first[key]));
 		}
 		for (idx_t i = 0; i < aggregates.size(); i++) {
-			chunk.SetValue(group_types.size() + i, produced,
-			               aggregates[i].kind == factorize::Aggregate::COUNT
-			                   ? Value::BIGINT(group.second[i])
-			                   : FoldedValue(group.second[i], aggregate_types[i]));
+			Value out;
+			if (aggregates[i].kind == factorize::Aggregate::AVG) {
+				// The sum is in `values`, the denominator in `counts`, and the
+				// division is here because the core deals in integers and a
+				// mean is not one. A group exists only if some tuple made it,
+				// so the count cannot be zero (D78).
+				const int64_t tuples = gstate.handed_out < counts.size() ? counts[gstate.handed_out] : 0;
+				out = tuples > 0 ? Value::DOUBLE(static_cast<double>(group.second[i]) /
+				                                 static_cast<double>(tuples))
+				                 : Value(aggregate_types[i]);
+			} else if (aggregates[i].kind == factorize::Aggregate::COUNT) {
+				out = Value::BIGINT(group.second[i]);
+			} else {
+				out = FoldedValue(group.second[i], aggregate_types[i]);
+			}
+			chunk.SetValue(group_types.size() + i, produced, out);
 		}
 		gstate.handed_out++;
 		produced++;

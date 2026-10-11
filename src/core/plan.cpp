@@ -1476,6 +1476,10 @@ public:
 	static bool IsExtreme(Aggregate kind) {
 		return kind == Aggregate::MIN || kind == Aggregate::MAX;
 	}
+	//! AVG folds exactly as SUM does; only the emission differs.
+	static bool IsSum(Aggregate kind) {
+		return kind == Aggregate::SUM || kind == Aggregate::AVG;
+	}
 
 	Fold Combine(const Fold &a, const Fold &b) const {
 		Fold result;
@@ -1550,7 +1554,7 @@ private:
 			Fold child_fold = Identity();
 			child_fold.count = rep.SubtreeSize(child);
 			for (size_t i = 0; i < aggregates.size(); i++) {
-				if (aggregates[i].kind == Aggregate::SUM) {
+				if (IsSum(aggregates[i].kind)) {
 					child_fold.sums[i] = rep.SubtreeSum(child, sum_attributes[i]);
 				} else if (IsExtreme(aggregates[i].kind)) {
 					child_fold.extremes[i] =
@@ -1572,7 +1576,7 @@ private:
 		const auto &level = rep.GetLayout().Level(record.Level());
 		for (size_t i = 0; i < aggregates.size(); i++) {
 			const bool extreme = IsExtreme(aggregates[i].kind);
-			if (aggregates[i].kind != Aggregate::SUM && !extreme) {
+			if (!IsSum(aggregates[i].kind) && !extreme) {
 				continue;
 			}
 			for (const auto &entry : level.payload) {
@@ -1769,6 +1773,7 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 			for (size_t i = 0; i < aggregates.size(); i++) {
 				switch (aggregates[i].kind) {
 				case Aggregate::SUM:
+				case Aggregate::AVG:
 					values.push_back(entry.second.sums[i]);
 					break;
 				case Aggregate::MIN:
@@ -1781,6 +1786,7 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 				}
 			}
 			result.groups.emplace_back(entry.first, std::move(values));
+			result.counts.push_back(entry.second.count);
 		}
 		result.records = accumulated.Rep().RecordCount();
 		result.bytes = accumulated.Rep().BytesAllocated();

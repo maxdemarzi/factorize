@@ -94,9 +94,20 @@ InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 			folds += "count(*)";
 			continue;
 		}
-		const char *fold_name = entry.kind == factorize::Aggregate::SUM
-		                            ? "sum"
-		                            : (entry.kind == factorize::Aggregate::MIN ? "min" : "max");
+		const char *fold_name = "max";
+		switch (entry.kind) {
+		case factorize::Aggregate::SUM:
+			fold_name = "sum";
+			break;
+		case factorize::Aggregate::AVG:
+			fold_name = "avg";
+			break;
+		case factorize::Aggregate::MIN:
+			fold_name = "min";
+			break;
+		default:
+			break;
+		}
 		folds += string(fold_name) + "(" + relations[entry.relation].alias + "." +
 		         relations[entry.relation].column_names[entry.column] + ")";
 	}

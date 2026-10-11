@@ -179,7 +179,7 @@ def make_aggregates(rng, aliases):
                 chosen.append("count(*)")
             continue
         alias, _, cols = rng.choice(aliases)
-        fold = rng.choice(["sum", "sum", "min", "max"])
+        fold = rng.choice(["sum", "sum", "min", "max", "avg", "count"])
         term = f"{fold}({alias}.{rng.choice(cols)})"
         if term not in seen:
             seen.add(term)

@@ -5432,3 +5432,48 @@ addition does not reassociate and `auto` must stay bit-exact against `off`. min
 and max reassociate freely and would be exact on any ordered type -- they are
 declined for storage, not for arithmetic, and a representation that carried
 other types could have them.
+
+## D78 — avg and count(c), neither of them a new fold
+
+Two more aggregates reachable from SQL, and the point of this entry is that
+neither needed a fold. The walk already computes everything they are made of.
+
+**avg is the sum fold over the tuple count the walk already carries.** Every
+group's count is computed whether or not a `count(*)` was asked for -- it is
+what decides whether the group exists at all -- so a mean is a division and no
+extra pass. `GroupCountResult` returns those counts alongside the values rather
+than making the caller request an extra aggregate, so asking for a mean does
+not change how many folds a query has.
+
+The division is the caller's, in the operator, because the core deals in
+integers and a mean is not one. Checked first rather than assumed: on 100,000
+rows DuckDB's `avg(v)` is exactly `sum(v)::DOUBLE / count(*)`, so the division
+is not a second way to compute the same thing, which matters because D10's
+invariant is that `auto` is bit-exact against `off`. avg is also the first
+floating-point value this engine produces, and it produces it by dividing two
+exact integers rather than by accumulating.
+
+**count(c) is count(\*) over a scan that has already dropped the NULLs.** The
+fold counts tuples and knows nothing of NULLs. But a column has to be read to
+be aggregated, and reading it drops the rows where it is NULL -- which are
+exactly the rows `count(c)` does not count. So the tuple count of that scan is
+the answer, with no new machinery at all.
+
+Measured, on a relation with three NULLs among five rows: `count(*)` reads only
+the key, drops nothing, and answers 5; `count(c)` reads the column, drops three
+rows, and answers 2. Both match stock. And a query asking for *both* is
+declined, which is the pre-existing refusal working as intended -- dropping a
+row for the sake of `count(c)` would make `count(*)` wrong, and that is the one
+case where the two cannot share a scan.
+
+**Checked three ways,** as D77's were: brute force in the core suite, stock
+DuckDB in the SQL suite including the empty join where avg returns NULL like a
+sum rather than 0 like a count, and stock DuckDB on 1,200 random queries with
+avg and count(c) now in the fuzzer's draw -- 388 taken over, no disagreements.
+
+**What the two have in common** is worth naming, because it is the second time
+in two entries. min and max were already describable in the fold's own terms;
+avg and count(c) are describable in terms of quantities the fold already
+produced and threw away. Three of the four aggregates added since D76 cost
+nothing but plumbing, which says the fold was built more generally than the
+matcher ever asked it to be.

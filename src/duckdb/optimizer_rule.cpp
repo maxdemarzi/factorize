@@ -81,6 +81,12 @@ struct RegionAggregate {
 	factorize::Aggregate kind = factorize::Aggregate::COUNT;
 	ColumnBinding sum_binding;
 	LogicalType type;
+	//! Whether `sum_binding` names a column that has to be resolved against the
+	//! scan. True for sum, min, max and avg; also true for `count(c)`, which
+	//! folds as a plain count but must still check that `c` cannot be NULL --
+	//! `count(c)` and `count(*)` differ exactly on the rows this engine would
+	//! have to drop to read `c` at all (D78).
+	bool reads_column = false;
 };
 
 struct FactorizedRegion {
@@ -454,6 +460,30 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				continue;
 			}
 			entry.kind = factorize::Aggregate::SUM;
+			entry.reads_column = true;
+			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+		} else if (name == "avg") {
+			// sum / count, and the walk already has both: the sum is the same
+			// fold, the count is the tuple count every group carries anyway. So
+			// a mean costs a division and no extra pass (D78).
+			if (bound.children.size() != 1 ||
+			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				Decline(region, "avg() of a computed expression");
+				ok = false;
+				continue;
+			}
+			entry.kind = factorize::Aggregate::AVG;
+			entry.reads_column = true;
+			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+		} else if (name == "count" && bound.children.size() == 1 &&
+		           bound.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			// `count(c)` counts the rows where `c` is not NULL. The fold counts
+			// tuples and knows nothing of NULLs, so this is `count(*)` exactly
+			// when `c` cannot be NULL -- and that is the same condition the
+			// other column-reading aggregates already require, for the same
+			// reason, so it is checked in the same place.
+			entry.kind = factorize::Aggregate::COUNT;
+			entry.reads_column = true;
 			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
 		} else if (name == "min" || name == "max") {
 			// The same fold again, with the idempotent semiring (D77). Same
@@ -477,9 +507,10 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				continue;
 			}
 			entry.kind = name == "min" ? factorize::Aggregate::MIN : factorize::Aggregate::MAX;
+			entry.reads_column = true;
 			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
 		} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
-			Decline(region, "aggregate is " + name + "(), not count(*), sum(), min() or max()");
+			Decline(region, "aggregate is " + name + "(), not count, sum, min, max or avg");
 			ok = false;
 			continue;
 		}
@@ -739,7 +770,7 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 	}
 
 	for (const auto &aggregate : region.aggregates) {
-		if (aggregate.kind == factorize::Aggregate::COUNT) {
+		if (!aggregate.reads_column) {
 			// count(*) reads nothing: the representation knows how many tuples
 			// a subtree denotes without looking at any column of them.
 			aggregates.push_back(factorize::GroupAggregate {factorize::Aggregate::COUNT, 0, 0});

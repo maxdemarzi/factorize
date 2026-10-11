@@ -319,7 +319,14 @@ enum class Aggregate : uint8_t {
 	//! reach the answer. That is why the fold carries a count alongside the
 	//! extreme even here (D77).
 	MIN,
-	MAX
+	MAX,
+	//! The mean of one column over those tuples.
+	//!
+	//! Not a fold of its own: it is the SUM fold divided by the tuple count the
+	//! walk already carries, so it costs nothing beyond a division. `values`
+	//! holds the sum for an AVG, and `counts` the denominator -- the core deals
+	//! in integers and a mean is not one, so the division is the caller's (D78).
+	AVG
 };
 
 //! Sums one column over the join without materializing it.
@@ -339,6 +346,13 @@ struct GroupCountResult {
 	//! values, in the order the caller listed them, then one value per
 	//! aggregate, in the order the caller listed those.
 	std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>> groups;
+	//! Tuples in each group, parallel to `groups`.
+	//!
+	//! The walk computes this whether or not a `count(*)` was asked for, and an
+	//! AVG needs it as a denominator. Returned rather than requested as an
+	//! extra aggregate so that asking for a mean does not change how many folds
+	//! a query has, and so the caller need not know that it did.
+	std::vector<int64_t> counts;
 	size_t records = 0;
 	size_t bytes = 0;
 };

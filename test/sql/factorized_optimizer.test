@@ -2210,3 +2210,85 @@ physical_plan	<!REGEX>:.*FACTORIZED.*
 
 statement ok
 SET factorize_mode = 'force';
+
+# avg() and count(c), neither of which is a new fold (D78). avg is the sum fold
+# divided by the tuple count the walk already carries; count(c) is the tuple
+# count of a scan that has dropped the rows where c is NULL, which is exactly
+# the rows count(c) does not count.
+statement ok
+CREATE TABLE av_r0(k INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE av_r1(k INTEGER NOT NULL, v INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE av_r2(k INTEGER NOT NULL, w INTEGER NOT NULL);
+
+statement ok
+INSERT INTO av_r0 VALUES (1),(2),(3);
+
+statement ok
+INSERT INTO av_r1 VALUES (1,50),(1,60),(3,70);
+
+statement ok
+INSERT INTO av_r2 VALUES (1,5),(1,40),(2,60),(9,-999);
+
+statement ok
+SET factorize_mode = 'force';
+
+query IIII
+SELECT count(*), count(av_r1.v), avg(av_r1.v), avg(av_r2.w)
+  FROM av_r0, av_r1, av_r2 WHERE av_r0.k = av_r1.k AND av_r0.k = av_r2.k;
+----
+4	4	55	22.5
+
+query III
+SELECT av_r0.k, avg(av_r2.w), count(av_r2.w)
+  FROM av_r0, av_r1, av_r2 WHERE av_r0.k = av_r1.k AND av_r0.k = av_r2.k
+ GROUP BY av_r0.k ORDER BY 1;
+----
+1	22.5	4
+
+# An empty join: avg is NULL like a sum, count is 0.
+query III
+SELECT count(*), count(av_r1.v), avg(av_r1.v)
+  FROM av_r0, av_r1 WHERE av_r0.k = av_r1.k AND av_r0.k = 99;
+----
+0	0	NULL
+
+# count(c) over a NULLable column counts the non-NULL rows, and gets there by
+# the scan dropping them -- so it must disagree with count(*) by exactly the
+# NULLs, and each must be right on its own.
+statement ok
+CREATE TABLE av_n(k INTEGER NOT NULL, v INTEGER);
+
+statement ok
+INSERT INTO av_n VALUES (1,5),(1,NULL),(1,NULL),(1,NULL),(1,7);
+
+query I
+SELECT count(av_n.v) FROM av_r0, av_n WHERE av_r0.k = av_n.k;
+----
+2
+
+query I
+SELECT count(*) FROM av_r0, av_n WHERE av_r0.k = av_n.k;
+----
+5
+
+query I
+SELECT avg(av_n.v) FROM av_r0, av_n WHERE av_r0.k = av_n.k;
+----
+6
+
+# Both in one query is the case that must be declined rather than answered:
+# dropping a row for the sake of count(v) would make count(*) wrong.
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT count(*), count(av_n.v) FROM av_r0, av_n WHERE av_r0.k = av_n.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'force';
