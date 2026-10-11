@@ -65,7 +65,8 @@ docs:
     cost model exists to tell those regimes apart, and `auto` declines far more
     often than it fires.
 
-    **Scope.** count(\*), count(c), sum, avg, min and max over acyclic equi-join
+    **Scope.** count(\*), count(c), sum, avg, min, max, bool_and and bool_or
+    over acyclic equi-join
     graphs of many-to-many joins on integer and DECIMAL columns, with GROUP BY,
     EXISTS and LIMIT.
     Anything else is declined and the stock plan runs unchanged. `auto` is

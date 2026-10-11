@@ -485,6 +485,26 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			entry.kind = factorize::Aggregate::COUNT;
 			entry.reads_column = true;
 			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+		} else if (name == "bool_and" || name == "bool_or") {
+			// The same idempotent semiring as min and max, over {false, true}:
+			// bool_and is the minimum and bool_or the maximum once false is 0
+			// and true is 1, which is how a BOOLEAN reaches the representation
+			// (D79). So no new fold -- only a different name for an existing
+			// one, and a BOOLEAN result rather than an integer one.
+			if (bound.children.size() != 1 ||
+			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				Decline(region, name + "() of a computed expression");
+				ok = false;
+				continue;
+			}
+			if (bound.children[0]->return_type.id() != LogicalTypeId::BOOLEAN) {
+				Decline(region, name + "() of a " + bound.children[0]->return_type.ToString() + " column");
+				ok = false;
+				continue;
+			}
+			entry.kind = name == "bool_and" ? factorize::Aggregate::MIN : factorize::Aggregate::MAX;
+			entry.reads_column = true;
+			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
 		} else if (name == "min" || name == "max") {
 			// The same fold again, with the idempotent semiring (D77). Same
 			// requirement on the argument and for the same reason: it is folded

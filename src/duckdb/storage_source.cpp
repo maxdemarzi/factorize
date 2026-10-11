@@ -45,6 +45,15 @@ bool TryIntegerKeyType(const LogicalType &type, factorize::ValueType &result) {
 }
 
 bool TrySummableType(const LogicalType &type, factorize::ValueType &result) {
+	// A folded column may be BOOLEAN; a join key may not. Deliberately added
+	// here and not to TryIntegerKeyType: bool_and and bool_or need to read one
+	// (D79), while joining on a two-valued column is a shape nothing has
+	// measured and widening the key types for it would be an untested side
+	// effect of an unrelated feature.
+	if (type.id() == LogicalTypeId::BOOLEAN) {
+		result = factorize::ValueType::INT32;
+		return true;
+	}
 	if (type.id() == LogicalTypeId::DECIMAL) {
 		switch (type.InternalType()) {
 		case PhysicalType::INT16:
@@ -151,6 +160,11 @@ static void AppendColumn(const LogicalType &type, const UnifiedVectorFormat &for
 		return AppendTyped<uint32_t>(format, kept, out);
 	case LogicalTypeId::UBIGINT:
 		return AppendTyped<uint64_t>(format, kept, out);
+	case LogicalTypeId::BOOLEAN:
+		// DuckDB stores a BOOLEAN one byte wide, so it reads like any other
+		// narrow integer and lands as 0 or 1 -- which is the order bool_and and
+		// bool_or need, false below true (D79).
+		return AppendTyped<bool>(format, kept, out);
 	default:
 		throw InternalException("factorize: unsupported key type %s", type.ToString());
 	}

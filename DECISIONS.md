@@ -5477,3 +5477,28 @@ avg and count(c) are describable in terms of quantities the fold already
 produced and threw away. Three of the four aggregates added since D76 cost
 nothing but plumbing, which says the fold was built more generally than the
 matcher ever asked it to be.
+
+## D79 — bool_and and bool_or, which are min and max wearing a hat
+
+Once a BOOLEAN reaches the representation as 0 and 1, `bool_and` is the minimum
+and `bool_or` the maximum. So these are not a new fold, not even a new
+semiring: they are D77's fold under another name, with a BOOLEAN result instead
+of an integer one. The matcher maps them straight onto `Aggregate::MIN` and
+`Aggregate::MAX`.
+
+**The only real work was reading the column,** and it came with a choice. The
+scan has two type gates: `TryIntegerKeyType` for join keys and `TrySummableType`
+for folded columns, the latter already wider by a DECIMAL. BOOLEAN was added to
+the second only.
+
+That is deliberate. Adding it to the first as well would have been one line
+fewer and would have quietly made BOOLEAN *join keys* eligible -- a two-valued
+join key is a shape nothing in this project has measured, and the gate's whole
+difficulty is skew, which a two-valued column has in the extreme. Widening the
+key types as a side effect of adding an aggregate is how an untested shape
+arrives in a release. The SQL suite pins the refusal so the choice stays made.
+
+Checked against stock, grouped and ungrouped, on a fixture where one relation is
+all-true and the other mixed, so `bool_and` and `bool_or` disagree and each
+group disagrees with the whole. An empty join gives NULL, as for everything but
+`count(*)`.

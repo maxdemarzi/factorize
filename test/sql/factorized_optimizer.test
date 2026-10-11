@@ -2292,3 +2292,74 @@ physical_plan	<!REGEX>:.*FACTORIZED.*
 
 statement ok
 SET factorize_mode = 'force';
+
+# bool_and and bool_or are min and max over {false, true} once a BOOLEAN reaches
+# the representation as 0 and 1, so they are an existing fold under another name
+# (D79). BOOLEAN is allowed as a folded column and still refused as a join key:
+# reading one is what these need, joining on one is an untested shape.
+statement ok
+CREATE TABLE bl_r0(k INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE bl_r1(k INTEGER NOT NULL, f BOOLEAN NOT NULL);
+
+statement ok
+CREATE TABLE bl_r2(k INTEGER NOT NULL, g BOOLEAN NOT NULL);
+
+statement ok
+INSERT INTO bl_r0 VALUES (1),(2);
+
+statement ok
+INSERT INTO bl_r1 VALUES (1,true),(1,true),(2,true);
+
+statement ok
+INSERT INTO bl_r2 VALUES (1,true),(1,false),(2,true);
+
+statement ok
+SET factorize_mode = 'force';
+
+query IIII
+SELECT bool_and(bl_r1.f), bool_or(bl_r1.f), bool_and(bl_r2.g), bool_or(bl_r2.g)
+  FROM bl_r0, bl_r1, bl_r2 WHERE bl_r0.k = bl_r1.k AND bl_r0.k = bl_r2.k;
+----
+true	true	false	true
+
+query III
+SELECT bl_r0.k, bool_and(bl_r2.g), bool_or(bl_r2.g)
+  FROM bl_r0, bl_r1, bl_r2 WHERE bl_r0.k = bl_r1.k AND bl_r0.k = bl_r2.k
+ GROUP BY bl_r0.k ORDER BY 1;
+----
+1	false	true
+2	true	true
+
+# An empty join is NULL, as for every aggregate but count(*).
+query III
+SELECT count(*), bool_and(bl_r1.f), bool_or(bl_r1.f)
+  FROM bl_r0, bl_r1 WHERE bl_r0.k = bl_r1.k AND bl_r0.k = 99;
+----
+0	NULL	NULL
+
+# A BOOLEAN join key is still refused, which is the side effect this change
+# deliberately did not take.
+statement ok
+SET factorize_mode = 'auto';
+
+statement ok
+CREATE TABLE bl_k1(b BOOLEAN NOT NULL, v INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE bl_k2(b BOOLEAN NOT NULL, v INTEGER NOT NULL);
+
+statement ok
+INSERT INTO bl_k1 VALUES (true,1);
+
+statement ok
+INSERT INTO bl_k2 VALUES (true,1);
+
+query II
+EXPLAIN SELECT count(*) FROM bl_k1, bl_k2 WHERE bl_k1.b = bl_k2.b;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'force';
