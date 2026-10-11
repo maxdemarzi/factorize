@@ -1,5 +1,6 @@
 #include "plan.hpp"
 
+#include <limits>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -1451,12 +1452,45 @@ public:
 	struct Fold {
 		int64_t count = 1;
 		int64_t sums[kMaxAggregates] = {};
+		//! Per aggregate, the extreme so far, at the identity when nothing has
+		//! been seen. Set up by `Identity()` rather than default-initialised,
+		//! since min and max have different identities.
+		int64_t extremes[kMaxAggregates] = {};
 	};
+
+	//! A fold standing for one tuple carrying nothing yet.
+	Fold Identity() const {
+		Fold fold;
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			fold.extremes[i] = ExtremeIdentity(i);
+		}
+		return fold;
+	}
+	int64_t ExtremeIdentity(size_t i) const {
+		return aggregates[i].kind == Aggregate::MAX ? std::numeric_limits<int64_t>::min()
+		                                            : std::numeric_limits<int64_t>::max();
+	}
+	int64_t Better(size_t i, int64_t a, int64_t b) const {
+		return aggregates[i].kind == Aggregate::MAX ? std::max(a, b) : std::min(a, b);
+	}
+	static bool IsExtreme(Aggregate kind) {
+		return kind == Aggregate::MIN || kind == Aggregate::MAX;
+	}
 
 	Fold Combine(const Fold &a, const Fold &b) const {
 		Fold result;
 		result.count = CheckedCardinalityMul(a.count, b.count);
 		for (size_t i = 0; i < aggregates.size(); i++) {
+			if (IsExtreme(aggregates[i].kind)) {
+				// The product of two branches is empty if either is, and then
+				// no value from the other belongs to any tuple. Taking the
+				// better of the two here regardless is the §4.6 hazard in its
+				// min/max form: it would report a value no tuple carries.
+				result.extremes[i] = (a.count == 0 || b.count == 0)
+				                         ? ExtremeIdentity(i)
+				                         : Better(i, a.extremes[i], b.extremes[i]);
+				continue;
+			}
 			result.sums[i] = CheckedCardinalityAdd(CheckedCardinalityMul(a.sums[i], b.count),
 			                                       CheckedCardinalityMul(a.count, b.sums[i]));
 		}
@@ -1467,6 +1501,12 @@ public:
 		Fold result;
 		result.count = CheckedCardinalityAdd(a.count, b.count);
 		for (size_t i = 0; i < aggregates.size(); i++) {
+			if (IsExtreme(aggregates[i].kind)) {
+				// A union needs no emptiness check: an empty alternative holds
+				// the identity, which loses to anything real.
+				result.extremes[i] = Better(i, a.extremes[i], b.extremes[i]);
+				continue;
+			}
 			result.sums[i] = CheckedCardinalityAdd(a.sums[i], b.sums[i]);
 		}
 		return result;
@@ -1496,7 +1536,7 @@ public:
 
 	void Run(std::map<std::vector<int64_t>, Fold> &out) {
 		std::vector<int64_t> row(width, 0);
-		Fold identity;
+		const Fold identity = Identity();
 		rep.ForEachRoot([&](Record root) { Descend(root, row, identity, out); });
 	}
 
@@ -1504,14 +1544,17 @@ private:
 	//! What a slot's children stand for, taken together: they are alternatives,
 	//! so they add.
 	Fold SlotTotals(Record record, size_t slot_index) const {
-		Fold total;
+		Fold total = Identity();
 		total.count = 0;
 		rep.ForEachChild(record, slot_index, [&](Record child) {
-			Fold child_fold;
+			Fold child_fold = Identity();
 			child_fold.count = rep.SubtreeSize(child);
 			for (size_t i = 0; i < aggregates.size(); i++) {
 				if (aggregates[i].kind == Aggregate::SUM) {
 					child_fold.sums[i] = rep.SubtreeSum(child, sum_attributes[i]);
+				} else if (IsExtreme(aggregates[i].kind)) {
+					child_fold.extremes[i] =
+					    rep.SubtreeExtreme(child, sum_attributes[i], aggregates[i].kind == Aggregate::MAX);
 				}
 			}
 			total = Alternatives(total, child_fold);
@@ -1522,20 +1565,27 @@ private:
 	//! This record's own contribution before any child is considered: one tuple
 	//! so far, carrying its own value if the summed column lives here.
 	Fold Own(Record record) const {
-		Fold fold;
+		Fold fold = Identity();
 		// Its multiplicity, so a grouped record contributes the tuples it
 		// stands for rather than one of them.
 		fold.count = rep.HasWeights() ? rep.GetWeight(record) : 1;
 		const auto &level = rep.GetLayout().Level(record.Level());
 		for (size_t i = 0; i < aggregates.size(); i++) {
-			if (aggregates[i].kind != Aggregate::SUM) {
+			const bool extreme = IsExtreme(aggregates[i].kind);
+			if (aggregates[i].kind != Aggregate::SUM && !extreme) {
 				continue;
 			}
 			for (const auto &entry : level.payload) {
 				if (entry.attribute == sum_attributes[i]) {
-					// Each of the tuples this record stands for carries the
-					// value, so the sum is the value that many times.
-					fold.sums[i] = CheckedCardinalityMul(rep.GetValue(record, sum_attributes[i]), fold.count);
+					if (extreme) {
+						// Multiplicity is irrelevant to an extreme: one copy of
+						// the value and a thousand have the same minimum.
+						fold.extremes[i] = rep.GetValue(record, sum_attributes[i]);
+					} else {
+						// Each of the tuples this record stands for carries the
+						// value, so the sum is the value that many times.
+						fold.sums[i] = CheckedCardinalityMul(rep.GetValue(record, sum_attributes[i]), fold.count);
+					}
 					break;
 				}
 			}
@@ -1578,9 +1628,15 @@ private:
 			// Fold's default is the *multiplicative* identity, count 1, because
 			// that is what Combine needs -- and using it as an accumulator would
 			// add a tuple to every group that nothing counted.
+			//
+			// The extremes need the same care for the same reason, and are the
+			// one case where zero is not a safe default: an accumulator holding
+			// 0 wins every min against a positive column and loses every max
+			// against a negative one. `Identity()` gives each aggregate the one
+			// that loses to everything.
 			auto found = out.find(row);
 			if (found == out.end()) {
-				Fold empty;
+				Fold empty = Identity();
 				empty.count = 0;
 				found = out.emplace(row, empty).first;
 			}
@@ -1646,7 +1702,7 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 		return result;
 	}
 	for (const auto &aggregate : aggregates) {
-		if (aggregate.kind == Aggregate::SUM && (aggregate.relation >= graph.RelationCount() ||
+		if (aggregate.kind != Aggregate::COUNT && (aggregate.relation >= graph.RelationCount() ||
 		                                         aggregate.column >= graph.column_counts[aggregate.relation])) {
 			result.error = "summed column is not a column of the query";
 			return result;
@@ -1693,7 +1749,7 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 
 		std::vector<AttributeId> sum_attributes(aggregates.size(), AttributeId(0));
 		for (size_t i = 0; i < aggregates.size(); i++) {
-			if (aggregates[i].kind == Aggregate::SUM) {
+			if (aggregates[i].kind != Aggregate::COUNT) {
 				sum_attributes[i] = AttributeOf(graph, aggregates[i].relation, aggregates[i].column);
 			}
 		}
@@ -1711,7 +1767,18 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 			std::vector<int64_t> values;
 			values.reserve(aggregates.size());
 			for (size_t i = 0; i < aggregates.size(); i++) {
-				values.push_back(aggregates[i].kind == Aggregate::SUM ? entry.second.sums[i] : entry.second.count);
+				switch (aggregates[i].kind) {
+				case Aggregate::SUM:
+					values.push_back(entry.second.sums[i]);
+					break;
+				case Aggregate::MIN:
+				case Aggregate::MAX:
+					values.push_back(entry.second.extremes[i]);
+					break;
+				default:
+					values.push_back(entry.second.count);
+					break;
+				}
 			}
 			result.groups.emplace_back(entry.first, std::move(values));
 		}

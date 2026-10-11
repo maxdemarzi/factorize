@@ -587,6 +587,94 @@ static void TestSeveralAggregatesInOneWalk() {
 
 //! No grouping columns at all: the whole join is one group, which is how the
 //! ungrouped answer is computed once several aggregates are asked for.
+//! min and max over the join, checked against enumerating it.
+//!
+//! They are the same fold as count and sum over the same representation, with
+//! a different semiring: idempotent, so no multiplicity is threaded through.
+//! What they still need is the *emptiness* of the sibling branches. A record
+//! whose siblings denote no tuples belongs to no tuple, and its value must not
+//! reach the answer -- the §4.6 hazard in the form min and max take, where a
+//! sum would contribute a harmless zero.
+//!
+//! The fixture makes that reachable: relation 2 holds a row whose key joins
+//! upward but matches nothing in relation 1, so a branch exists with a very
+//! small and a very large value in it and no tuple to carry either.
+static void TestMinMaxAgainstEnumeration() {
+	Group scope("min and max fold like count and sum, and respect empty branches");
+
+	MemorySource source;
+	// Column-major. Key 9 exists only in r2, so its rows join nothing: the
+	// -999 and 999 they carry belong to no tuple of the result.
+	source.Add({{1, 2, 3}});                                 // r0: keys
+	source.Add({{1, 1, 3}, {50, 60, 70}});                   // r1: key, value
+	source.Add({{1, 1, 2, 9, 9}, {5, 40, 60, -999, 999}});   // r2: key, value
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "minmax: materialize succeeds (" + materialized.error + ")");
+	int64_t lo1 = INT64_MAX, hi1 = INT64_MIN, lo2 = INT64_MAX, hi2 = INT64_MIN;
+	for (const auto &tuple : materialized.tuples) {
+		lo1 = std::min(lo1, tuple[2]);
+		hi1 = std::max(hi1, tuple[2]);
+		lo2 = std::min(lo2, tuple[4]);
+		hi2 = std::max(hi2, tuple[4]);
+	}
+	Expect(!materialized.tuples.empty(), "minmax: the fixture must produce tuples");
+
+	auto folded = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {},
+	                             {GroupAggregate {Aggregate::MIN, 1, 1}, GroupAggregate {Aggregate::MAX, 1, 1},
+	                              GroupAggregate {Aggregate::MIN, 2, 1}, GroupAggregate {Aggregate::MAX, 2, 1}});
+	Expect(folded.ok, "minmax: fold succeeds (" + folded.error + ")");
+	Expect(folded.groups.size() == 1, "minmax: one group");
+	if (!folded.groups.empty()) {
+		const auto &v = folded.groups[0].second;
+		Expect(v[0] == lo1, "minmax: min of r1 is " + std::to_string(v[0]) + ", enumeration says " +
+		                        std::to_string(lo1));
+		Expect(v[1] == hi1, "minmax: max of r1 is " + std::to_string(v[1]) + ", enumeration says " +
+		                        std::to_string(hi1));
+		Expect(v[2] == lo2, "minmax: min of r2 is " + std::to_string(v[2]) + ", enumeration says " +
+		                        std::to_string(lo2));
+		Expect(v[3] == hi2, "minmax: max of r2 is " + std::to_string(v[3]) + ", enumeration says " +
+		                        std::to_string(hi2));
+		// Said explicitly, because this is what the hazard breaks: -999 and 999
+		// sit on key 9, which joins nothing, so no tuple carries them and
+		// neither may be the answer however extreme it looks.
+		Expect(v[2] != -999, "minmax: a value on a key that joins nothing must not be the minimum");
+		Expect(v[3] != 999, "minmax: a value on a key that joins nothing must not be the maximum");
+	}
+
+	// Grouped, so each group's extreme is over its own tuples only.
+	auto by_key = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}},
+	                             {GroupAggregate {Aggregate::MIN, 2, 1}, GroupAggregate {Aggregate::MAX, 2, 1},
+	                              GroupAggregate {Aggregate::COUNT, 0, 0}});
+	Expect(by_key.ok, "minmax: grouped fold succeeds (" + by_key.error + ")");
+	for (const auto &group : by_key.groups) {
+		int64_t lo = INT64_MAX, hi = INT64_MIN, n = 0;
+		for (const auto &tuple : materialized.tuples) {
+			if (tuple[0] != group.first[0]) {
+				continue;
+			}
+			n += 1;
+			lo = std::min(lo, tuple[4]);
+			hi = std::max(hi, tuple[4]);
+		}
+		Expect(group.second[2] == n, "minmax: group " + std::to_string(group.first[0]) + " count");
+		Expect(group.second[0] == lo, "minmax: group " + std::to_string(group.first[0]) + " min is " +
+		                                  std::to_string(group.second[0]) + ", enumeration says " +
+		                                  std::to_string(lo));
+		Expect(group.second[1] == hi, "minmax: group " + std::to_string(group.first[0]) + " max is " +
+		                                  std::to_string(group.second[1]) + ", enumeration says " +
+		                                  std::to_string(hi));
+	}
+}
+
 static void TestSeveralAggregatesUngrouped() {
 	Group scope("with no grouping columns the whole join is a single group");
 
@@ -657,6 +745,7 @@ int main() {
 	TestGroupSumOnSiblingBranches();
 	TestSeveralAggregatesInOneWalk();
 	TestSeveralAggregatesUngrouped();
+	TestMinMaxAgainstEnumeration();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <limits>
 #include "frep.hpp"
 
 #include <cassert>
@@ -208,6 +210,36 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 	const uint64_t to_store = static_cast<uint64_t>(size) + 1;
 	std::memcpy(record.Data() + level.size_offset, &to_store, sizeof(to_store));
 	return size;
+}
+
+int64_t FRepresentation::SubtreeExtreme(Record record, AttributeId attribute, bool want_max) const {
+	const int64_t identity = want_max ? std::numeric_limits<int64_t>::min() : std::numeric_limits<int64_t>::max();
+	const auto better = [&](int64_t a, int64_t b) { return want_max ? std::max(a, b) : std::min(a, b); };
+	if (SubtreeSize(record) == 0) {
+		// No tuples, so no values -- the §4.6 hazard, which for an extreme is
+		// simply the identity rather than the zero a sum contributes.
+		return identity;
+	}
+	const auto &level = layout->Level(record.Level());
+	for (size_t i = 0; i < level.payload.size(); i++) {
+		if (level.payload[i].attribute != attribute) {
+			continue;
+		}
+		// The value lives here, so every tuple of this subtree carries it and
+		// it is the extreme of all of them.
+		return level.payload[i].type == ValueType::INT32 ? static_cast<int64_t>(GetInt32(record, i))
+		                                                 : GetInt64(record, i);
+	}
+	// Otherwise it lives under exactly one slot, the representation being a
+	// tree. Children of a slot are alternatives, so they take the extreme;
+	// slots that do not carry the attribute return the identity throughout and
+	// fold away harmlessly.
+	int64_t best = identity;
+	for (size_t slot_index = 0; slot_index < level.slots.size(); slot_index++) {
+		ForEachChild(record, slot_index,
+		             [&](Record child) { best = better(best, SubtreeExtreme(child, attribute, want_max)); });
+	}
+	return best;
 }
 
 int64_t FRepresentation::SubtreeSum(Record record, AttributeId attribute) const {

@@ -332,6 +332,18 @@ public:
 	//! visited once per call, so a sum costs O(|f-rep|) like a count does.
 	int64_t SubtreeSum(Record record, AttributeId attribute) const;
 
+	//! The smallest (or largest) value of `attribute` over the tuples this
+	//! subtree denotes, or the identity -- INT64_MAX for a min, INT64_MIN for a
+	//! max -- when it denotes none.
+	//!
+	//! Cheaper than the sum it sits beside, because min and max are idempotent:
+	//! how *many* tuples carry a value does not change the extreme of them, so
+	//! no multiplicity is threaded through and the §4.6 empty-subtree hazard
+	//! reduces to returning the identity. Within a non-empty subtree every slot
+	//! is non-empty too, since the count is their product, so a value found
+	//! below genuinely appears in a tuple.
+	int64_t SubtreeExtreme(Record record, AttributeId attribute, bool want_max) const;
+
 	//===------------------------------------------------------------------===//
 	// Diagnostics
 	//===------------------------------------------------------------------===//

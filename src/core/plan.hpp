@@ -309,7 +309,17 @@ enum class Aggregate : uint8_t {
 	COUNT,
 	//! The total of one column over those tuples: a slot's values are weighted
 	//! by how many tuples the other slots make.
-	SUM
+	SUM,
+	//! The smallest or largest value of one column over those tuples.
+	//!
+	//! The same fold with a different semiring, and a cheaper one: min and max
+	//! are idempotent, so a slot's values are not weighted by anything. What
+	//! they still need is the *emptiness* of the other slots -- a value in a
+	//! branch whose siblings denote no tuples belongs to no tuple, and must not
+	//! reach the answer. That is why the fold carries a count alongside the
+	//! extreme even here (D77).
+	MIN,
+	MAX
 };
 
 //! Sums one column over the join without materializing it.
@@ -342,7 +352,7 @@ struct GroupKey {
 //! One aggregate the caller wants computed per group.
 struct GroupAggregate {
 	Aggregate kind = Aggregate::COUNT;
-	//! Which column carries the values, when the kind is SUM.
+	//! Which column carries the values, when the kind is SUM, MIN or MAX.
 	size_t relation = 0;
 	size_t column = 0;
 };
