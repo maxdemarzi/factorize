@@ -68,7 +68,10 @@ docs:
     **Scope.** count(\*), count(c), sum, avg, min, max, bool_and and bool_or
     over acyclic equi-join
     graphs of many-to-many joins on integer and DECIMAL columns, with GROUP BY,
-    EXISTS and LIMIT.
+    EXISTS and LIMIT. Also sum(x * y) for two columns, ungrouped, which is the
+    case factorisation is for: over independent branches it decomposes into a
+    product of one-column sums, so the pairings of x and y are summed without
+    being enumerated even though they are the join result itself.
     Anything else is declined and the stock plan runs unchanged. `auto` is
     bit-exact against `off`; if the factorised path raises, the replaced plan
     answers instead.

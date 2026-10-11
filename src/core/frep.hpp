@@ -344,6 +344,31 @@ public:
 	//! below genuinely appears in a tuple.
 	int64_t SubtreeExtreme(Record record, AttributeId attribute, bool want_max) const;
 
+	//! The four quantities a `sum(x * y)` needs over one subtree's tuples.
+	//!
+	//! This is the aggregate factorisation is actually *for*. A sum of one
+	//! column needs no independence: DuckDB can stream it. A sum of a product
+	//! of two columns from different relations needs every pairing of them --
+	//! which is the join result, exponentially larger than the inputs -- unless
+	//! the two live in independent branches, in which case
+	//!
+	//!     sum over A x B of x*y  =  sum_x(A) * sum_y(B)
+	//!
+	//! and neither side ever sees the other's tuples. Independence of siblings
+	//! is the property the whole representation is built on, so this is the
+	//! paper's claim at its sharpest: not the same answer faster, an answer
+	//! whose cost is the representation rather than the result (D80).
+	struct ProductSum {
+		//! Tuples in the subtree, needed because the combine is bilinear.
+		int64_t count = 0;
+		int64_t sum_x = 0;
+		int64_t sum_y = 0;
+		int64_t sum_xy = 0;
+	};
+	ProductSum SubtreeProductSum(Record record, AttributeId x, AttributeId y) const;
+	//! The bilinear product of two independent tuple sets (see the .cpp).
+	static ProductSum CombineProductSums(const ProductSum &a, const ProductSum &b);
+
 	//===------------------------------------------------------------------===//
 	// Diagnostics
 	//===------------------------------------------------------------------===//

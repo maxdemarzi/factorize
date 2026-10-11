@@ -2363,3 +2363,95 @@ physical_plan	<!REGEX>:.*FACTORIZED.*
 
 statement ok
 SET factorize_mode = 'force';
+
+# sum(x * y) is the aggregate factorisation is for (D80). Over independent
+# branches it decomposes into a product of one-column sums, so the pairings of
+# x and y are never enumerated even though they are the join result itself.
+statement ok
+CREATE TABLE ps_r0(k INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE ps_r1(k INTEGER NOT NULL, x BIGINT NOT NULL);
+
+statement ok
+CREATE TABLE ps_r2(k INTEGER NOT NULL, y BIGINT NOT NULL);
+
+statement ok
+INSERT INTO ps_r0 VALUES (1),(2),(3);
+
+statement ok
+INSERT INTO ps_r1 VALUES (1,5),(1,-7),(2,11),(3,2);
+
+statement ok
+INSERT INTO ps_r2 VALUES (1,3),(1,-4),(2,6),(9,1000);
+
+statement ok
+SET factorize_mode = 'force';
+
+# Values straddle zero so a sign error cannot cancel, and key 9 joins nothing so
+# its 1000 must not appear.
+query I
+SELECT sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
+ WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k;
+----
+68
+
+# Both columns from one relation: no independence involved, and the per-record
+# product must be exact rather than a product of sums.
+query I
+SELECT sum(ps_r1.x * ps_r1.x) FROM ps_r0, ps_r1, ps_r2
+ WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k;
+----
+269
+
+# Duplicate keys are grouped into one record standing for several tuples.
+# Ignoring that weight halved this while leaving sum(k*x) right.
+statement ok
+CREATE TABLE ps_d0(k INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE ps_d1(k INTEGER NOT NULL, x BIGINT NOT NULL);
+
+statement ok
+INSERT INTO ps_d0 VALUES (1),(1);
+
+statement ok
+INSERT INTO ps_d1 VALUES (1,5),(1,-7);
+
+query I
+SELECT sum(ps_d1.x * ps_d1.x) FROM ps_d0, ps_d1 WHERE ps_d0.k = ps_d1.k;
+----
+148
+
+query I
+SELECT sum(ps_d0.k * ps_d1.x) FROM ps_d0, ps_d1 WHERE ps_d0.k = ps_d1.k;
+----
+-4
+
+# An empty join sums nothing, which is NULL.
+query I
+SELECT sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
+ WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k AND ps_r0.k = 99;
+----
+NULL
+
+# Declined beside anything else, or under a GROUP BY: the grouped walk carries
+# one value per aggregate where this needs three, and it builds a fold per
+# record it visits.
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT count(*), sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
+ WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+query II
+EXPLAIN SELECT ps_r0.k, sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
+ WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k GROUP BY ps_r0.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'force';

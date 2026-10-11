@@ -5502,3 +5502,56 @@ Checked against stock, grouped and ungrouped, on a fixture where one relation is
 all-true and the other mixed, so `bool_and` and `bool_or` disagree and each
 group disagrees with the whole. An empty join gives NULL, as for everything but
 `count(*)`.
+
+## D80 — sum(x * y), the aggregate factorisation is actually for
+
+The three aggregates before this one were coverage: the same answers DuckDB
+already gives, from a representation that happens to be smaller. This one is
+not. A sum of a product of two columns from different relations needs every
+pairing of them, and the pairings *are* the join result -- exponentially larger
+than the inputs. Unless the two sit in independent branches, where
+
+    sum over A x B of x*y  =  sum_x(A) * sum_y(B)
+
+and neither side ever sees the other's tuples. Independence of siblings is the
+property the whole representation is built on, so this is the paper's claim at
+its sharpest: not the same answer faster, an answer whose cost is the size of
+the representation rather than of the result.
+
+**The combine is bilinear,** which is the only part that needed deriving. Two
+independent tuple sets side by side:
+
+    n      = n_a * n_b
+    sum_x  = sum_x(a)*n_b + n_a*sum_x(b)
+    sum_xy = sum_xy(a)*n_b + n_a*sum_xy(b) + sum_x(a)*sum_y(b) + sum_y(a)*sum_x(b)
+
+The last line is the point. The cross terms are a product of two one-column
+sums, so the pairings are summed without being enumerated. A subtree therefore
+has to carry four quantities rather than one, which is why `SubtreeProductSum`
+returns a struct where `SubtreeSum` returns an integer.
+
+**Ungrouped, and declined otherwise, which is a trade rather than an omission.**
+The grouped walk carries one value per aggregate and this needs three, and it
+builds a fold per *record it visits* -- `kMaxAggregates`' own comment says a
+vector there "would dominate the fold it is part of". Widening every fold in
+every query by 24 integers for an aggregate this rare is the wrong way round, so
+`sum(x*y)` takes its own ungrouped path and the matcher refuses to pair it with
+another aggregate or a GROUP BY. The SQL suite pins both refusals.
+
+**One bug, and the measurement found it where the reasoning had not.** The first
+version read `sum(x*y)` correctly across relations and halved `sum(x*x)` within
+one: 74 against DuckDB's 148. Duplicate keys are grouped into a single record
+standing for several tuples, and the per-record contribution ignored that
+weight, so every value was counted once instead of twice. `SubtreeSum` never had
+the bug because it multiplies through `SubtreeSize`, which already includes
+weights. The fixture that caught it is now in both suites, along with the
+`sum(k*x)` that stayed right throughout -- the pair is what localised it.
+
+**Checked** against brute-force enumeration in the core suite (across relations,
+within one relation, and weighted), against stock DuckDB in the SQL suite
+including the empty join, and against stock on 900 random queries -- 309 taken
+over, no disagreements.
+
+**What it does not do yet:** three or more columns, a product under a GROUP BY,
+or a product of expressions rather than plain columns. Each is the same algebra
+with more terms, and none is reachable today.

@@ -675,6 +675,90 @@ static void TestMinMaxAgainstEnumeration() {
 	}
 }
 
+//! sum(x * y) with x and y in different relations, checked against enumerating
+//! the join.
+//!
+//! This is the aggregate factorisation exists for, so it is the one worth being
+//! most suspicious of. A sum of one column needs no independence and DuckDB can
+//! stream it; a sum of a product needs every pairing of x and y, which is the
+//! join result -- exponentially larger than the inputs -- unless the two sit in
+//! independent branches, where
+//!
+//!     sum over A x B of x*y = sum_x(A) * sum_y(B)
+//!
+//! and the pairings are never enumerated. The fixture puts x and y in separate
+//! relations hanging off a shared key, which is exactly that shape, and makes
+//! the values straddle zero so a sign error cannot cancel out.
+static void TestProductSumAgainstEnumeration() {
+	Group scope("sum(x*y) decomposes over independent branches");
+
+	MemorySource source;
+	source.Add({{1, 2, 3}});                              // r0: keys
+	source.Add({{1, 1, 2, 3}, {5, -7, 11, 2}});           // r1: key, x
+	source.Add({{1, 1, 2, 9}, {3, -4, 6, 1000}});         // r2: key, y
+
+	QueryGraph graph;
+	graph.column_counts = {1, 2, 2};
+	graph.column_types = {{ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64},
+	                      {ValueType::INT64, ValueType::INT64}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
+	const auto plan = BuildPlan(graph);
+
+	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
+	Expect(materialized.ok, "productsum: materialize succeeds (" + materialized.error + ")");
+	int64_t expected = 0;
+	for (const auto &tuple : materialized.tuples) {
+		expected += tuple[2] * tuple[4];
+	}
+	Expect(!materialized.tuples.empty(), "productsum: the fixture must produce tuples");
+
+	auto folded = ExecuteProductSum(graph, plan, source, JoinMode::BOTTOM_INSERT, 1, 1, 2, 1);
+	Expect(folded.ok, "productsum: fold succeeds (" + folded.error + ")");
+	Expect(folded.count == expected, "productsum: folded " + std::to_string(folded.count) +
+	                                     ", enumeration says " + std::to_string(expected));
+	Expect(folded.tuples == static_cast<int64_t>(materialized.tuples.size()),
+	       "productsum: tuple count " + std::to_string(folded.tuples) + " against " +
+	           std::to_string(materialized.tuples.size()));
+
+	// Both columns from the same relation: no independence involved, and the
+	// per-record product has to be exact rather than a product of sums.
+	auto same = ExecuteProductSum(graph, plan, source, JoinMode::BOTTOM_INSERT, 1, 1, 1, 1);
+	int64_t expected_same = 0;
+	for (const auto &tuple : materialized.tuples) {
+		expected_same += tuple[2] * tuple[2];
+	}
+	Expect(same.ok, "productsum: same-relation fold succeeds (" + same.error + ")");
+	Expect(same.count == expected_same, "productsum: x*x folded " + std::to_string(same.count) +
+	                                        ", enumeration says " + std::to_string(expected_same));
+
+	// Duplicate keys, which the representation groups into one record standing
+	// for several tuples. Ignoring that weight halved sum(x*x) here while
+	// leaving sum(k*x) right, so the fixture carries both: the values were
+	// correct and each was counted once instead of twice.
+	MemorySource weighted;
+	weighted.Add({{1, 1}});                    // two identical keys -> one record
+	weighted.Add({{1, 1}, {5, -7}});
+	QueryGraph wgraph;
+	wgraph.column_counts = {1, 2};
+	wgraph.column_types = {{ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
+	wgraph.predicates = {Predicate {0, 0, 1, 0}};
+	const auto wplan = BuildPlan(wgraph);
+
+	auto wmaterialized = ExecuteMaterialize(wgraph, wplan, weighted, JoinMode::BOTTOM_INSERT, 0);
+	Expect(wmaterialized.ok, "productsum: weighted materialize succeeds");
+	int64_t wexpected = 0;
+	for (const auto &tuple : wmaterialized.tuples) {
+		wexpected += tuple[2] * tuple[2];
+	}
+	auto wfolded = ExecuteProductSum(wgraph, wplan, weighted, JoinMode::BOTTOM_INSERT, 1, 1, 1, 1);
+	Expect(wfolded.ok, "productsum: weighted fold succeeds (" + wfolded.error + ")");
+	Expect(wmaterialized.tuples.size() == 4, "productsum: the weighted fixture must make four tuples, got " +
+	                                             std::to_string(wmaterialized.tuples.size()));
+	Expect(wfolded.count == wexpected, "productsum: weighted x*x folded " + std::to_string(wfolded.count) +
+	                                       ", enumeration says " + std::to_string(wexpected));
+}
+
 static void TestSeveralAggregatesUngrouped() {
 	Group scope("with no grouping columns the whole join is a single group");
 
@@ -746,6 +830,7 @@ int main() {
 	TestSeveralAggregatesInOneWalk();
 	TestSeveralAggregatesUngrouped();
 	TestMinMaxAgainstEnumeration();
+	TestProductSumAgainstEnumeration();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

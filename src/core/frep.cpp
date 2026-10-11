@@ -212,6 +212,95 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 	return size;
 }
 
+FRepresentation::ProductSum FRepresentation::SubtreeProductSum(Record record, AttributeId x,
+                                                              AttributeId y) const {
+	ProductSum result;
+	result.count = SubtreeSize(record);
+	if (result.count == 0) {
+		// No tuples, so no values: the §4.6 hazard, where every term is zero
+		// rather than needing a special case.
+		return result;
+	}
+	const auto &level = layout->Level(record.Level());
+	const auto value_of = [&](AttributeId attribute, bool &found) -> int64_t {
+		for (size_t i = 0; i < level.payload.size(); i++) {
+			if (level.payload[i].attribute != attribute) {
+				continue;
+			}
+			found = true;
+			return level.payload[i].type == ValueType::INT32 ? static_cast<int64_t>(GetInt32(record, i))
+			                                                 : GetInt64(record, i);
+		}
+		found = false;
+		return 0;
+	};
+	bool has_x = false;
+	bool has_y = false;
+	const int64_t value_x = value_of(x, has_x);
+	const int64_t value_y = value_of(y, has_y);
+
+	// Whatever this record carries, every tuple of its subtree carries too --
+	// and a record stands for as many tuples as its weight, because duplicate
+	// keys are grouped into one. Ignoring that halved `sum(x*x)` on a fixture
+	// whose other relation had two identical keys: the values were right and
+	// each was counted once instead of twice. SubtreeSum avoids this by
+	// multiplying through SubtreeSize, which already includes the weights.
+	ProductSum here;
+	here.count = HasWeights() ? GetWeight(record) : 1;
+	if (has_x) {
+		here.sum_x = CheckedCardinalityMul(value_x, here.count);
+	}
+	if (has_y) {
+		here.sum_y = CheckedCardinalityMul(value_y, here.count);
+	}
+	if (has_x && has_y) {
+		// Both columns on one record: the product is exact per tuple, and no
+		// independence is needed or claimed.
+		here.sum_xy = CheckedCardinalityMul(CheckedCardinalityMul(value_x, value_y), here.count);
+	}
+
+	// Each slot's children are alternatives, so their quantities add; the slots
+	// themselves are independent, so they combine bilinearly.
+	ProductSum below;
+	below.count = 1;
+	for (size_t slot_index = 0; slot_index < level.slots.size(); slot_index++) {
+		ProductSum slot;
+		ForEachChild(record, slot_index, [&](Record child) {
+			const ProductSum child_sum = SubtreeProductSum(child, x, y);
+			slot.count = CheckedCardinalityAdd(slot.count, child_sum.count);
+			slot.sum_x = CheckedCardinalityAdd(slot.sum_x, child_sum.sum_x);
+			slot.sum_y = CheckedCardinalityAdd(slot.sum_y, child_sum.sum_y);
+			slot.sum_xy = CheckedCardinalityAdd(slot.sum_xy, child_sum.sum_xy);
+		});
+		below = CombineProductSums(below, slot);
+	}
+	return CombineProductSums(here, below);
+}
+
+//! Two independent sets of tuples, side by side: every tuple of one pairs with
+//! every tuple of the other.
+//!
+//!     n      = n_a * n_b
+//!     sum_x  = sum_x(a) * n_b + n_a * sum_x(b)
+//!     sum_xy = sum_xy(a) * n_b + n_a * sum_xy(b)
+//!              + sum_x(a) * sum_y(b) + sum_y(a) * sum_x(b)
+//!
+//! The last line is the whole point: the cross terms are a product of two
+//! one-column sums, so the pairings are never enumerated (D80).
+FRepresentation::ProductSum FRepresentation::CombineProductSums(const ProductSum &a, const ProductSum &b) {
+	ProductSum out;
+	out.count = CheckedCardinalityMul(a.count, b.count);
+	out.sum_x = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_x, b.count),
+	                                  CheckedCardinalityMul(a.count, b.sum_x));
+	out.sum_y = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_y, b.count),
+	                                  CheckedCardinalityMul(a.count, b.sum_y));
+	out.sum_xy = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_xy, b.count),
+	                                   CheckedCardinalityMul(a.count, b.sum_xy));
+	out.sum_xy = CheckedCardinalityAdd(out.sum_xy, CheckedCardinalityMul(a.sum_x, b.sum_y));
+	out.sum_xy = CheckedCardinalityAdd(out.sum_xy, CheckedCardinalityMul(a.sum_y, b.sum_x));
+	return out;
+}
+
 int64_t FRepresentation::SubtreeExtreme(Record record, AttributeId attribute, bool want_max) const {
 	const int64_t identity = want_max ? std::numeric_limits<int64_t>::min() : std::numeric_limits<int64_t>::max();
 	const auto better = [&](int64_t a, int64_t b) { return want_max ? std::max(a, b) : std::min(a, b); };

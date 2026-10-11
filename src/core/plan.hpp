@@ -320,6 +320,14 @@ enum class Aggregate : uint8_t {
 	//! extreme even here (D77).
 	MIN,
 	MAX,
+	//! The total of `x * y` for two columns over those tuples.
+	//!
+	//! Not folded by the grouped walk, which carries one value per aggregate
+	//! and would need three for this. It is answered by `ExecuteProductSum`,
+	//! ungrouped, and declined otherwise -- the walk creates a fold per record
+	//! it visits, so widening every one of them for an aggregate this rare is
+	//! the wrong trade (D80).
+	SUM_PRODUCT,
 	//! The mean of one column over those tuples.
 	//!
 	//! Not a fold of its own: it is the SUM fold divided by the tuple count the
@@ -337,6 +345,19 @@ enum class Aggregate : uint8_t {
 //! the representation and not of the result.
 ExecuteResult ExecuteSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                          size_t sum_relation, size_t sum_column, PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! Sums the product of two columns over the join, without materializing it.
+//!
+//! The aggregate factorisation is for. A sum of one column needs no
+//! independence; a sum of `x * y` needs every pairing of the two, which is the
+//! join result itself -- unless x and y sit in independent branches, where it
+//! decomposes into a product of one-column sums and the pairings are never
+//! enumerated. See FRepresentation::SubtreeProductSum (D80).
+//!
+//! `count` carries the answer, as it does for ExecuteSum.
+ExecuteResult ExecuteProductSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                size_t x_relation, size_t x_column, size_t y_relation, size_t y_column,
+                                PathStrategy strategy = PathStrategy::LEVELWISE);
 
 struct GroupCountResult {
 	bool ok = false;
@@ -366,9 +387,13 @@ struct GroupKey {
 //! One aggregate the caller wants computed per group.
 struct GroupAggregate {
 	Aggregate kind = Aggregate::COUNT;
-	//! Which column carries the values, when the kind is SUM, MIN or MAX.
+	//! Which column carries the values, for every kind but COUNT.
 	size_t relation = 0;
 	size_t column = 0;
+	//! The second column, for SUM_PRODUCT only. Ignored by the grouped walk,
+	//! which never sees that kind.
+	size_t relation_y = 0;
+	size_t column_y = 0;
 };
 
 //! How many aggregates one query may ask for.

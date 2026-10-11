@@ -1360,6 +1360,44 @@ MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const 
 	return result;
 }
 
+ExecuteResult ExecuteProductSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                               size_t x_relation, size_t x_column, size_t y_relation, size_t y_column,
+                               PathStrategy strategy) {
+	ExecuteResult result;
+	auto built = BuildRepresentation(graph, plan, source, mode, strategy);
+	if (!built.ok) {
+		result.error = built.error;
+		result.out_of_memory = built.out_of_memory;
+		return result;
+	}
+	try {
+		const auto &rep = built.relation->Rep();
+		const auto x = AttributeOf(graph, x_relation, x_column);
+		const auto y = AttributeOf(graph, y_relation, y_column);
+		// Roots are alternatives, so their quantities add. Only the product term
+		// is answered; the other three exist so that the recursion below a root
+		// can combine, and are of no interest once it has.
+		int64_t total = 0;
+		int64_t tuples = 0;
+		rep.ForEachRoot([&](Record root) {
+			const auto sums = rep.SubtreeProductSum(root, x, y);
+			total = CheckedCardinalityAdd(total, sums.sum_xy);
+			tuples = CheckedCardinalityAdd(tuples, sums.count);
+		});
+		result.count = total;
+		result.tuples = tuples;
+		result.records = rep.RecordCount();
+		result.bytes = rep.BytesAllocated();
+		result.ok = true;
+	} catch (const MemoryLimitExceeded &error) {
+		result.error = error.what();
+		result.out_of_memory = true;
+	} catch (const std::exception &error) {
+		result.error = error.what();
+	}
+	return result;
+}
+
 ExecuteResult ExecuteSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                          size_t sum_relation, size_t sum_column, PathStrategy strategy) {
 	ExecuteResult result;
@@ -1706,6 +1744,12 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 		return result;
 	}
 	for (const auto &aggregate : aggregates) {
+		if (aggregate.kind == Aggregate::SUM_PRODUCT) {
+			// Refused rather than mishandled: IsSum() would treat it as a plain
+			// sum of x and answer a different question (D80).
+			result.error = "sum of a product is not grouped; use ExecuteProductSum";
+			return result;
+		}
 		if (aggregate.kind != Aggregate::COUNT && (aggregate.relation >= graph.RelationCount() ||
 		                                         aggregate.column >= graph.column_counts[aggregate.relation])) {
 			result.error = "summed column is not a column of the query";

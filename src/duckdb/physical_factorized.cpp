@@ -580,6 +580,32 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	    BooleanValue::Get(fail)) {
 		throw InvalidInputException("factorize: factorize_debug_fail is set");
 	}
+	if (!aggregates.empty() && aggregates[0].kind == factorize::Aggregate::SUM_PRODUCT) {
+		// Its own path, because the grouped fold cannot carry it: a sum of a
+		// product needs three running quantities per aggregate where the fold
+		// has one, and the matcher has already refused to pair it with anything
+		// else or with a GROUP BY (D80).
+		lock_guard<mutex> guard(gstate.lock);
+		if (gstate.handed_out > 0) {
+			return SourceResultType::FINISHED;
+		}
+		factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
+		                           abandon_after_ms, min_rate, second_key);
+		SharedRelations source(context.client, relations);
+		const auto result = factorize::ExecuteProductSum(
+		    graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, aggregates[0].relation,
+		    aggregates[0].column, aggregates[0].relation_y, aggregates[0].column_y);
+		if (!result.ok) {
+			throw InvalidInputException("factorize: %s", result.error);
+		}
+		chunk.SetCardinality(1);
+		// No tuples means nothing was summed, and SQL answers NULL rather than
+		// zero -- the same rule every aggregate but count(*) follows here.
+		chunk.SetValue(0, 0, result.tuples > 0 ? FoldedValue(result.count, aggregate_types[0])
+		                                       : Value(aggregate_types[0]));
+		gstate.handed_out = 1;
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
 	if (!IsPlainCount()) {
 		// Everything except one ungrouped count(*) goes through the fold, which
 		// handles no grouping columns as a single group over the whole join.

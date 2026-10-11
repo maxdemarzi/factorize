@@ -81,6 +81,8 @@ struct RegionAggregate {
 	factorize::Aggregate kind = factorize::Aggregate::COUNT;
 	ColumnBinding sum_binding;
 	LogicalType type;
+	//! The second column, for a sum of a product only (D80).
+	ColumnBinding second_binding;
 	//! Whether `sum_binding` names a column that has to be resolved against the
 	//! scan. True for sum, min, max and avg; also true for `count(c)`, which
 	//! folds as a plain count but must still check that `c` cannot be NULL --
@@ -453,6 +455,38 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			// against 24 for count(*). The column has to be a plain column of
 			// the region, since it is folded through the representation rather
 			// than evaluated.
+			if (bound.children.size() == 1 &&
+			    bound.children[0]->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				// sum(x * y) is the aggregate factorisation is *for*: over
+				// independent branches it decomposes into a product of
+				// one-column sums, so the pairings of x and y are never
+				// enumerated even though they are the join result (D80).
+				auto &function = bound.children[0]->Cast<BoundFunctionExpression>();
+				const auto function_name = StringUtil::Lower(function.function.name);
+				if ((function_name != "*" && function_name != "multiply") || function.children.size() != 2 ||
+				    function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+				    function.children[1]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					Decline(region, "sum() of a computed expression");
+					ok = false;
+					continue;
+				}
+				// Answered by ExecuteProductSum, which is ungrouped and takes
+				// the whole query. The grouped walk carries one value per
+				// aggregate and this needs three, and it builds a fold per
+				// record it visits -- widening every one of them for an
+				// aggregate this rare is the wrong trade.
+				if (region.grouped || !region.aggregates.empty() || aggr.expressions.size() != 1) {
+					Decline(region, "sum() of a product alongside another aggregate or a GROUP BY");
+					ok = false;
+					continue;
+				}
+				entry.kind = factorize::Aggregate::SUM_PRODUCT;
+				entry.reads_column = true;
+				entry.sum_binding = function.children[0]->Cast<BoundColumnRefExpression>().binding;
+				entry.second_binding = function.children[1]->Cast<BoundColumnRefExpression>().binding;
+				region.aggregates.push_back(std::move(entry));
+				continue;
+			}
 			if (bound.children.size() != 1 ||
 			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 				Decline(region, "sum() of a computed expression");
@@ -796,22 +830,30 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			aggregates.push_back(factorize::GroupAggregate {factorize::Aggregate::COUNT, 0, 0});
 			continue;
 		}
+		// Once per column the aggregate reads: one for a sum, min, max, avg or
+		// count(c), two for a sum of a product (D80). Every check below is
+		// per-column and unchanged; only the binding it reads varies.
+		size_t resolved_relation[2] = {0, 0};
+		size_t resolved_local[2] = {0, 0};
+		const size_t binding_count = aggregate.kind == factorize::Aggregate::SUM_PRODUCT ? 2 : 1;
+		for (size_t which = 0; which < binding_count; which++) {
+		const ColumnBinding &column_binding = which == 0 ? aggregate.sum_binding : aggregate.second_binding;
 		// A summed column is not a join key, so unlike a join key it is *added*
 		// to the scan rather than required to be there already. Appended, never
 		// inserted: the join predicates above hold local column indices, and
 		// inserting would move the ground under them. (Filters are re-keyed
 		// below, after every append, for the same reason from the other
 		// direction.)
-		auto found = relation_of_table_index.find(aggregate.sum_binding.table_index);
+		auto found = relation_of_table_index.find(column_binding.table_index);
 		if (found == relation_of_table_index.end()) {
 			return Decline(region, "summed column belongs to no relation of the region");
 		}
 		auto &get = region.relations[found->second].get();
 		auto &column_ids = get.GetColumnIds();
-		if (aggregate.sum_binding.column_index >= column_ids.size()) {
+		if (column_binding.column_index >= column_ids.size()) {
 			return Decline(region, "summed column is not among the scanned columns");
 		}
-		auto &column_index = column_ids[aggregate.sum_binding.column_index];
+		auto &column_index = column_ids[column_binding.column_index];
 		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
 			return Decline(region, "summed column is not a stored scalar column");
 		}
@@ -863,7 +905,16 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			}
 			bound.no_null_columns.push_back(static_cast<idx_t>(local));
 		}
-		aggregates.push_back(factorize::GroupAggregate {aggregate.kind, found->second, local});
+		resolved_relation[which] = found->second;
+		resolved_local[which] = local;
+		}
+		factorize::GroupAggregate folded;
+		folded.kind = aggregate.kind;
+		folded.relation = resolved_relation[0];
+		folded.column = resolved_local[0];
+		folded.relation_y = resolved_relation[1];
+		folded.column_y = resolved_local[1];
+		aggregates.push_back(folded);
 	}
 
 	for (const auto &binding : region.group_bindings) {
