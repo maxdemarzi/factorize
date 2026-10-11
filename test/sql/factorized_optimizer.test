@@ -2143,3 +2143,70 @@ SET factorize_estimate_slack = 2.0;
 
 statement ok
 SET factorize_mode = 'off';
+
+# min() and max() over the join, which are the same semiring fold as count and
+# sum with an idempotent operator (D77). The fixture is the one the core test
+# uses: key 9 exists only in mm_r2, so the -999 and 999 it carries join nothing
+# and must not reach either answer. A fold that ignored sibling emptiness would
+# return them, and they are the most extreme values present.
+statement ok
+CREATE TABLE mm_r0(k INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE mm_r1(k INTEGER NOT NULL, v INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE mm_r2(k INTEGER NOT NULL, w INTEGER NOT NULL);
+
+statement ok
+INSERT INTO mm_r0 VALUES (1),(2),(3);
+
+statement ok
+INSERT INTO mm_r1 VALUES (1,50),(1,60),(3,70);
+
+statement ok
+INSERT INTO mm_r2 VALUES (1,5),(1,40),(2,60),(9,-999),(9,999);
+
+statement ok
+SET factorize_mode = 'force';
+
+query IIIII
+SELECT count(*), min(mm_r1.v), max(mm_r1.v), min(mm_r2.w), max(mm_r2.w)
+  FROM mm_r0, mm_r1, mm_r2 WHERE mm_r0.k = mm_r1.k AND mm_r0.k = mm_r2.k;
+----
+4	50	60	5	40
+
+query III
+SELECT mm_r0.k, min(mm_r2.w), max(mm_r2.w)
+  FROM mm_r0, mm_r1, mm_r2 WHERE mm_r0.k = mm_r1.k AND mm_r0.k = mm_r2.k
+ GROUP BY mm_r0.k ORDER BY 1;
+----
+1	5	40
+
+# An empty join has no least element, so SQL says NULL -- min and max join sum
+# here rather than count(*), which says 0.
+query III
+SELECT count(*), min(mm_r1.v), max(mm_r1.v)
+  FROM mm_r0, mm_r1 WHERE mm_r0.k = mm_r1.k AND mm_r0.k = 99;
+----
+0	NULL	NULL
+
+# The representation stores integers, so there is nowhere to put a VARCHAR --
+# even though min and max would otherwise handle one exactly, reassociating
+# freely in a way sum does not.
+statement ok
+CREATE TABLE mm_s(k INTEGER NOT NULL, s VARCHAR NOT NULL);
+
+statement ok
+INSERT INTO mm_s VALUES (1,'a');
+
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT min(mm_s.s) FROM mm_r0, mm_s WHERE mm_r0.k = mm_s.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'force';

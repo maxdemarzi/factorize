@@ -160,7 +160,14 @@ def make_aggregates(rng, aliases):
 
     DuckDB deduplicates identical aggregate expressions, so asking for the same
     sum twice is one aggregate and not two -- distinct ones are what exercise
-    the shared walk, and the sums are drawn without replacement for that reason.
+    the shared walk, and they are drawn without replacement for that reason.
+
+    min and max are drawn alongside sum (D77). They fold over the same walk with
+    an idempotent operator, and their failure mode is one no count or sum has:
+    a value belonging to no tuple can still be the extreme of the values
+    *present*, so a branch whose siblings are empty must not contribute. Mixing
+    them with sums in one query is what exercises that, since the emptiness a
+    sum absorbs as a zero is the thing an extreme must notice.
     """
     wanted = rng.choice([1, 1, 2, 3])
     chosen = []
@@ -172,7 +179,8 @@ def make_aggregates(rng, aliases):
                 chosen.append("count(*)")
             continue
         alias, _, cols = rng.choice(aliases)
-        term = f"sum({alias}.{rng.choice(cols)})"
+        fold = rng.choice(["sum", "sum", "min", "max"])
+        term = f"{fold}({alias}.{rng.choice(cols)})"
         if term not in seen:
             seen.add(term)
             chosen.append(term)

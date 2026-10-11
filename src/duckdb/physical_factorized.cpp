@@ -322,9 +322,12 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		// the summed column are dropped, so if they were all there was, the join
 		// is empty here and the answer is NULL, which is what SQL says.
 		for (idx_t i = 0; i < aggregates.size(); i++) {
+			// count(*) of nothing is 0; every other aggregate of nothing is
+			// NULL, which a typed Value() with no value is. min and max join
+			// sum here rather than count: SQL has no least element to return.
 			chunk.SetValue(i, 0,
-			               aggregates[i].kind == factorize::Aggregate::SUM ? Value(aggregate_types[i])
-			                                                              : Value::BIGINT(0));
+			               aggregates[i].kind == factorize::Aggregate::COUNT ? Value::BIGINT(0)
+			                                                                 : Value(aggregate_types[i]));
 		}
 		chunk.SetCardinality(1);
 		gstate.handed_out = 1;
@@ -339,9 +342,9 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		}
 		for (idx_t i = 0; i < aggregates.size(); i++) {
 			chunk.SetValue(group_types.size() + i, produced,
-			               aggregates[i].kind == factorize::Aggregate::SUM
-			                   ? FoldedValue(group.second[i], aggregate_types[i])
-			                   : Value::BIGINT(group.second[i]));
+			               aggregates[i].kind == factorize::Aggregate::COUNT
+			                   ? Value::BIGINT(group.second[i])
+			                   : FoldedValue(group.second[i], aggregate_types[i]));
 		}
 		gstate.handed_out++;
 		produced++;

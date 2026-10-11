@@ -5381,3 +5381,54 @@ installing.
 `ref` names, confirm the six-platform matrix is green at that tag, fork
 duckdb/community-extensions and open the pull request with this file. The README
 serves as the extension's front page and already leads with what it is not for.
+
+## D77 — min and max, the third semiring
+
+D76 caught a false claim in the shipping description: it listed `min` and `max`
+among the supported aggregates and only `COUNT` and `SUM` existed. They exist
+now, and the reason it was a small change is that the fold was built for it --
+`plan.hpp` has described count and sum as "semiring folds over the same
+representation, differing in what a node contributes" since they were written.
+
+**min and max are the cheaper semiring.** They are idempotent, so no
+multiplicity is threaded anywhere: `SubtreeExtreme` needs none of `SubtreeSum`'s
+weighting of each slot by how many tuples the others make, because a value
+appearing once and appearing a thousand times have the same minimum.
+
+**What they do need is emptiness, and that is the whole of the difficulty.** A
+record whose sibling branches denote no tuples belongs to no tuple, and its
+value must not reach the answer. This is §4.6's hazard in the form an extreme
+takes: a sum absorbs an empty branch as a harmless zero, while an extreme would
+report a value no tuple carries. So `Combine`, the sibling product, annihilates
+the extreme when either side is empty, and `Alternatives`, a union, needs no
+such check -- an empty alternative holds the identity, which loses to
+everything.
+
+**One bug, found by the test rather than by reading it.** The group accumulator
+inserted a default-constructed `Fold`, whose extremes are zero, and zero is the
+one value that is never safe there: it wins every min over a positive column and
+loses every max over a negative one. A min over 50 and 60 came back 0. It takes
+`Identity()` now, which gives each aggregate the extreme that loses to
+everything -- the same care the count beside it already took in demanding an
+explicit zero rather than `Fold`'s multiplicative default of 1.
+
+**Checked three ways.** Against brute-force enumeration of the same join in the
+core suite, grouped and ungrouped, on a fixture where one key exists only in the
+lowest relation so the -999 and 999 it carries join nothing: if the hazard were
+present those would be the answer, since they are the most extreme values in the
+data. Against stock DuckDB in the SQL suite, including an empty join, where min
+and max side with sum in returning NULL rather than with count in returning 0.
+And against stock DuckDB on 1,900 randomly generated queries over degenerate
+shapes, 659 of them taken over, with no disagreement.
+
+The fuzzer now draws min and max alongside sum, which is the test that matters:
+the emptiness a sum absorbs is the thing an extreme must notice, so mixing them
+in one walk is what exercises the difference.
+
+**Declined: non-integer columns.** The representation stores integers and there
+is nowhere to put anything else. Worth recording that this is a narrower reason
+than D10's: D10 excludes FLOAT and DOUBLE from *sums* because floating-point
+addition does not reassociate and `auto` must stay bit-exact against `off`. min
+and max reassociate freely and would be exact on any ordered type -- they are
+declined for storage, not for arithmetic, and a representation that carried
+other types could have them.

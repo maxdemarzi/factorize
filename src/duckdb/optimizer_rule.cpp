@@ -455,8 +455,31 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			}
 			entry.kind = factorize::Aggregate::SUM;
 			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+		} else if (name == "min" || name == "max") {
+			// The same fold again, with the idempotent semiring (D77). Same
+			// requirement on the argument and for the same reason: it is folded
+			// through the representation, not evaluated per tuple.
+			if (bound.children.size() != 1 ||
+			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				Decline(region, name + "() of a computed expression");
+				ok = false;
+				continue;
+			}
+			// The representation stores integers, so the value must be one. An
+			// ordered type min and max would otherwise handle exactly -- they
+			// reassociate freely, unlike sum -- is still declined here because
+			// there is nowhere to put it (D10's restriction, for a different
+			// reason than D10's).
+			const auto &value_type = bound.children[0]->return_type;
+			if (!value_type.IsIntegral() && value_type.id() != LogicalTypeId::DECIMAL) {
+				Decline(region, name + "() of a " + value_type.ToString() + " column");
+				ok = false;
+				continue;
+			}
+			entry.kind = name == "min" ? factorize::Aggregate::MIN : factorize::Aggregate::MAX;
+			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
 		} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
-			Decline(region, "aggregate is " + name + "(), not count(*) or sum()");
+			Decline(region, "aggregate is " + name + "(), not count(*), sum(), min() or max()");
 			ok = false;
 			continue;
 		}
@@ -716,7 +739,7 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 	}
 
 	for (const auto &aggregate : region.aggregates) {
-		if (aggregate.kind != factorize::Aggregate::SUM) {
+		if (aggregate.kind == factorize::Aggregate::COUNT) {
 			// count(*) reads nothing: the representation knows how many tuples
 			// a subtree denotes without looking at any column of them.
 			aggregates.push_back(factorize::GroupAggregate {factorize::Aggregate::COUNT, 0, 0});
@@ -782,13 +805,14 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			// guard below it is for the rows the statistics do not cover.
 			auto statistics = get.GetTable()->GetStatistics(context, column_index.GetPrimaryIndex());
 			if (!statistics || statistics->CanHaveNull()) {
-				return Decline(region, "sum over " + definition.Name() + ", which may contain NULL and would " +
+				return Decline(region, "an aggregate over " + definition.Name() +
+				                           ", which may contain NULL and would " +
 				                           (region.grouped ? "drop a group entirely"
 				                                           : "drop the row from the query's other aggregates"));
 			}
 			bound.no_null_columns.push_back(static_cast<idx_t>(local));
 		}
-		aggregates.push_back(factorize::GroupAggregate {factorize::Aggregate::SUM, found->second, local});
+		aggregates.push_back(factorize::GroupAggregate {aggregate.kind, found->second, local});
 	}
 
 	for (const auto &binding : region.group_bindings) {
@@ -1414,7 +1438,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 						// count(*) is BIGINT; a sum keeps the type DuckDB gave
 						// it, because the operators above were bound to that.
 						replacement->aggregate_types.push_back(
-						    entry.kind == factorize::Aggregate::SUM ? entry.type : LogicalType::BIGINT);
+						    entry.kind == factorize::Aggregate::COUNT ? LogicalType::BIGINT : entry.type);
 					}
 					// Hold the operator to the size the gate bet on. The gate is a
 					// prediction and predictions are wrong; this bounds how wrong.

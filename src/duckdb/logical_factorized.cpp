@@ -90,10 +90,15 @@ InsertionOrderPreservingMap<string> LogicalFactorized::ParamsToString() const {
 	string folds;
 	for (const auto &entry : aggregates) {
 		folds += (folds.empty() ? "" : ", ");
-		folds += entry.kind == factorize::Aggregate::SUM
-		             ? "sum(" + relations[entry.relation].alias + "." +
-		                   relations[entry.relation].column_names[entry.column] + ")"
-		             : "count(*)";
+		if (entry.kind == factorize::Aggregate::COUNT) {
+			folds += "count(*)";
+			continue;
+		}
+		const char *fold_name = entry.kind == factorize::Aggregate::SUM
+		                            ? "sum"
+		                            : (entry.kind == factorize::Aggregate::MIN ? "min" : "max");
+		folds += string(fold_name) + "(" + relations[entry.relation].alias + "." +
+		         relations[entry.relation].column_names[entry.column] + ")";
 	}
 	result["Aggregate"] = folds;
 	return result;
