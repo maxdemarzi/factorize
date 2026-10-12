@@ -135,7 +135,9 @@ struct TupleWalker {
 			if (stopped) {
 				return;
 			}
-			auto rest = [&]() { EnumerateSlots(record, slot_index + 1, next); };
+			auto rest = [&]() {
+				EnumerateSlots(record, slot_index + 1, next);
+			};
 			EnumerateRecord(child, Continuation(rest));
 		});
 	}

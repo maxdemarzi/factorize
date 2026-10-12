@@ -102,8 +102,9 @@ int64_t BruteForce(const QueryGraph &graph, const Source &source, size_t rows, c
 		for (const auto &predicate : graph.predicates) {
 			const int64_t left = source.relations[predicate.left_relation][static_cast<size_t>(predicate.left_column)]
 			                                     [index[predicate.left_relation]];
-			const int64_t right = source.relations[predicate.right_relation][static_cast<size_t>(predicate.right_column)]
-			                                      [index[predicate.right_relation]];
+			const int64_t right =
+			    source.relations[predicate.right_relation][static_cast<size_t>(predicate.right_column)]
+			                    [index[predicate.right_relation]];
 			if (left != right) {
 				keep = false;
 				break;
@@ -112,8 +113,9 @@ int64_t BruteForce(const QueryGraph &graph, const Source &source, size_t rows, c
 		if (keep && neq != nullptr) {
 			const int64_t left =
 			    source.relations[neq->left_relation][static_cast<size_t>(neq->left_column)][index[neq->left_relation]];
-			const int64_t right = source.relations[neq->right_relation][static_cast<size_t>(neq->right_column)]
-			                                      [index[neq->right_relation]];
+			const int64_t right =
+			    source
+			        .relations[neq->right_relation][static_cast<size_t>(neq->right_column)][index[neq->right_relation]];
 			keep = neq_as_equality ? (left == right) : (left != right);
 		}
 		total += keep ? 1 : 0;
@@ -179,8 +181,8 @@ static void TestDifferential() {
 		auto graph = MakeGraph(relations, columns, ValueType::INT32);
 		// A spanning tree of equalities, so the graph is connected.
 		for (size_t r = 1; r < relations; r++) {
-			graph.predicates.push_back(Predicate {rng() % r, static_cast<int>(rng() % columns), r,
-			                                      static_cast<int>(rng() % columns)});
+			graph.predicates.push_back(
+			    Predicate {rng() % r, static_cast<int>(rng() % columns), r, static_cast<int>(rng() % columns)});
 		}
 		// The inequality, between two distinct relations.
 		NotEqualPredicate neq;
@@ -192,8 +194,8 @@ static void TestDifferential() {
 		neq.right_column = static_cast<int>(rng() % columns);
 
 		auto source = MakeData(rng, relations, columns, rows, domain);
-		const auto result = ExecuteCountNotEqual(graph, neq, source,
-		                                         (trial % 2) ? JoinMode::TOP_INSERT : JoinMode::BOTTOM_INSERT);
+		const auto result =
+		    ExecuteCountNotEqual(graph, neq, source, (trial % 2) ? JoinMode::TOP_INSERT : JoinMode::BOTTOM_INSERT);
 		cases++;
 		if (!result.ok) {
 			// A decline is a legitimate outcome -- the second term may not plan
@@ -238,8 +240,8 @@ static void TestPartition() {
 
 		auto graph = MakeGraph(relations, columns, ValueType::INT32);
 		for (size_t r = 1; r < relations; r++) {
-			graph.predicates.push_back(Predicate {rng() % r, static_cast<int>(rng() % columns), r,
-			                                      static_cast<int>(rng() % columns)});
+			graph.predicates.push_back(
+			    Predicate {rng() % r, static_cast<int>(rng() % columns), r, static_cast<int>(rng() % columns)});
 		}
 		NotEqualPredicate neq;
 		neq.left_relation = 0;
@@ -366,12 +368,12 @@ static void TestCost() {
 		}
 		const auto all_plan = BuildPlan(graph);
 		const auto all = ExecuteCount(graph, all_plan, source, JoinMode::BOTTOM_INSERT);
-		const double kept = all.count > 0 ? 100.0 * static_cast<double>(result.count) / static_cast<double>(all.count)
-		                                  : 0.0;
+		const double kept =
+		    all.count > 0 ? 100.0 * static_cast<double>(result.count) / static_cast<double>(all.count) : 0.0;
 		std::printf("       compared-column domain %2d: equi-join %lld tuples, `<>` keeps %lld (%.1f%%)\n", domain,
 		            static_cast<long long>(all.count), static_cast<long long>(result.count), kept);
-		Expect(result.count <= all.count, "the `<>` count never exceeds the equi-join it filters (domain " +
-		                                      std::to_string(domain) + ")");
+		Expect(result.count <= all.count,
+		       "the `<>` count never exceeds the equi-join it filters (domain " + std::to_string(domain) + ")");
 	}
 }
 

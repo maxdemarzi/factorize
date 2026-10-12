@@ -285,7 +285,8 @@ static void TestOverflowIsCaught() {
 	// not a blanket ban on large numbers.
 	ExpectEq<int64_t>(CheckedCardinalityMul(max, 1), max, "multiplying by 1 at the boundary is exact, not rejected");
 	ExpectEq<int64_t>(CheckedCardinalityAdd(max, 0), max, "adding 0 at the boundary is exact, not rejected");
-	ExpectEq<int64_t>(CheckedCardinalityMul(0, max), 0, "multiplying by 0 never overflows, regardless of the other operand");
+	ExpectEq<int64_t>(CheckedCardinalityMul(0, max), 0,
+	                  "multiplying by 0 never overflows, regardless of the other operand");
 	ExpectEq<int64_t>(CheckedCardinalityMul(1000, 1000), 1000000, "ordinary multiplication is unaffected");
 }
 

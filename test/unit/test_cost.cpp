@@ -330,8 +330,8 @@ static void TestMemoryBudget() {
 	CostThresholds tight = generous;
 	tight.memory_budget_bytes = unlimited.bytes / 2;
 	const auto within = EstimateCost(steps, true, tight);
-	std::printf("  %.4g bytes predicted, budget %.4g, slack %.0fx -> %s\n", within.bytes,
-	            tight.memory_budget_bytes, tight.memory_slack, within.fire ? "FIRE" : "decline");
+	std::printf("  %.4g bytes predicted, budget %.4g, slack %.0fx -> %s\n", within.bytes, tight.memory_budget_bytes,
+	            tight.memory_slack, within.fire ? "FIRE" : "decline");
 	Check(within.fire, "twice the budget is inside the slack, so this must still fire");
 
 	CostThresholds refuse = generous;
@@ -471,8 +471,7 @@ static void TestCollapsedEstimateIsNotASmallJoin() {
 		steps.push_back(step);
 	}
 	const auto estimate = EstimateCost(steps, true);
-	std::printf("  over-covered: flat %.4g -> %s\n", estimate.flat_tuples,
-	            estimate.collapsed ? "COLLAPSED" : "costed");
+	std::printf("  over-covered: flat %.4g -> %s\n", estimate.flat_tuples, estimate.collapsed ? "COLLAPSED" : "costed");
 	Check(!estimate.collapsed, "and the gate must get a number it can cost");
 }
 
@@ -487,7 +486,7 @@ static void TestGenuinelyEmptyClassStillCollapses() {
 	for (int i = 0; i < 2; i++) {
 		ColumnStats column;
 		column.rows = 1000;
-		column.distinct = 2;  // exactly what the list names: nothing unnamed
+		column.distinct = 2; // exactly what the list names: nothing unnamed
 		column.mcv = {{i * 2 + 1, 600}, {i * 2 + 2, 400}};
 		Check(column.TailRows() == 0, "a complete list leaves a genuinely empty tail");
 		group.push_back(column);

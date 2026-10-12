@@ -175,8 +175,7 @@ public:
 		return finalized;
 	}
 	size_t BytesAllocated() const {
-		return arena.BytesAllocated() + entries.capacity() * sizeof(Entry *) +
-		       directory.capacity() * sizeof(Entry *);
+		return arena.BytesAllocated() + entries.capacity() * sizeof(Entry *) + directory.capacity() * sizeof(Entry *);
 	}
 
 	//! Caps everything this table holds; 0 means unlimited. One `Entry` is
@@ -237,8 +236,8 @@ private:
 		if (limit == 0) {
 			return;
 		}
-		const size_t held = arena.BytesAllocated() + entries.capacity() * sizeof(Entry *) +
-		                    directory.capacity() * sizeof(Entry *);
+		const size_t held =
+		    arena.BytesAllocated() + entries.capacity() * sizeof(Entry *) + directory.capacity() * sizeof(Entry *);
 		if (held + growing > limit) {
 			throw MemoryLimitExceeded("hash table exceeded its memory limit");
 		}

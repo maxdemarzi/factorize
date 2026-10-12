@@ -204,8 +204,8 @@ static void TestAgainstBruteForce() {
 							}
 							failures++;
 							if (detail.empty()) {
-								detail = std::string(c.name) + " mode=" +
-								         (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + " " +
+								detail = std::string(c.name) +
+								         " mode=" + (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + " " +
 								         std::to_string(left_rows) + "x" + std::to_string(left_domain) + " vs " +
 								         std::to_string(right_rows) + "x" + std::to_string(right_domain) + ": got " +
 								         std::to_string(got) + ", expected " + std::to_string(c.expected);
@@ -312,8 +312,7 @@ static void TestFactorizedSide() {
 		                                  std::to_string(ref.semi_left) + where);
 		Expect(anti == ref.anti_left, "anti over a factorized side: got " + std::to_string(anti) + ", expected " +
 		                                  std::to_string(ref.anti_left) + where);
-		Expect(semi + anti == accumulated.Count(),
-		       "semi + anti must equal the factorized side's tuple count" + where);
+		Expect(semi + anti == accumulated.Count(), "semi + anti must equal the factorized side's tuple count" + where);
 	}
 }
 

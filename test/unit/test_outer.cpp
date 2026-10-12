@@ -210,11 +210,9 @@ static void TestFlatOuterJoins() {
 					JoinKeys keys;
 					keys.build = {0};
 					keys.probe = {10};
-					for (auto preserve :
-					     {Preserve::NEITHER, Preserve::BUILD, Preserve::PROBE, Preserve::BOTH}) {
+					for (auto preserve : {Preserve::NEITHER, Preserve::BUILD, Preserve::PROBE, Preserve::BOTH}) {
 						const auto expected =
-						    BruteForce(build, 0, probe, 10,
-						               preserve == Preserve::BUILD || preserve == Preserve::BOTH,
+						    BruteForce(build, 0, probe, 10, preserve == Preserve::BUILD || preserve == Preserve::BOTH,
 						               preserve == Preserve::PROBE || preserve == Preserve::BOTH);
 						for (auto mode : {JoinMode::TOP_INSERT, JoinMode::BOTTOM_INSERT}) {
 							const auto actual = FactorizedCountJoin(Scan(build), Scan(probe), keys, mode,
@@ -225,12 +223,11 @@ static void TestFlatOuterJoins() {
 							}
 							failures++;
 							if (detail.empty()) {
-								detail = std::string(NameOf(preserve)) + " mode=" +
-								         (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + " build=" +
-								         std::to_string(build_rows) + "x" + std::to_string(build_domain) +
-								         " probe=" + std::to_string(probe_rows) + "x" +
-								         std::to_string(probe_domain) + ": got " + std::to_string(actual) +
-								         ", expected " + std::to_string(expected);
+								detail = std::string(NameOf(preserve)) +
+								         " mode=" + (mode == JoinMode::TOP_INSERT ? "top" : "bottom") +
+								         " build=" + std::to_string(build_rows) + "x" + std::to_string(build_domain) +
+								         " probe=" + std::to_string(probe_rows) + "x" + std::to_string(probe_domain) +
+								         ": got " + std::to_string(actual) + ", expected " + std::to_string(expected);
 							}
 						}
 					}
@@ -260,15 +257,15 @@ static void TestNeitherIsUnchanged() {
 		keys.probe = {10};
 		for (auto mode : {JoinMode::TOP_INSERT, JoinMode::BOTTOM_INSERT}) {
 			const auto without = FactorizedCountJoin(Scan(build), Scan(probe), keys, mode);
-			const auto with_neither = FactorizedCountJoin(Scan(build), Scan(probe), keys, mode,
-			                                             PathStrategy::LEVELWISE, nullptr, Preserve::NEITHER);
+			const auto with_neither = FactorizedCountJoin(Scan(build), Scan(probe), keys, mode, PathStrategy::LEVELWISE,
+			                                              nullptr, Preserve::NEITHER);
 			if (without != with_neither) {
 				mismatches++;
 			}
 		}
 	}
-	Expect(mismatches == 0, "the defaulted call and an explicit NEITHER disagree " + std::to_string(mismatches) +
-	                            " times");
+	Expect(mismatches == 0,
+	       "the defaulted call and an explicit NEITHER disagree " + std::to_string(mismatches) + " times");
 }
 
 //===--------------------------------------------------------------------===//
@@ -322,10 +319,10 @@ static void TestPreservedSideIsFactorized() {
 		for (auto preserve : {Preserve::NEITHER, Preserve::BUILD, Preserve::PROBE, Preserve::BOTH}) {
 			const auto expected = BruteForce(rs, 0, u, 0, preserve == Preserve::BUILD || preserve == Preserve::BOTH,
 			                                 preserve == Preserve::PROBE || preserve == Preserve::BOTH);
-			const auto actual = FactorizedCountJoin(accumulated, Scan(u), outer_keys, mode, PathStrategy::LEVELWISE,
-			                                        nullptr, preserve);
-			Expect(actual == expected, std::string("factorized preserved side, ") + NameOf(preserve) + " mode=" +
-			                               (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ": got " +
+			const auto actual =
+			    FactorizedCountJoin(accumulated, Scan(u), outer_keys, mode, PathStrategy::LEVELWISE, nullptr, preserve);
+			Expect(actual == expected, std::string("factorized preserved side, ") + NameOf(preserve) +
+			                               " mode=" + (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ": got " +
 			                               std::to_string(actual) + ", expected " + std::to_string(expected));
 		}
 	}

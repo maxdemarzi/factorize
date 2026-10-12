@@ -750,8 +750,12 @@ static void TestMemoryLimitCoversBuildSide() {
 	constexpr size_t tight_limit = 200 * 1024;
 
 	for (auto mode : {JoinMode::TOP_INSERT, JoinMode::BOTTOM_INSERT}) {
-		auto make_build = [&] { return MakeScan({A}, types, {build_keys}); };
-		auto make_probe = [&] { return MakeScan({A}, types, {probe_keys}); };
+		auto make_build = [&] {
+			return MakeScan({A}, types, {build_keys});
+		};
+		auto make_probe = [&] {
+			return MakeScan({A}, types, {probe_keys});
+		};
 
 		SetGlobalMemoryLimit(0); // unlimited, to confirm the shape itself is fine
 		bool ok_unlimited = false;
@@ -761,9 +765,8 @@ static void TestMemoryLimitCoversBuildSide() {
 		} catch (const std::exception &) {
 			ok_unlimited = false;
 		}
-		Expect(ok_unlimited,
-		      std::string("unlimited: 200,000-row build side joins fine (") +
-		          (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ")");
+		Expect(ok_unlimited, std::string("unlimited: 200,000-row build side joins fine (") +
+		                         (mode == JoinMode::TOP_INSERT ? "top" : "bottom") + ")");
 
 		SetGlobalMemoryLimit(tight_limit);
 		bool threw = false;
@@ -849,8 +852,8 @@ static void TestSliceBudgetBoundsTheSum() {
 	keys.build = {0};
 	keys.probe = {0};
 	{
-		auto result = FactorizedJoin(MakeScan({0}, types, {build}), MakeScan({0}, types, {probe}), keys,
-		                             JoinMode::BOTTOM_INSERT);
+		auto result =
+		    FactorizedJoin(MakeScan({0}, types, {build}), MakeScan({0}, types, {probe}), keys, JoinMode::BOTTOM_INSERT);
 		Expect(result.Count() == 2, "slice budget: an unconstrained join still answers");
 	}
 	Expect(ThreadBudget().used.load() == baseline,
@@ -930,8 +933,8 @@ static void TestCompositeKeyWidth() {
 			// 2 against 2 (1). Composite: only the (1,1) and (2,7) pairs agree
 			// on both columns.
 			const int64_t expected = c.composite ? 2 : 5;
-			Expect(count == expected, std::string(c.what) + " counts " + std::to_string(expected) + ", got " +
-			                              std::to_string(count));
+			Expect(count == expected,
+			       std::string(c.what) + " counts " + std::to_string(expected) + ", got " + std::to_string(count));
 		}
 	}
 }
@@ -990,17 +993,16 @@ static void TestGroupedScans() {
 
 	FactorizedRelation accumulated = scan(0);
 	const auto scanned = accumulated.Rep().RecordCount();
-	Expect(scanned == static_cast<size_t>(distinct), std::to_string(rows) + " rows over " +
-	                                                     std::to_string(distinct) + " distinct values scan to " +
-	                                                     std::to_string(distinct) + " records, got " +
-	                                                     std::to_string(scanned));
+	Expect(scanned == static_cast<size_t>(distinct), std::to_string(rows) + " rows over " + std::to_string(distinct) +
+	                                                     " distinct values scan to " + std::to_string(distinct) +
+	                                                     " records, got " + std::to_string(scanned));
 
 	// The multiplicity is where the dropped rows went; without it the relation
 	// would be a set and every count over it would be too small.
 	int64_t weighed = 0;
 	accumulated.Rep().ForEachRoot([&](Record root) { weighed += accumulated.Rep().GetWeight(root); });
-	Expect(weighed == rows, "the records' multiplicities total the " + std::to_string(rows) +
-	                            " rows scanned, got " + std::to_string(weighed));
+	Expect(weighed == rows, "the records' multiplicities total the " + std::to_string(rows) + " rows scanned, got " +
+	                            std::to_string(weighed));
 
 	for (int i = 1; i < relations; i++) {
 		JoinKeys join_keys;
@@ -1010,16 +1012,15 @@ static void TestGroupedScans() {
 	}
 
 	const auto count = accumulated.Count();
-	Expect(count == oracle,
-	       "the grouped star counts " + std::to_string(oracle) + ", got " + std::to_string(count));
+	Expect(count == oracle, "the grouped star counts " + std::to_string(oracle) + ", got " + std::to_string(count));
 
 	// One record per distinct value per level is 12 here. The bound is loose
 	// enough not to pin the representation's internals and tight enough that
 	// per-row records (about 510,200) cannot pass it.
 	const auto records = accumulated.Rep().RecordCount();
 	const size_t bound = static_cast<size_t>(distinct * relations * 2);
-	Expect(records <= bound, "the joined star holds at most " + std::to_string(bound) + " records, got " +
-	                             std::to_string(records));
+	Expect(records <= bound,
+	       "the joined star holds at most " + std::to_string(bound) + " records, got " + std::to_string(records));
 	scope.Detail(" (" + std::to_string(records) + " records for " + std::to_string(count) + " tuples)");
 }
 

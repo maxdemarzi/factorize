@@ -208,20 +208,18 @@ GroupSize EstimateGroup(const std::vector<ColumnStats> &group, const EstimatorOp
 		}
 		size.flat_by_value.emplace_back(value, product);
 	}
-	std::sort(size.flat_by_value.begin(), size.flat_by_value.end(),
-	          [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
-		          return a.first < b.first;
-	          });
+	std::sort(
+	    size.flat_by_value.begin(), size.flat_by_value.end(),
+	    [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) { return a.first < b.first; });
 	size.tail_flat_per_value = tail_flat / std::max(1.0, surviving);
 	size.uniform_flat_per_value = size.flat / std::max(1.0, size.distinct);
 	return size;
 }
 
 double GroupSize::FlatFor(int64_t value) const {
-	const auto found = std::lower_bound(flat_by_value.begin(), flat_by_value.end(), value,
-	                                    [](const std::pair<int64_t, double> &entry, int64_t v) {
-		                                    return entry.first < v;
-	                                    });
+	const auto found =
+	    std::lower_bound(flat_by_value.begin(), flat_by_value.end(), value,
+	                     [](const std::pair<int64_t, double> &entry, int64_t v) { return entry.first < v; });
 	if (found != flat_by_value.end() && found->first == value) {
 		return found->second;
 	}

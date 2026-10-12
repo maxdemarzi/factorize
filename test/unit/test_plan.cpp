@@ -160,7 +160,7 @@ static void TestInt64BeyondInt32Range() {
 		expected += entry.second;
 	}
 	Expect(result.count == expected,
-	      "int64 beyond int32 range: count is " + std::to_string(expected) + ", got " + std::to_string(result.count));
+	       "int64 beyond int32 range: count is " + std::to_string(expected) + ", got " + std::to_string(result.count));
 
 	// The adversarial-truncation case: two distinct BIGINT values that alias to
 	// the same int32_t after a naive `static_cast<int32_t>` (they differ only
@@ -181,7 +181,7 @@ static void TestInt64BeyondInt32Range() {
 	// total = 4, NOT 3*3=9 (which is what merging v1/v2 into one key would give)
 	Expect(alias_result.ok, "int64 alias case: executes without error (" + alias_result.error + ")");
 	Expect(alias_result.count == 4,
-	      "int64 alias case: distinct high-32-bit values must not collide, got " + std::to_string(alias_result.count));
+	       "int64 alias case: distinct high-32-bit values must not collide, got " + std::to_string(alias_result.count));
 }
 
 //! ExecuteCount must refuse to guess a missing or mismatched column_types
@@ -306,9 +306,8 @@ static void TestSlicingIsExact() {
 	const auto plan = BuildPlan(graph);
 	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(whole.ok, "slicing: the undivided run succeeds (" + whole.error + ")");
-	Expect(whole.count == 39 * 2 * 3 + 50 * 3,
-	       "slicing: undivided count is " + std::to_string(39 * 2 * 3 + 50 * 3) + ", got " +
-	           std::to_string(whole.count));
+	Expect(whole.count == 39 * 2 * 3 + 50 * 3, "slicing: undivided count is " + std::to_string(39 * 2 * 3 + 50 * 3) +
+	                                               ", got " + std::to_string(whole.count));
 
 	for (size_t slices : {2u, 3u, 8u, 64u}) {
 		const auto sliced = ExecuteCountSliced(graph, plan, source, JoinMode::BOTTOM_INSERT, slices);
@@ -393,8 +392,8 @@ static void TestExistsAgreesWithCount() {
 	const auto plan = BuildPlan(graph);
 
 	const auto counted = ExecuteCount(graph, plan, present, JoinMode::BOTTOM_INSERT);
-	Expect(counted.ok && counted.count == 1, "exists: the sparse join has exactly one tuple, got " +
-	                                             std::to_string(counted.count));
+	Expect(counted.ok && counted.count == 1,
+	       "exists: the sparse join has exactly one tuple, got " + std::to_string(counted.count));
 	const auto found = ExecuteExists(graph, plan, present, JoinMode::BOTTOM_INSERT);
 	Expect(found.ok, "exists: succeeds (" + found.error + ")");
 	Expect(found.count == 1, "exists: must find the witness wherever its bucket falls");
@@ -443,12 +442,11 @@ static void TestCountAtMostClampsToTheLimit() {
 	// tuples than exist answers with how many exist.
 	const int64_t wanted[] = {1, 5, 17, 18, 19, 1000};
 	for (auto limit : wanted) {
-		const auto got = ExecuteCountAtMost(graph, plan, source, JoinMode::BOTTOM_INSERT,
-		                                    static_cast<size_t>(limit));
+		const auto got = ExecuteCountAtMost(graph, plan, source, JoinMode::BOTTOM_INSERT, static_cast<size_t>(limit));
 		const int64_t expected = limit < whole.count ? limit : whole.count;
 		Expect(got.ok, "limit: succeeds at k=" + std::to_string(limit) + " (" + got.error + ")");
-		Expect(got.count == expected, "limit: k=" + std::to_string(limit) + " must answer " +
-		                                  std::to_string(expected) + ", got " + std::to_string(got.count));
+		Expect(got.count == expected, "limit: k=" + std::to_string(limit) + " must answer " + std::to_string(expected) +
+		                                  ", got " + std::to_string(got.count));
 	}
 
 	// `LIMIT 0` keeps nothing, and must answer without reading the input at all.
@@ -481,13 +479,13 @@ static void TestSliceKeyPartitionsTheFirstJoin() {
 	MemorySource source;
 	std::vector<int64_t> r0, r1a, r1c, r2b, r2c, r3, r4;
 	for (int64_t v = 0; v < 800; v++) {
-		r0.push_back(v);         // r0.c0: 800 distinct, class A with r1.c0
-		r1a.push_back(v);        // r1.c0
-		r1c.push_back(v % 4);    // r1.c1: class C with r2.c1
+		r0.push_back(v);      // r0.c0: 800 distinct, class A with r1.c0
+		r1a.push_back(v);     // r1.c0
+		r1c.push_back(v % 4); // r1.c1: class C with r2.c1
 	}
 	for (int64_t v = 0; v < 100; v++) {
-		r2b.push_back(v % 5);    // r2.c0: class B, only five values
-		r2c.push_back(v % 4);    // r2.c1
+		r2b.push_back(v % 5); // r2.c0: class B, only five values
+		r2c.push_back(v % 4); // r2.c1
 		r3.push_back(v % 5);
 		r4.push_back(v % 5);
 	}
@@ -507,8 +505,7 @@ static void TestSliceKeyPartitionsTheFirstJoin() {
 	// predicates[0] fixes the base at r0 and forms the narrow class that covers
 	// it. The wide class is r2-r3-r4, reaching three relations and neither of
 	// the first two joined.
-	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {2, 0, 3, 0}, Predicate {3, 0, 4, 0},
-	                    Predicate {1, 1, 2, 1}};
+	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {2, 0, 3, 0}, Predicate {3, 0, 4, 0}, Predicate {1, 1, 2, 1}};
 
 	const auto plan = BuildPlan(graph);
 	Expect(plan.complete, "slice key: the fixture must be plannable (" + plan.reason + ")");
@@ -517,7 +514,8 @@ static void TestSliceKeyPartitionsTheFirstJoin() {
 
 	SetGlobalLimits(0, 0, 0);
 	const auto whole = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
-	Expect(whole.ok && !whole.steps.empty(), "slice key: the undivided run must record its steps (" + whole.error + ")");
+	Expect(whole.ok && !whole.steps.empty(),
+	       "slice key: the undivided run must record its steps (" + whole.error + ")");
 	if (!whole.ok || whole.steps.empty()) {
 		return;
 	}
@@ -644,17 +642,15 @@ static void TestSkewedBucketFallsBackToAnotherKey() {
 		big_spread.push_back(v);
 		partner.push_back(v);
 	}
-	source.Add({small_skewed});              // r0: one column, all 7
-	source.Add({small_skewed});              // r1: one column, all 7
-	source.Add({big_skewed, big_spread});    // r2: the weight of the query
-	source.Add({partner});                   // r3: joined on the spreading key
+	source.Add({small_skewed});           // r0: one column, all 7
+	source.Add({small_skewed});           // r1: one column, all 7
+	source.Add({big_skewed, big_spread}); // r2: the weight of the query
+	source.Add({partner});                // r3: joined on the spreading key
 
 	QueryGraph graph;
 	graph.column_counts = {1, 1, 2, 1};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64}};
 	// The widest class reaches r0, r1 and r2 and is the skewed one: every row
 	// of all three carries the single value 7, so a bucket of it is either
 	// empty or the whole join. The second class reaches r2 and r3 only, and is
@@ -766,8 +762,7 @@ static void TestRateFloorAbandonsAtTheLastJoin() {
 	const auto four_run = ExecuteCount(four, four_plan, source, JoinMode::BOTTOM_INSERT);
 	Expect(!four_run.ok, "rate floor: an impossible floor must abandon the four-relation chain too");
 	Expect(four_run.error.find("join 2 of 3") != std::string::npos,
-	       "rate floor: it must judge at the LAST materialized join (2 of 3), not the first, got: " +
-	           four_run.error);
+	       "rate floor: it must judge at the LAST materialized join (2 of 3), not the first, got: " + four_run.error);
 
 	// A floor any machine meets leaves everything alone, which rules out the
 	// abandons above having been caused by anything other than the floor.
@@ -848,17 +843,15 @@ static void TestCompressionFloorAbandons() {
 	// n relations means n-1 joins, of which the last is fused into the count and
 	// materializes nothing -- so n-2 steps, and a two-relation query has none.
 	Expect(chain_off.steps.size() == chain_plan.steps.size() - 2,
-	       "compression floor: one step recorded per materialized join, got " +
-	           std::to_string(chain_off.steps.size()));
+	       "compression floor: one step recorded per materialized join, got " + std::to_string(chain_off.steps.size()));
 	for (const auto &step : chain_off.steps) {
 		Expect(step.live > 0 && step.tuples > 0, "compression floor: a step reports what it built");
-		Expect(step.Compression() < 2.0,
-		       "compression floor: a chain of unique keys barely compresses, got " +
-		           std::to_string(step.Compression()));
+		Expect(step.Compression() < 2.0, "compression floor: a chain of unique keys barely compresses, got " +
+		                                     std::to_string(step.Compression()));
 	}
 	for (const auto &step : star_off.steps) {
-		Expect(step.Compression() > 2.0, "compression floor: the star compresses, got " +
-		                                     std::to_string(step.Compression()));
+		Expect(step.Compression() > 2.0,
+		       "compression floor: the star compresses, got " + std::to_string(step.Compression()));
 	}
 
 	// The same two queries with the floor between them.
@@ -872,8 +865,8 @@ static void TestCompressionFloorAbandons() {
 	       "compression floor: abandoning is not a memory problem, so it must not be retried by slicing");
 	Expect(chain_on.error.find("compression") != std::string::npos,
 	       "compression floor: the error says what was measured, got '" + chain_on.error + "'");
-	Expect(chain_on.slices == 1, "compression floor: the chain was not sliced, it ran " +
-	                                 std::to_string(chain_on.slices) + " slices");
+	Expect(chain_on.slices == 1,
+	       "compression floor: the chain was not sliced, it ran " + std::to_string(chain_on.slices) + " slices");
 	// The exemption, pinned: three relations leave exactly one materialized
 	// join -- the first -- and the floor must not judge the query on it.
 	MemorySource short_source;
@@ -890,8 +883,8 @@ static void TestCompressionFloorAbandons() {
 	SetGlobalMinCompression(0);
 	Expect(short_on.ok, "compression floor: a query whose only materialized join is the first is not judged on it (" +
 	                        short_on.error + ")");
-	Expect(short_on.count == 2000, "compression floor: the exempt chain still counts 2000, got " +
-	                                   std::to_string(short_on.count));
+	Expect(short_on.count == 2000,
+	       "compression floor: the exempt chain still counts 2000, got " + std::to_string(short_on.count));
 
 	Expect(star_on.ok, "compression floor: the star still answers (" + star_on.error + ")");
 	Expect(star_on.count == star_off.count, "compression floor: the star's count is unchanged, " +

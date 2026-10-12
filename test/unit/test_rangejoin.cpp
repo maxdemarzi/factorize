@@ -297,9 +297,9 @@ static void TestSavingTracksCompression() {
 		// is an upper bound on the time ratio, and below some fan-out the
 		// factorized loop is slower despite doing strictly less work.
 		const double time_ratio = fact.ms > 0 ? flat.ms / fact.ms : 0.0;
-		std::printf("    fanout %2d:  comparisons %10ld -> %7ld (%7.1fx)   time %7.2f -> %5.2f ms (%6.2fx)%s\n",
-		            fanout, static_cast<long>(flat.evaluations), static_cast<long>(fact.evaluations), ratio, flat.ms,
-		            fact.ms, time_ratio, time_ratio < 1.0 ? "   <- SLOWER" : "");
+		std::printf("    fanout %2d:  comparisons %10ld -> %7ld (%7.1fx)   time %7.2f -> %5.2f ms (%6.2fx)%s\n", fanout,
+		            static_cast<long>(flat.evaluations), static_cast<long>(fact.evaluations), ratio, flat.ms, fact.ms,
+		            time_ratio, time_ratio < 1.0 ? "   <- SLOWER" : "");
 	}
 	Expect(all_match, "factorized and flat counts agree at every fan-out (" + detail + ")");
 }

@@ -30,7 +30,7 @@ thread_local double g_abandon_after_ms = 0;
 thread_local double g_min_rate = 0;
 thread_local bool g_second_key = false;
 thread_local std::chrono::steady_clock::time_point g_slice_start = std::chrono::steady_clock::now();
-}
+} // namespace
 
 void SetGlobalMemoryLimit(size_t bytes) {
 	g_memory_limit = bytes;
@@ -99,8 +99,8 @@ double GetGlobalMinCompression() {
 	return g_min_compression;
 }
 
-void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression,
-                     double abandon_after_ms, double min_rate, bool second_key) {
+void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double min_compression, double abandon_after_ms,
+                     double min_rate, bool second_key) {
 	g_memory_limit = memory_bytes;
 	ThreadBudget().limit = memory_bytes;
 	ThreadBudget().peak.store(ThreadBudget().used.load());
@@ -784,7 +784,7 @@ struct LowerSizeCounter {
 				slot_total = Of(child.first);
 			} else {
 				IterateLevel(plan, child.first, input, ctx, 0,
-				            [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
+				             [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
 			}
 			size = CheckedCardinalityMul(size, slot_total);
 			if (size == 0) {
@@ -838,7 +838,7 @@ struct OutputCounter {
 		for (const auto &child : level.children) {
 			int64_t slot_total = 0;
 			IterateLevel(plan, child.first, input, ctx, 0,
-			            [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
+			             [&]() { slot_total = CheckedCardinalityAdd(slot_total, Of(child.first)); });
 			size = CheckedCardinalityMul(size, slot_total);
 			if (size == 0) {
 				// This upper record encodes no tuples at all, so there is

@@ -579,7 +579,8 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 		if (!result.ok) {
 			throw InvalidInputException("factorized_group_count: %s", result.error);
 		}
-		state.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
+		state.groups =
+		    make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
 	}
 
 	// Groups can outnumber a vector, so this one hands them out a chunk at a
@@ -622,7 +623,7 @@ void ExecuteTuples(ClientContext &context, TableFunctionInput &data, DataChunk &
 
 	StorageSource source(context, bind_data.relations);
 	auto result = factorize::ExecuteMaterializeWithinMemory(bind_data.graph, plan, source,
-	                                                       factorize::JoinMode::BOTTOM_INSERT, bind_data.limit);
+	                                                        factorize::JoinMode::BOTTOM_INSERT, bind_data.limit);
 	if (!result.ok) {
 		throw InvalidInputException("factorized_tuples: %s", result.error);
 	}
@@ -631,9 +632,9 @@ void ExecuteTuples(ClientContext &context, TableFunctionInput &data, DataChunk &
 		// Streaming this properly means holding the representation across calls
 		// and an enumerator that can be resumed mid-tuple; the limit is the
 		// interesting case (plan §10.2) and it does fit.
-		throw InvalidInputException(
-		    "factorized_tuples: %llu tuples exceeds one vector; pass a limit of %llu or fewer",
-		    static_cast<uint64_t>(result.tuples.size()), static_cast<uint64_t>(STANDARD_VECTOR_SIZE));
+		throw InvalidInputException("factorized_tuples: %llu tuples exceeds one vector; pass a limit of %llu or fewer",
+		                            static_cast<uint64_t>(result.tuples.size()),
+		                            static_cast<uint64_t>(STANDARD_VECTOR_SIZE));
 	}
 
 	output.SetCardinality(result.tuples.size());

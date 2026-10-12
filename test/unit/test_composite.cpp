@@ -225,9 +225,8 @@ static void TestThirdRelationOnOneOfTheKeys() {
 
 	QueryGraph graph;
 	graph.column_counts = {2, 2, 1};
-	graph.column_types = {{ValueType::INT32, ValueType::INT32},
-	                      {ValueType::INT32, ValueType::INT32},
-	                      {ValueType::INT32}};
+	graph.column_types = {
+	    {ValueType::INT32, ValueType::INT32}, {ValueType::INT32, ValueType::INT32}, {ValueType::INT32}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 1, 1, 1}, Predicate {0, 0, 2, 0}};
 
 	const auto plan = BuildPlan(graph);
@@ -385,10 +384,10 @@ static void TestUnenforcedEqualityIsNeverSubstituted() {
 		}
 		for (auto mode : {JoinMode::BOTTOM_INSERT, JoinMode::TOP_INSERT}) {
 			const auto counted = ExecuteCount(graph, plan, source, mode);
-			Expect(counted.ok && counted.count == truth,
-			       std::string("unenforced: ") + shape.what + " -- " +
-			           (mode == JoinMode::BOTTOM_INSERT ? "bottom" : "top") + "-insert gives " +
-			           std::to_string(counted.count) + ", brute force says " + std::to_string(truth));
+			Expect(counted.ok && counted.count == truth, std::string("unenforced: ") + shape.what + " -- " +
+			                                                 (mode == JoinMode::BOTTOM_INSERT ? "bottom" : "top") +
+			                                                 "-insert gives " + std::to_string(counted.count) +
+			                                                 ", brute force says " + std::to_string(truth));
 		}
 	}
 }
@@ -434,8 +433,7 @@ static void TestSweepAgainstBruteForce() {
 
 				QueryGraph graph;
 				graph.column_counts = {2, 2};
-				graph.column_types = {{ValueType::INT32, ValueType::INT32},
-				                      {ValueType::INT32, ValueType::INT32}};
+				graph.column_types = {{ValueType::INT32, ValueType::INT32}, {ValueType::INT32, ValueType::INT32}};
 				graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 1, 1, 1}};
 				const auto plan = BuildPlan(graph);
 				if (!plan.complete) {
@@ -446,8 +444,8 @@ static void TestSweepAgainstBruteForce() {
 				for (auto mode : {JoinMode::BOTTOM_INSERT, JoinMode::TOP_INSERT}) {
 					const auto counted = ExecuteCount(graph, plan, source, mode);
 					if (!counted.ok || counted.count != truth) {
-						Expect(false, "sweep: domain " + std::to_string(domain) + " " + std::to_string(a_rows_n) +
-						                  "x" + std::to_string(b_rows_n) + " gave " + std::to_string(counted.count) +
+						Expect(false, "sweep: domain " + std::to_string(domain) + " " + std::to_string(a_rows_n) + "x" +
+						                  std::to_string(b_rows_n) + " gave " + std::to_string(counted.count) +
 						                  " against " + std::to_string(truth) + " (" + counted.error + ")");
 						return;
 					}
