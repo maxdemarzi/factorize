@@ -5610,3 +5610,71 @@ correction does not help. The folds differ by under 2x in our own cost while the
 decisions differ by much more, which says again -- as D81's three predecessors
 said -- that the error is not in any one coefficient. Recorded rather than
 patched.
+
+## D82 — The gate orders queries well and the axis still cannot be cut
+
+D81 left the cost model aggregate-blind and the obvious correction useless. This
+is why, and it generalises the four failures before it.
+
+**Both engines change with the fold, and not by the same amount.** Over the 35
+runnable queries the gate fires on, relative to the same query as a `count(*)`:
+
+    fold        DuckDB side   our side   as count(*)   actual
+    min               1.07x      1.25x         1.38x    1.00x
+    max               1.07x      1.20x         1.38x    1.00x
+    avg               1.08x      1.18x         1.38x    1.06x
+    sum(x*y)          0.56x      1.25x         1.38x    0.42x
+
+DuckDB barely slows for min, max and avg -- it carries one more column -- while
+this engine slows by a fifth, so a 1.38x win becomes a wash. For `sum(x*y)`
+DuckDB gets *faster* than its own `count(*)`, and firing loses outright. The
+error is in the ratio, not in either side alone, which is why D81's multiplier
+on our side could not express it.
+
+**And the predictions are too compressed for any threshold to reach.** Over
+those 35 fires the predicted speedup runs from 1.4x to 451,884x, median 62.8x
+-- forty times the 1.5x bar. Raising the bar to 2.55x, which is what D81's
+measured 1.7x amounts to, drops four of thirty-five. There is nothing a
+multiplier can do at that scale.
+
+**The ordering is good, though, which is new.** Rank correlation between
+predicted and achieved speedup over the fires is **+0.68**: the four most
+confident predictions achieved 73.6x, 38.1x, 27.8x and 26.5x, in nearly that
+order. I expected zero and was wrong. What is wrong is the scale, and it is a
+clean power law over all 119 runnable queries:
+
+    achieved  ~  0.146 * predicted^0.516
+
+which halves the error -- x4.9 against x10.8 taking the prediction at face
+value. On that curve, actually achieving 1.5x needs a raw prediction near 91x.
+
+**So calibrate the scale and cut there, which is the first thing in this whole
+line that improved both corpora at once.** A bar at 20x takes the runnable
+corpus from 11.78s to 11.18s and its regressions from 13 to 4, while removing
+every one of the three bad fires on the excluded corpus.
+
+And it is still wrong, because of what it gives up:
+
+    bar    surrendered
+    20x    36 rescues, 25 faster   -- to avoid 4 slower and 1 lost
+    50x    56 rescues, 31 faster   -- to avoid the same 5
+    91x    71 rescues, 38 faster   -- to avoid the same 5
+
+Thirty-six answers that do not otherwise exist, for five bad outcomes. By the
+standard this project has used since D60 that is not close.
+
+**Five attempts, one shape.** D71 scaled DuckDB's coefficient, D73 tried four
+plan-time features, D75 keyed a learned correction on tables and then on join
+shape, D81 charged the fold, and this calibrated the axis itself. Every one
+moved a threshold along an axis that *orders queries correctly*, and every one
+surrendered four to ten good outcomes per bad one, because the rescues and the
+losses are interleaved along it rather than separated by it.
+
+That is the thing to write down. The gate's problem was never that it ranks
+badly. It is that the queries it most wants to keep and the ones it most wants
+to drop sit next to each other in its ranking, and no monotone function of that
+ranking can tell them apart. Any further progress needs a second axis, not a
+better cut on this one.
+
+`scripts/calibrate-outcome.py` recomputes all of it from measurements already
+in the repository.
