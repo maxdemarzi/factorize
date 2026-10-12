@@ -1339,6 +1339,33 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 		const double min_obs = DoubleSetting(context, "factorize_learn_min_queries", 3.0);
 		thresholds.flat_correction = factorize::Calibration::Get().CorrectionFor(tables, min_obs);
 	}
+	// A fold that reads a column costs more per record than one that reads
+	// none, and until D81 the cost model did not know which fold was running:
+	// it fired on the same 35 queries of the runnable corpus whether the query
+	// was a count(*), a min, an avg or a sum of a product. Measured on those
+	// 35, our own time is 1.6x to 1.8x higher for every column-reading fold
+	// than for count(*), and the corpus went from 1.71x on count(*) to 1.32x
+	// on min and 0.92x on sum(x*y) -- firing made it slower than not firing.
+	//
+	// Defaulting to 1.0, which is to say off, because charging the fold was
+	// tried at the measured 1.7x and did not work: 35 fires became 33 and the
+	// corpus moved 1.32x to 1.29x on min, 1.33x to 1.25x on max, 1.29x to
+	// 1.38x on avg and 0.92x to 0.93x on sum(x*y) -- noise in both directions,
+	// no decision meaningfully changed. The third global scalar to fail at
+	// separating these cases, after D71's coefficient and D73's four features.
+	//
+	// And the regime matters more than the fold. sum(x*y) loses on the runnable
+	// corpus (0.92x) and wins where the aggregate exists to be used: on 50 of
+	// the excluded queries it is 7 faster against 1 slower with one rescue and
+	// no losses, 221.0s of stock against 91.8s. Declining it under `auto`
+	// because of the runnable number would give up the case it was built for,
+	// so it keeps firing and this knob stays an instrument (D81).
+	for (const auto &aggregate : region.aggregates) {
+		if (aggregate.reads_column) {
+			thresholds.ours.per_output_ms *= DoubleSetting(context, "factorize_fold_cost", 1.0);
+			break;
+		}
+	}
 	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
 	thresholds.memory_slack = DoubleSetting(context, "factorize_memory_slack", thresholds.memory_slack);
 	// The operator's IsPlainCount, restated: only then is the last join fused.
@@ -1662,6 +1689,12 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	// answered over it, and correct later predictions by it (D75). Off by
 	// default: it makes the gate's decisions depend on what it has run before,
 	// which is a property this project has not had and should be opted into.
+	// How much more a fold that reads a column costs per record than count(*),
+	// which reads none. 1.0 restores the aggregate-blind cost model (D81).
+	config.AddExtensionOption("factorize_fold_cost",
+	                          "Multiplier on this engine's predicted per-record cost for an aggregate that "
+	                          "reads a column",
+	                          LogicalType::DOUBLE, Value::DOUBLE(1.0));
 	config.AddExtensionOption("factorize_learn_cardinality",
 	                          "Correct the predicted flat result by what earlier queries over the same tables "
 	                          "turned out to be",

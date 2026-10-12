@@ -5555,3 +5555,58 @@ over, no disagreements.
 **What it does not do yet:** three or more columns, a product under a GROUP BY,
 or a product of expressions rather than plain columns. Each is the same algebra
 with more terms, and none is reachable today.
+
+## D81 — Five aggregates shipped, none of them timed, and one of them loses
+
+D77 through D80 added min, max, avg, count(c), bool_and, bool_or and
+sum(x * y), and every one was verified three ways -- brute force, stock DuckDB,
+and thousands of random queries. Not one was ever *timed*. The CE corpus cannot
+time them either: every query in it is a `count(*)`.
+
+So the corpus was rewritten, one aggregate at a time, over the same 119 join
+graphs, changing only the fold.
+
+**The gate fires on the same 35 queries whichever aggregate it is,** because
+`EstimateCost` has no idea which fold will run. What that costs:
+
+    fold         fires   faster   slower   corpus
+    count(*)        35       23        -    1.71x
+    min             35       17       16    1.32x
+    max             35       17       16    1.33x
+    avg             35       18       15    1.29x
+    sum(x*y)        35        9       25    0.92x
+
+Nearly half the fires lose on min, max and avg, and `sum(x*y)` is *worse than
+not firing at all*. A gate tuned on one aggregate was applied to five others on
+the assumption that the fold does not matter, and the assumption is wrong:
+measured on those 35 queries, our own time is 1.59x to 1.83x higher for every
+column-reading fold than for `count(*)`.
+
+**Charging the fold does not fix it.** `factorize_fold_cost` multiplies our
+predicted per-record cost when an aggregate reads a column; set to the measured
+1.7, 35 fires became 33 and the corpus moved 1.32x to 1.29x on min, 1.33x to
+1.25x on max, 1.29x to 1.38x on avg, 0.92x to 0.93x on sum(x*y). Noise, in both
+directions, with no decision meaningfully changed. That is the third global
+scalar to fail at separating these cases, after D71's coefficient and D73's
+four plan-time features, and it fails the same way: the losses are not clustered
+near the threshold, so moving the threshold does not reach them. Default 1.0,
+kept as an instrument.
+
+**But the regime matters more than the fold, and that is what saves it.**
+`sum(x*y)` loses on the runnable corpus, which is by construction the regime a
+flat engine already handles. On 50 of the excluded queries -- the regime the
+aggregate was built for -- it is 7 faster against 1 slower, with one rescue, no
+losses, and 221.0s of stock against 91.8s of ours.
+
+So the honest statement about `sum(x*y)` is not "it is slower" but "it is 0.92x
+where DuckDB is already comfortable and 2.4x where DuckDB is not", which is the
+same shape as the engine's own headline and should have been the expectation.
+Declining it under `auto` on the strength of the runnable number would have
+given up the case it exists for. It keeps firing.
+
+**What this leaves open,** and it is the first real gap in the cost model since
+D65: the gate is aggregate-blind, the blindness is measurable, and the obvious
+correction does not help. The folds differ by under 2x in our own cost while the
+decisions differ by much more, which says again -- as D81's three predecessors
+said -- that the error is not in any one coefficient. Recorded rather than
+patched.

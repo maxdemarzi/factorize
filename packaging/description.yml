@@ -76,6 +76,14 @@ docs:
     bit-exact against `off`; if the factorised path raises, the replaced plan
     answers instead.
 
+    The aggregates beyond count(\*) are timed as well as verified (D81), and the
+    gate does not yet know which fold it is costing: it fires on the same
+    queries whichever aggregate runs. On the benchmark's live corpus that is
+    1.3x for min, max and avg against 1.7x for count(\*), and 0.92x for
+    sum(x * y) — slower than not firing. In the regime these exist for it is the
+    other way round: on 50 of the excluded queries sum(x * y) is 7 faster
+    against 1 slower with no losses, 221s of stock against 92s.
+
     **Known limitations**, measured rather than assumed, with the numbers in
     DECISIONS.md: the cost model's coefficients are fitted on one machine and do
     not transfer between machines or datasets; its estimates are wrong where it
