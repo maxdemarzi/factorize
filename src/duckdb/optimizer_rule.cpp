@@ -584,8 +584,8 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		Decline(region, "fewer than two joined relations");
 		ok = false;
 	}
-	if (region.limited && (region.grouped || region.aggregates.size() != 1 ||
-	                       region.aggregates[0].kind != factorize::Aggregate::COUNT)) {
+	if (region.limited &&
+	    (region.grouped || region.aggregates.size() != 1 || region.aggregates[0].kind != factorize::Aggregate::COUNT)) {
 		// count(*) is the one fold whose answer does not depend on *which* k
 		// tuples the limit kept. A sum over them does, and so does a count per
 		// group, and SQL does not say which k those are -- so there is no
@@ -780,7 +780,8 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			}
 			factorize::ValueType value_type;
 			if (!TryIntegerKeyType(definition.Type(), value_type)) {
-				return Decline(region, "join key " + definition.Name() + " is " + definition.Type().ToString() + ", not an integer");
+				return Decline(region, "join key " + definition.Name() + " is " + definition.Type().ToString() +
+				                           ", not an integer");
 			}
 			// Columns no predicate mentions are never read: they cannot change a
 			// count, and carrying them would widen every record for nothing.
@@ -837,76 +838,76 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 		size_t resolved_local[2] = {0, 0};
 		const size_t binding_count = aggregate.kind == factorize::Aggregate::SUM_PRODUCT ? 2 : 1;
 		for (size_t which = 0; which < binding_count; which++) {
-		const ColumnBinding &column_binding = which == 0 ? aggregate.sum_binding : aggregate.second_binding;
-		// A summed column is not a join key, so unlike a join key it is *added*
-		// to the scan rather than required to be there already. Appended, never
-		// inserted: the join predicates above hold local column indices, and
-		// inserting would move the ground under them. (Filters are re-keyed
-		// below, after every append, for the same reason from the other
-		// direction.)
-		auto found = relation_of_table_index.find(column_binding.table_index);
-		if (found == relation_of_table_index.end()) {
-			return Decline(region, "summed column belongs to no relation of the region");
-		}
-		auto &get = region.relations[found->second].get();
-		auto &column_ids = get.GetColumnIds();
-		if (column_binding.column_index >= column_ids.size()) {
-			return Decline(region, "summed column is not among the scanned columns");
-		}
-		auto &column_index = column_ids[column_binding.column_index];
-		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
-			return Decline(region, "summed column is not a stored scalar column");
-		}
-		auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
-		if (definition.Generated()) {
-			return Decline(region, "summed column is generated");
-		}
-		factorize::ValueType value_type;
-		if (!TrySummableType(definition.Type(), value_type)) {
-			// Floating point is excluded on purpose rather than for want of a
-			// fold: reassociation makes a sum depend on the order it was taken
-			// in, and this rule's whole contract is that 'auto' and 'off' agree
-			// (DECISIONS D10). A DECIMAL past precision 18 is int128-backed and
-			// simply wider than the fold.
-			return Decline(region, "summed column " + definition.Name() + " is " + definition.Type().ToString() +
-			                           ", which the fold cannot carry");
-		}
-		auto &bound = relations[found->second];
-		const auto physical = static_cast<idx_t>(definition.Physical().index);
-		if (bound.LocalIndex(physical) < 0) {
-			bound.columns.push_back(physical);
-			bound.column_names.push_back(definition.Name());
-			bound.column_types.push_back(value_type);
-		}
-		const auto local = static_cast<size_t>(bound.LocalIndex(physical));
-		const bool row_matters_elsewhere = region.grouped || region.aggregates.size() > 1;
-		if (row_matters_elsewhere && local >= join_columns[found->second]) {
-			// A row whose summed value is NULL may be dropped only when this sum
-			// is the whole answer, because it contributes NULL to its own sum
-			// either way. It may not be dropped when anything else in the query
-			// needs the row to exist: a count(*) comes back one short, and a sum
-			// over another column loses that row's contribution to it. Grouped,
-			// it may never be dropped -- a group whose every row is NULL here is
-			// still a row of the answer, with a NULL sum.
-			//
-			// This read `region.grouped` alone, and `count(*), sum(x)` over a
-			// nullable x silently returned one row short (D31). The reasoning
-			// written here was sound about the sum and was applied to the query.
-			//
-			// Declined up front on the statistics, so the common case stays a
-			// decline that DuckDB answers rather than an error; the run-time
-			// guard below it is for the rows the statistics do not cover.
-			auto statistics = get.GetTable()->GetStatistics(context, column_index.GetPrimaryIndex());
-			if (!statistics || statistics->CanHaveNull()) {
-				return Decline(region, "an aggregate over " + definition.Name() +
-				                           ", which may contain NULL and would " +
-				                           (region.grouped ? "drop a group entirely"
-				                                           : "drop the row from the query's other aggregates"));
+			const ColumnBinding &column_binding = which == 0 ? aggregate.sum_binding : aggregate.second_binding;
+			// A summed column is not a join key, so unlike a join key it is *added*
+			// to the scan rather than required to be there already. Appended, never
+			// inserted: the join predicates above hold local column indices, and
+			// inserting would move the ground under them. (Filters are re-keyed
+			// below, after every append, for the same reason from the other
+			// direction.)
+			auto found = relation_of_table_index.find(column_binding.table_index);
+			if (found == relation_of_table_index.end()) {
+				return Decline(region, "summed column belongs to no relation of the region");
 			}
-			bound.no_null_columns.push_back(static_cast<idx_t>(local));
-		}
-		resolved_relation[which] = found->second;
-		resolved_local[which] = local;
+			auto &get = region.relations[found->second].get();
+			auto &column_ids = get.GetColumnIds();
+			if (column_binding.column_index >= column_ids.size()) {
+				return Decline(region, "summed column is not among the scanned columns");
+			}
+			auto &column_index = column_ids[column_binding.column_index];
+			if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren()) {
+				return Decline(region, "summed column is not a stored scalar column");
+			}
+			auto &definition = get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+			if (definition.Generated()) {
+				return Decline(region, "summed column is generated");
+			}
+			factorize::ValueType value_type;
+			if (!TrySummableType(definition.Type(), value_type)) {
+				// Floating point is excluded on purpose rather than for want of a
+				// fold: reassociation makes a sum depend on the order it was taken
+				// in, and this rule's whole contract is that 'auto' and 'off' agree
+				// (DECISIONS D10). A DECIMAL past precision 18 is int128-backed and
+				// simply wider than the fold.
+				return Decline(region, "summed column " + definition.Name() + " is " + definition.Type().ToString() +
+				                           ", which the fold cannot carry");
+			}
+			auto &bound = relations[found->second];
+			const auto physical = static_cast<idx_t>(definition.Physical().index);
+			if (bound.LocalIndex(physical) < 0) {
+				bound.columns.push_back(physical);
+				bound.column_names.push_back(definition.Name());
+				bound.column_types.push_back(value_type);
+			}
+			const auto local = static_cast<size_t>(bound.LocalIndex(physical));
+			const bool row_matters_elsewhere = region.grouped || region.aggregates.size() > 1;
+			if (row_matters_elsewhere && local >= join_columns[found->second]) {
+				// A row whose summed value is NULL may be dropped only when this sum
+				// is the whole answer, because it contributes NULL to its own sum
+				// either way. It may not be dropped when anything else in the query
+				// needs the row to exist: a count(*) comes back one short, and a sum
+				// over another column loses that row's contribution to it. Grouped,
+				// it may never be dropped -- a group whose every row is NULL here is
+				// still a row of the answer, with a NULL sum.
+				//
+				// This read `region.grouped` alone, and `count(*), sum(x)` over a
+				// nullable x silently returned one row short (D31). The reasoning
+				// written here was sound about the sum and was applied to the query.
+				//
+				// Declined up front on the statistics, so the common case stays a
+				// decline that DuckDB answers rather than an error; the run-time
+				// guard below it is for the rows the statistics do not cover.
+				auto statistics = get.GetTable()->GetStatistics(context, column_index.GetPrimaryIndex());
+				if (!statistics || statistics->CanHaveNull()) {
+					return Decline(region, "an aggregate over " + definition.Name() +
+					                           ", which may contain NULL and would " +
+					                           (region.grouped ? "drop a group entirely"
+					                                           : "drop the row from the query's other aggregates"));
+				}
+				bound.no_null_columns.push_back(static_cast<idx_t>(local));
+			}
+			resolved_relation[which] = found->second;
+			resolved_local[which] = local;
 		}
 		factorize::GroupAggregate folded;
 		folded.kind = aggregate.kind;
@@ -1369,8 +1370,8 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	thresholds.memory_budget_bytes = static_cast<double>(MemoryBudget(context));
 	thresholds.memory_slack = DoubleSetting(context, "factorize_memory_slack", thresholds.memory_slack);
 	// The operator's IsPlainCount, restated: only then is the last join fused.
-	thresholds.last_join_fused = !region.grouped && region.aggregates.size() == 1 &&
-	                             region.aggregates[0].kind == factorize::Aggregate::COUNT;
+	thresholds.last_join_fused =
+	    !region.grouped && region.aggregates.size() == 1 && region.aggregates[0].kind == factorize::Aggregate::COUNT;
 	// BuildPlan has already refused anything that cannot be arranged as a tree.
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
 	reason = estimate.reason;
@@ -1399,16 +1400,15 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 		for (idx_t i = 0; i < estimate.class_sizes.size(); i++) {
 			const auto &c = estimate.class_sizes[i];
 			classes += StringUtil::Format("[%llu: flat %.4g recs %.4g distinct %.4g tail/val %.4g] ",
-			                              static_cast<uint64_t>(i), c.flat, c.records, c.distinct,
-			                              c.tail_per_value);
+			                              static_cast<uint64_t>(i), c.flat, c.records, c.distinct, c.tail_per_value);
 		}
 		for (idx_t i = 0; i < estimate.edge_partners.size(); i++) {
 			const auto &e = estimate.edge_partners[i];
 			classes += StringUtil::Format(
 			    "[edge %llu: partners %.4g = head %.4g (share %.3f, %.0f mcv of %.0f rows) + tail %.4g "
 			    "(child flat %.4g / %.4g)] ",
-			    static_cast<uint64_t>(i), e.partners, e.head_term, e.head_share, e.parent_mcv_entries,
-			    e.parent_rows, e.tail_term, e.child_flat, e.divisor);
+			    static_cast<uint64_t>(i), e.partners, e.head_term, e.head_share, e.parent_mcv_entries, e.parent_rows,
+			    e.tail_term, e.child_flat, e.divisor);
 		}
 		Printer::Print(classes);
 	}
@@ -1544,7 +1544,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 				// FORCE skips this and only this: the matcher's refusals are
 				// about what the engine can compute at all, while the gate is
 				// about whether computing it that way is a good idea.
-				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason, predicted_bytes, predicted_flat);
+				const bool fire = !gated || GateAgrees(context, region, relations, graph, plan, gate_reason,
+				                                       predicted_bytes, predicted_flat);
 				if (!fire) {
 					region.decline = "gate says no: " + gate_reason;
 				} else {
@@ -1554,7 +1555,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 						               DescribeJoinOrder(relations, plan));
 					}
 					auto replacement = make_uniq<LogicalFactorized>(region.aggregate_index, std::move(relations),
-					                                               std::move(graph), std::move(plan));
+					                                                std::move(graph), std::move(plan));
 					replacement->predicted_flat = predicted_flat;
 					replacement->grouped = region.grouped;
 					replacement->limited = region.limited;
@@ -1590,7 +1591,8 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					// so a floor that applied under FORCE would quietly turn the
 					// whole SQL suite into a test of the fallback, passing all
 					// the way and covering nothing (D25, D26 again).
-					replacement->min_compression = gated ? DoubleSetting(context, "factorize_min_compression", 0.0) : 0.0;
+					replacement->min_compression =
+					    gated ? DoubleSetting(context, "factorize_min_compression", 0.0) : 0.0;
 					replacement->abandon_after_ms = DoubleSetting(context, "factorize_abandon_after_ms", 2000.0);
 					replacement->min_rate = DoubleSetting(context, "factorize_min_rate", 0.0);
 					replacement->second_key = BooleanSetting(context, "factorize_second_key", false);
@@ -1710,8 +1712,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Carry min(V_R, V_S) forward as the surviving tail domain instead of max, which is "
 	                          "the textbook rule (D45)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	config.AddExtensionOption("factorize_duckdb_per_tuple_ms",
-	                          "Milliseconds the gate charges DuckDB per result tuple",
+	config.AddExtensionOption("factorize_duckdb_per_tuple_ms", "Milliseconds the gate charges DuckDB per result tuple",
 	                          LogicalType::DOUBLE, Value::DOUBLE(3.981e-6));
 	config.AddExtensionOption("factorize_fallback_max_loss",
 	                          "Ignore the catalog's second opinion when the sampled estimate predicts we lose "

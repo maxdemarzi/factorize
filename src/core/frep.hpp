@@ -77,10 +77,9 @@ inline int64_t CheckedCardinalityMul(int64_t a, int64_t b) {
 		}
 		return -other;
 	}
-	const bool overflows = a > 0 ? (b > 0 ? a > std::numeric_limits<int64_t>::max() / b
-	                                      : b < std::numeric_limits<int64_t>::min() / a)
-	                             : (b > 0 ? a < std::numeric_limits<int64_t>::min() / b
-	                                      : a < std::numeric_limits<int64_t>::max() / b);
+	const bool overflows =
+	    a > 0 ? (b > 0 ? a > std::numeric_limits<int64_t>::max() / b : b < std::numeric_limits<int64_t>::min() / a)
+	          : (b > 0 ? a < std::numeric_limits<int64_t>::min() / b : a < std::numeric_limits<int64_t>::max() / b);
 	if (overflows) {
 		throw std::runtime_error("factorized count or sum exceeds the representable range (int64 overflow)");
 	}

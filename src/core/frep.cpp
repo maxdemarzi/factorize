@@ -198,7 +198,8 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 		// Siblings are a Cartesian product, so slots multiply; the children
 		// within one slot are alternatives, so they sum.
 		int64_t slot_total = 0;
-		ForEachChild(record, slot_index, [&](Record child) { slot_total = CheckedCardinalityAdd(slot_total, SubtreeSize(child)); });
+		ForEachChild(record, slot_index,
+		             [&](Record child) { slot_total = CheckedCardinalityAdd(slot_total, SubtreeSize(child)); });
 		size = CheckedCardinalityMul(size, slot_total);
 		if (size == 0) {
 			// An empty slot makes the whole subtree contribute nothing; the
@@ -212,8 +213,7 @@ int64_t FRepresentation::SubtreeSize(Record record) const {
 	return size;
 }
 
-FRepresentation::ProductSum FRepresentation::SubtreeProductSum(Record record, AttributeId x,
-                                                              AttributeId y) const {
+FRepresentation::ProductSum FRepresentation::SubtreeProductSum(Record record, AttributeId x, AttributeId y) const {
 	ProductSum result;
 	result.count = SubtreeSize(record);
 	if (result.count == 0) {
@@ -290,12 +290,10 @@ FRepresentation::ProductSum FRepresentation::SubtreeProductSum(Record record, At
 FRepresentation::ProductSum FRepresentation::CombineProductSums(const ProductSum &a, const ProductSum &b) {
 	ProductSum out;
 	out.count = CheckedCardinalityMul(a.count, b.count);
-	out.sum_x = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_x, b.count),
-	                                  CheckedCardinalityMul(a.count, b.sum_x));
-	out.sum_y = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_y, b.count),
-	                                  CheckedCardinalityMul(a.count, b.sum_y));
-	out.sum_xy = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_xy, b.count),
-	                                   CheckedCardinalityMul(a.count, b.sum_xy));
+	out.sum_x = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_x, b.count), CheckedCardinalityMul(a.count, b.sum_x));
+	out.sum_y = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_y, b.count), CheckedCardinalityMul(a.count, b.sum_y));
+	out.sum_xy =
+	    CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_xy, b.count), CheckedCardinalityMul(a.count, b.sum_xy));
 	out.sum_xy = CheckedCardinalityAdd(out.sum_xy, CheckedCardinalityMul(a.sum_x, b.sum_y));
 	out.sum_xy = CheckedCardinalityAdd(out.sum_xy, CheckedCardinalityMul(a.sum_y, b.sum_x));
 	return out;
@@ -303,7 +301,9 @@ FRepresentation::ProductSum FRepresentation::CombineProductSums(const ProductSum
 
 int64_t FRepresentation::SubtreeExtreme(Record record, AttributeId attribute, bool want_max) const {
 	const int64_t identity = want_max ? std::numeric_limits<int64_t>::min() : std::numeric_limits<int64_t>::max();
-	const auto better = [&](int64_t a, int64_t b) { return want_max ? std::max(a, b) : std::min(a, b); };
+	const auto better = [&](int64_t a, int64_t b) {
+		return want_max ? std::max(a, b) : std::min(a, b);
+	};
 	if (SubtreeSize(record) == 0) {
 		// No tuples, so no values -- the §4.6 hazard, which for an extreme is
 		// simply the identity rather than the zero a sum contributes.
@@ -345,8 +345,8 @@ int64_t FRepresentation::SubtreeSum(Record record, AttributeId attribute) const 
 			continue;
 		}
 		// The value lives here, so every tuple of this subtree carries it.
-		const int64_t value = level.payload[i].type == ValueType::INT32 ? static_cast<int64_t>(GetInt32(record, i))
-		                                                                : GetInt64(record, i);
+		const int64_t value =
+		    level.payload[i].type == ValueType::INT32 ? static_cast<int64_t>(GetInt32(record, i)) : GetInt64(record, i);
 		return CheckedCardinalityMul(value, count);
 	}
 

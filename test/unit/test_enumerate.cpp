@@ -113,13 +113,13 @@ static void TestEnumerationMatchesTheJoin() {
 
 	// The join is 1x1 (twice) + 1x2 = 4 tuples over key values 1 and 2.
 	const auto counted = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
-	Expect(counted.ok && counted.count == 4, "enumerate: the join has 4 tuples, count says " +
-	                                             std::to_string(counted.count));
+	Expect(counted.ok && counted.count == 4,
+	       "enumerate: the join has 4 tuples, count says " + std::to_string(counted.count));
 
 	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
 	Expect(materialized.ok, "enumerate: materialize succeeds (" + materialized.error + ")");
-	Expect(materialized.tuples.size() == 4, "enumerate: emitted " + std::to_string(materialized.tuples.size()) +
-	                                            " tuples, count says 4");
+	Expect(materialized.tuples.size() == 4,
+	       "enumerate: emitted " + std::to_string(materialized.tuples.size()) + " tuples, count says 4");
 
 	// Both attributes are the same equivalence class, so every tuple has the two
 	// columns equal -- and the multiset of values must be {1,1,2,2}.
@@ -156,8 +156,8 @@ static void TestEmptySubtreesAreNotEnumerated() {
 
 	const auto counted = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
 	// (1,10) and (2,20) survive; (1,99) joins nothing downward.
-	Expect(counted.ok && counted.count == 2, "enumerate: the chain has 2 tuples, count says " +
-	                                             std::to_string(counted.count));
+	Expect(counted.ok && counted.count == 2,
+	       "enumerate: the chain has 2 tuples, count says " + std::to_string(counted.count));
 
 	auto materialized = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 0);
 	Expect(materialized.ok, "enumerate: materialize succeeds (" + materialized.error + ")");
@@ -193,8 +193,8 @@ static void TestLimitStopsEarly() {
 	const auto plan = BuildPlan(graph);
 
 	const auto all = ExecuteCount(graph, plan, source, JoinMode::BOTTOM_INSERT);
-	Expect(all.ok && all.count == 50 * 20 * 20, "limit: the whole join is 20000 tuples, count says " +
-	                                                std::to_string(all.count));
+	Expect(all.ok && all.count == 50 * 20 * 20,
+	       "limit: the whole join is 20000 tuples, count says " + std::to_string(all.count));
 
 	auto five = ExecuteMaterialize(graph, plan, source, JoinMode::BOTTOM_INSERT, 5);
 	Expect(five.ok, "limit: materialize succeeds (" + five.error + ")");
@@ -278,8 +278,8 @@ static void TestGroupOnDeepKey() {
 
 	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {2, 0}});
 	Expect(grouped.ok, "deep key: fold succeeds (" + grouped.error + ")");
-	Expect(grouped.groups.size() == by_hand.size(), "deep key: " + std::to_string(grouped.groups.size()) +
-	                                                    " groups against " + std::to_string(by_hand.size()));
+	Expect(grouped.groups.size() == by_hand.size(),
+	       "deep key: " + std::to_string(grouped.groups.size()) + " groups against " + std::to_string(by_hand.size()));
 	for (const auto &entry : grouped.groups) {
 		const auto found = by_hand.find(entry.first[0]);
 		if (found == by_hand.end()) {
@@ -288,7 +288,7 @@ static void TestGroupOnDeepKey() {
 		}
 		Expect(entry.second[0] == found->second, "deep key: group " + std::to_string(entry.first[0]) + " counts " +
 		                                             std::to_string(entry.second[0]) + ", enumeration says " +
-		                                          std::to_string(found->second));
+		                                             std::to_string(found->second));
 	}
 }
 
@@ -345,9 +345,9 @@ static void TestSumMatchesEnumeration() {
 	// A star: the hub joins two arms, so a hub value is multiplied by the
 	// product of the arms' matching rows, and each arm's values are weighted by
 	// the other arm's count.
-	source.Add({{1, 2}});          // hub(k)
-	source.Add({{1, 1, 2}});       // arm1(k): two rows for k=1
-	source.Add({{1, 2, 2, 2}});    // arm2(k): one for k=1, three for k=2
+	source.Add({{1, 2}});       // hub(k)
+	source.Add({{1, 1, 2}});    // arm1(k): two rows for k=1
+	source.Add({{1, 2, 2, 2}}); // arm2(k): one for k=1, three for k=2
 	// Values to sum live on arm1, which is neither the root nor alone.
 	QueryGraph graph;
 	graph.column_counts = {1, 1, 1};
@@ -401,11 +401,11 @@ static void TestSumIgnoresUnmatchedAndKeepsZeroGroups() {
 	const auto zero_plan = BuildPlan(zero_graph);
 	auto grouped = ExecuteGroupSum(zero_graph, zero_plan, zeroes, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}}, 0, 1);
 	Expect(grouped.ok, "sum: grouped sum succeeds (" + grouped.error + ")");
-	Expect(grouped.groups.size() == 1, "sum: a group whose values are all zero is still a group, got " +
-	                                       std::to_string(grouped.groups.size()));
+	Expect(grouped.groups.size() == 1,
+	       "sum: a group whose values are all zero is still a group, got " + std::to_string(grouped.groups.size()));
 	if (!grouped.groups.empty()) {
-		Expect(grouped.groups[0].second[0] == 0, "sum: that group's sum is 0, got " +
-		                                             std::to_string(grouped.groups[0].second[0]));
+		Expect(grouped.groups[0].second[0] == 0,
+		       "sum: that group's sum is 0, got " + std::to_string(grouped.groups[0].second[0]));
 	}
 }
 
@@ -423,15 +423,14 @@ static void TestGroupOnSiblingBranches() {
 	MemorySource source;
 	// A star: hub joins two arms, and the group keys are one column from each
 	// arm, so neither is an ancestor of the other.
-	source.Add({{1, 1, 2}});             // hub(k)
-	source.Add({{1, 1, 2}, {7, 8, 9}});  // arm1(k, a)
+	source.Add({{1, 1, 2}});               // hub(k)
+	source.Add({{1, 1, 2}, {7, 8, 9}});    // arm1(k, a)
 	source.Add({{1, 2, 2}, {70, 80, 90}}); // arm2(k, b)
 
 	QueryGraph graph;
 	graph.column_counts = {1, 2, 2};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
 	const auto plan = BuildPlan(graph);
 
@@ -444,8 +443,7 @@ static void TestGroupOnSiblingBranches() {
 		by_hand[{tuple[2], tuple[4]}]++;
 	}
 
-	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT,
-	                                 {GroupKey {1, 1}, GroupKey {2, 1}});
+	auto grouped = ExecuteGroupCount(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {1, 1}, GroupKey {2, 1}});
 	Expect(grouped.ok, "sibling groups: fold succeeds (" + grouped.error + ")");
 	Expect(grouped.groups.size() == by_hand.size(), "sibling groups: " + std::to_string(grouped.groups.size()) +
 	                                                    " groups against " + std::to_string(by_hand.size()) +
@@ -458,10 +456,9 @@ static void TestGroupOnSiblingBranches() {
 			                  std::to_string(key.second) + ")");
 			continue;
 		}
-		Expect(entry.second[0] == found->second, "sibling groups: (" + std::to_string(key.first) + "," +
-		                                             std::to_string(key.second) + ") counts " +
-		                                             std::to_string(entry.second[0]) + ", enumeration says " +
-		                                          std::to_string(found->second));
+		Expect(entry.second[0] == found->second,
+		       "sibling groups: (" + std::to_string(key.first) + "," + std::to_string(key.second) + ") counts " +
+		           std::to_string(entry.second[0]) + ", enumeration says " + std::to_string(found->second));
 	}
 }
 
@@ -478,9 +475,8 @@ static void TestGroupSumOnSiblingBranches() {
 
 	QueryGraph graph;
 	graph.column_counts = {1, 2, 2};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
 	const auto plan = BuildPlan(graph);
 
@@ -505,7 +501,7 @@ static void TestGroupSumOnSiblingBranches() {
 		}
 		Expect(entry.second[0] == found->second, "sibling sums: group " + std::to_string(entry.first[0]) + " sums to " +
 		                                             std::to_string(entry.second[0]) + ", enumeration says " +
-		                                          std::to_string(found->second));
+		                                             std::to_string(found->second));
 	}
 }
 
@@ -525,9 +521,8 @@ static void TestSeveralAggregatesInOneWalk() {
 
 	QueryGraph graph;
 	graph.column_counts = {1, 2, 2};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
 	const auto plan = BuildPlan(graph);
 
@@ -552,29 +547,26 @@ static void TestSeveralAggregatesInOneWalk() {
 	                                                GroupAggregate {Aggregate::SUM, 2, 1}};
 	auto grouped = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}}, aggregates);
 	Expect(grouped.ok, "several: fold succeeds (" + grouped.error + ")");
-	Expect(grouped.groups.size() == by_hand.size(), "several: " + std::to_string(grouped.groups.size()) +
-	                                                    " groups against " + std::to_string(by_hand.size()));
+	Expect(grouped.groups.size() == by_hand.size(),
+	       "several: " + std::to_string(grouped.groups.size()) + " groups against " + std::to_string(by_hand.size()));
 	for (const auto &entry : grouped.groups) {
 		const auto found = by_hand.find(entry.first[0]);
 		if (found == by_hand.end()) {
 			Expect(false, "several: fold invented group " + std::to_string(entry.first[0]));
 			continue;
 		}
-		Expect(entry.second.size() == 3, "several: three values per group, got " +
-		                                     std::to_string(entry.second.size()));
+		Expect(entry.second.size() == 3, "several: three values per group, got " + std::to_string(entry.second.size()));
 		for (size_t i = 0; i < found->second.size() && i < entry.second.size(); i++) {
 			Expect(entry.second[i] == found->second[i],
-			       "several: group " + std::to_string(entry.first[0]) + " aggregate " + std::to_string(i) +
-			           " gives " + std::to_string(entry.second[i]) + ", enumeration says " +
-			           std::to_string(found->second[i]));
+			       "several: group " + std::to_string(entry.first[0]) + " aggregate " + std::to_string(i) + " gives " +
+			           std::to_string(entry.second[i]) + ", enumeration says " + std::to_string(found->second[i]));
 		}
 	}
 
 	// The same aggregates asked for one at a time have to agree with the shared
 	// walk, or sharing it changed an answer.
 	for (size_t i = 0; i < aggregates.size(); i++) {
-		auto alone = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}},
-		                            {aggregates[i]});
+		auto alone = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, {GroupKey {0, 0}}, {aggregates[i]});
 		Expect(alone.ok && alone.groups.size() == grouped.groups.size(),
 		       "several: aggregate " + std::to_string(i) + " alone gives the same groups");
 		for (size_t g = 0; g < alone.groups.size() && g < grouped.groups.size(); g++) {
@@ -605,15 +597,14 @@ static void TestMinMaxAgainstEnumeration() {
 	MemorySource source;
 	// Column-major. Key 9 exists only in r2, so its rows join nothing: the
 	// -999 and 999 they carry belong to no tuple of the result.
-	source.Add({{1, 2, 3}});                                 // r0: keys
-	source.Add({{1, 1, 3}, {50, 60, 70}});                   // r1: key, value
-	source.Add({{1, 1, 2, 9, 9}, {5, 40, 60, -999, 999}});   // r2: key, value
+	source.Add({{1, 2, 3}});                               // r0: keys
+	source.Add({{1, 1, 3}, {50, 60, 70}});                 // r1: key, value
+	source.Add({{1, 1, 2, 9, 9}, {5, 40, 60, -999, 999}}); // r2: key, value
 
 	QueryGraph graph;
 	graph.column_counts = {1, 2, 2};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
 	const auto plan = BuildPlan(graph);
 
@@ -635,14 +626,14 @@ static void TestMinMaxAgainstEnumeration() {
 	Expect(folded.groups.size() == 1, "minmax: one group");
 	if (!folded.groups.empty()) {
 		const auto &v = folded.groups[0].second;
-		Expect(v[0] == lo1, "minmax: min of r1 is " + std::to_string(v[0]) + ", enumeration says " +
-		                        std::to_string(lo1));
-		Expect(v[1] == hi1, "minmax: max of r1 is " + std::to_string(v[1]) + ", enumeration says " +
-		                        std::to_string(hi1));
-		Expect(v[2] == lo2, "minmax: min of r2 is " + std::to_string(v[2]) + ", enumeration says " +
-		                        std::to_string(lo2));
-		Expect(v[3] == hi2, "minmax: max of r2 is " + std::to_string(v[3]) + ", enumeration says " +
-		                        std::to_string(hi2));
+		Expect(v[0] == lo1,
+		       "minmax: min of r1 is " + std::to_string(v[0]) + ", enumeration says " + std::to_string(lo1));
+		Expect(v[1] == hi1,
+		       "minmax: max of r1 is " + std::to_string(v[1]) + ", enumeration says " + std::to_string(hi1));
+		Expect(v[2] == lo2,
+		       "minmax: min of r2 is " + std::to_string(v[2]) + ", enumeration says " + std::to_string(lo2));
+		Expect(v[3] == hi2,
+		       "minmax: max of r2 is " + std::to_string(v[3]) + ", enumeration says " + std::to_string(hi2));
 		// Said explicitly, because this is what the hazard breaks: -999 and 999
 		// sit on key 9, which joins nothing, so no tuple carries them and
 		// neither may be the answer however extreme it looks.
@@ -667,11 +658,9 @@ static void TestMinMaxAgainstEnumeration() {
 		}
 		Expect(group.second[2] == n, "minmax: group " + std::to_string(group.first[0]) + " count");
 		Expect(group.second[0] == lo, "minmax: group " + std::to_string(group.first[0]) + " min is " +
-		                                  std::to_string(group.second[0]) + ", enumeration says " +
-		                                  std::to_string(lo));
+		                                  std::to_string(group.second[0]) + ", enumeration says " + std::to_string(lo));
 		Expect(group.second[1] == hi, "minmax: group " + std::to_string(group.first[0]) + " max is " +
-		                                  std::to_string(group.second[1]) + ", enumeration says " +
-		                                  std::to_string(hi));
+		                                  std::to_string(group.second[1]) + ", enumeration says " + std::to_string(hi));
 	}
 }
 
@@ -693,15 +682,14 @@ static void TestProductSumAgainstEnumeration() {
 	Group scope("sum(x*y) decomposes over independent branches");
 
 	MemorySource source;
-	source.Add({{1, 2, 3}});                              // r0: keys
-	source.Add({{1, 1, 2, 3}, {5, -7, 11, 2}});           // r1: key, x
-	source.Add({{1, 1, 2, 9}, {3, -4, 6, 1000}});         // r2: key, y
+	source.Add({{1, 2, 3}});                      // r0: keys
+	source.Add({{1, 1, 2, 3}, {5, -7, 11, 2}});   // r1: key, x
+	source.Add({{1, 1, 2, 9}, {3, -4, 6, 1000}}); // r2: key, y
 
 	QueryGraph graph;
 	graph.column_counts = {1, 2, 2};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
 	const auto plan = BuildPlan(graph);
 
@@ -715,8 +703,8 @@ static void TestProductSumAgainstEnumeration() {
 
 	auto folded = ExecuteProductSum(graph, plan, source, JoinMode::BOTTOM_INSERT, 1, 1, 2, 1);
 	Expect(folded.ok, "productsum: fold succeeds (" + folded.error + ")");
-	Expect(folded.count == expected, "productsum: folded " + std::to_string(folded.count) +
-	                                     ", enumeration says " + std::to_string(expected));
+	Expect(folded.count == expected,
+	       "productsum: folded " + std::to_string(folded.count) + ", enumeration says " + std::to_string(expected));
 	Expect(folded.tuples == static_cast<int64_t>(materialized.tuples.size()),
 	       "productsum: tuple count " + std::to_string(folded.tuples) + " against " +
 	           std::to_string(materialized.tuples.size()));
@@ -729,15 +717,15 @@ static void TestProductSumAgainstEnumeration() {
 		expected_same += tuple[2] * tuple[2];
 	}
 	Expect(same.ok, "productsum: same-relation fold succeeds (" + same.error + ")");
-	Expect(same.count == expected_same, "productsum: x*x folded " + std::to_string(same.count) +
-	                                        ", enumeration says " + std::to_string(expected_same));
+	Expect(same.count == expected_same, "productsum: x*x folded " + std::to_string(same.count) + ", enumeration says " +
+	                                        std::to_string(expected_same));
 
 	// Duplicate keys, which the representation groups into one record standing
 	// for several tuples. Ignoring that weight halved sum(x*x) here while
 	// leaving sum(k*x) right, so the fixture carries both: the values were
 	// correct and each was counted once instead of twice.
 	MemorySource weighted;
-	weighted.Add({{1, 1}});                    // two identical keys -> one record
+	weighted.Add({{1, 1}}); // two identical keys -> one record
 	weighted.Add({{1, 1}, {5, -7}});
 	QueryGraph wgraph;
 	wgraph.column_counts = {1, 2};
@@ -769,9 +757,8 @@ static void TestSeveralAggregatesUngrouped() {
 
 	QueryGraph graph;
 	graph.column_counts = {1, 2, 2};
-	graph.column_types = {{ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64},
-	                      {ValueType::INT64, ValueType::INT64}};
+	graph.column_types = {
+	    {ValueType::INT64}, {ValueType::INT64, ValueType::INT64}, {ValueType::INT64, ValueType::INT64}};
 	graph.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 0, 2, 0}};
 	const auto plan = BuildPlan(graph);
 
@@ -790,8 +777,8 @@ static void TestSeveralAggregatesUngrouped() {
 	                              {GroupAggregate {Aggregate::COUNT, 0, 0}, GroupAggregate {Aggregate::SUM, 1, 1},
 	                               GroupAggregate {Aggregate::SUM, 2, 1}});
 	Expect(grouped.ok, "ungrouped: fold succeeds (" + grouped.error + ")");
-	Expect(grouped.groups.size() == 1, "ungrouped: the whole join is one group, got " +
-	                                       std::to_string(grouped.groups.size()));
+	Expect(grouped.groups.size() == 1,
+	       "ungrouped: the whole join is one group, got " + std::to_string(grouped.groups.size()));
 	if (!grouped.groups.empty()) {
 		Expect(grouped.groups[0].first.empty(), "ungrouped: that group has no key values");
 		Expect(grouped.groups[0].second[0] == tuples, "ungrouped: count is " +

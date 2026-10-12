@@ -170,7 +170,6 @@ static void AppendColumn(const LogicalType &type, const UnifiedVectorFormat &for
 	}
 }
 
-
 //! Appends one chunk's surviving rows to `held`, keeping every column in
 //! step. Shared by the full read and the sampled one so the row-alignment
 //! rule below has exactly one implementation -- a second copy of it was a
@@ -211,10 +210,9 @@ static void AppendChunk(const BoundRelation &bound, DataChunk &chunk, vector<idx
 			if (formats[column].validity.RowIsValid(formats[column].sel->get_index(row))) {
 				continue;
 			}
-			throw InvalidInputException(
-			    "factorize: %s.%s contains NULL, which this query needs to report as its own "
-			    "group and the representation cannot carry; SET factorize_mode='off' to run it",
-			    bound.alias, bound.column_names[column]);
+			throw InvalidInputException("factorize: %s.%s contains NULL, which this query needs to report as its own "
+			                            "group and the representation cannot carry; SET factorize_mode='off' to run it",
+			                            bound.alias, bound.column_names[column]);
 		}
 	}
 	kept.clear();
@@ -269,10 +267,9 @@ factorize::ColumnStats StorageSource::Stats(size_t relation, size_t column) {
 		frequencies.emplace_back(sorted[i], static_cast<double>(j - i));
 		i = j;
 	}
-	std::sort(frequencies.begin(), frequencies.end(),
-	          [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) {
-		          return a.second > b.second;
-	          });
+	std::sort(
+	    frequencies.begin(), frequencies.end(),
+	    [](const std::pair<int64_t, double> &a, const std::pair<int64_t, double> &b) { return a.second > b.second; });
 	if (frequencies.size() > MCV_ENTRIES) {
 		frequencies.resize(MCV_ENTRIES);
 	}

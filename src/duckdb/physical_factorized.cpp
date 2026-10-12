@@ -20,8 +20,8 @@ namespace duckdb {
 PhysicalFactorized::PhysicalFactorized(PhysicalPlan &physical_plan, vector<LogicalType> types,
                                        vector<BoundRelation> relations_p, factorize::QueryGraph graph_p,
                                        factorize::Plan plan_p, idx_t estimated_cardinality)
-    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality),
-      relations(std::move(relations_p)), graph(std::move(graph_p)), plan(std::move(plan_p)) {
+    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality), relations(std::move(relations_p)),
+      graph(std::move(graph_p)), plan(std::move(plan_p)) {
 }
 
 string PhysicalFactorized::GetName() const {
@@ -96,7 +96,6 @@ public:
 	FallbackPhase fallback_phase = FallbackPhase::NONE;
 	//! Scan position in the fallback's collected rows, set once it has run.
 	unique_ptr<ColumnDataScanState> fallback_scan;
-
 };
 
 //! Set while this thread is inside the fallback's own pipeline execution, so a
@@ -126,8 +125,7 @@ struct FallbackRunning {
 //! pipeline it drives, the same arrangement PhysicalRecursiveCTE uses.
 class FactorizedGlobalSinkState : public GlobalSinkState {
 public:
-	FactorizedGlobalSinkState(ClientContext &context, const vector<LogicalType> &types)
-	    : collected(context, types) {
+	FactorizedGlobalSinkState(ClientContext &context, const vector<LogicalType> &types) : collected(context, types) {
 	}
 	mutex lock;
 	ColumnDataCollection collected;
@@ -302,12 +300,13 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
 			                           abandon_after_ms, min_rate, second_key);
 			SharedRelations source(client, relations);
-			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
-			                                        group_keys, aggregates);
+			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, group_keys,
+			                                        aggregates);
 			if (!result.ok) {
 				throw InvalidInputException("factorize: %s", result.error);
 			}
-			gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
+			gstate.groups =
+			    make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
 			gstate.counts = std::move(result.counts);
 		}
 	}
@@ -329,9 +328,8 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			// count(*) of nothing is 0; every other aggregate of nothing is
 			// NULL, which a typed Value() with no value is. min and max join
 			// sum here rather than count: SQL has no least element to return.
-			chunk.SetValue(i, 0,
-			               aggregates[i].kind == factorize::Aggregate::COUNT ? Value::BIGINT(0)
-			                                                                 : Value(aggregate_types[i]));
+			chunk.SetValue(
+			    i, 0, aggregates[i].kind == factorize::Aggregate::COUNT ? Value::BIGINT(0) : Value(aggregate_types[i]));
 		}
 		chunk.SetCardinality(1);
 		gstate.handed_out = 1;
@@ -352,8 +350,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 				// mean is not one. A group exists only if some tuple made it,
 				// so the count cannot be zero (D78).
 				const int64_t tuples = gstate.handed_out < counts.size() ? counts[gstate.handed_out] : 0;
-				out = tuples > 0 ? Value::DOUBLE(static_cast<double>(group.second[i]) /
-				                                 static_cast<double>(tuples))
+				out = tuples > 0 ? Value::DOUBLE(static_cast<double>(group.second[i]) / static_cast<double>(tuples))
 				                 : Value(aggregate_types[i]);
 			} else if (aggregates[i].kind == factorize::Aggregate::COUNT) {
 				out = Value::BIGINT(group.second[i]);
@@ -553,8 +550,7 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 		// the first version of this did. That predicate describes what a
 		// connection does once an error has propagated; catching it here means
 		// it has not propagated and no transaction has been marked.
-		if (children.empty() || data.Type() == ExceptionType::FATAL ||
-		    data.Type() == ExceptionType::INTERRUPT) {
+		if (children.empty() || data.Type() == ExceptionType::FATAL || data.Type() == ExceptionType::INTERRUPT) {
 			throw;
 		}
 		lock_guard<mutex> guard(gstate.lock);
@@ -572,8 +568,7 @@ SourceResultType PhysicalFactorized::GetDataInternal(ExecutionContext &context, 
 }
 
 //! The factorized path proper. Split out so the caller can catch it whole.
-SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataChunk &chunk,
-                                                OperatorSourceInput &input,
+SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input,
                                                 FactorizedGlobalSourceState &gstate) const {
 	Value fail;
 	if (context.client.TryGetCurrentSetting("factorize_debug_fail", fail) && !fail.IsNull() &&
@@ -589,20 +584,20 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		if (gstate.handed_out > 0) {
 			return SourceResultType::FINISHED;
 		}
-		factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
-		                           abandon_after_ms, min_rate, second_key);
+		factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression, abandon_after_ms,
+		                           min_rate, second_key);
 		SharedRelations source(context.client, relations);
-		const auto result = factorize::ExecuteProductSum(
-		    graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, aggregates[0].relation,
-		    aggregates[0].column, aggregates[0].relation_y, aggregates[0].column_y);
+		const auto result = factorize::ExecuteProductSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+		                                                 aggregates[0].relation, aggregates[0].column,
+		                                                 aggregates[0].relation_y, aggregates[0].column_y);
 		if (!result.ok) {
 			throw InvalidInputException("factorize: %s", result.error);
 		}
 		chunk.SetCardinality(1);
 		// No tuples means nothing was summed, and SQL answers NULL rather than
 		// zero -- the same rule every aggregate but count(*) follows here.
-		chunk.SetValue(0, 0, result.tuples > 0 ? FoldedValue(result.count, aggregate_types[0])
-		                                       : Value(aggregate_types[0]));
+		chunk.SetValue(0, 0,
+		               result.tuples > 0 ? FoldedValue(result.count, aggregate_types[0]) : Value(aggregate_types[0]));
 		gstate.handed_out = 1;
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
@@ -677,9 +672,8 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	// Within memory, not merely up to it: a bucket that does not fit is
 	// subdivided rather than abandoned. The rule replaced a plan DuckDB could
 	// have run, so failing here would turn a slow query into no query at all.
-	const auto result = factorize::ExecuteCountSliceWithinMemory(graph, plan, source,
-	                                                             factorize::JoinMode::BOTTOM_INSERT, slice,
-	                                                             gstate.slices);
+	const auto result = factorize::ExecuteCountSliceWithinMemory(
+	    graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, slice, gstate.slices);
 	if (explain_steps) {
 		PrintSteps(result, slice);
 	}

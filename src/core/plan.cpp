@@ -179,7 +179,8 @@ Plan BuildPlan(const QueryGraph &graph) {
 	// not the reverse, and every composite-key join lives in the gap. `A.k1 =
 	// B.k1 AND A.k2 = B.k2` is what every composite foreign key writes, and it
 	// was refused project-wide as "cyclic" -- which it is not.
-	FTree simulated = FTree::Scan(AttributesOf(graph, graph.predicates.empty() ? 0 : graph.predicates[0].left_relation));
+	FTree simulated =
+	    FTree::Scan(AttributesOf(graph, graph.predicates.empty() ? 0 : graph.predicates[0].left_relation));
 
 	// The accumulated side's key attributes, as the join will name them: mapped
 	// through equality propagation against the tree as it stands.
@@ -246,12 +247,13 @@ Plan BuildPlan(const QueryGraph &graph) {
 		unsigned new_bits = 0;
 		for (const auto &edge : edges) {
 			const bool left_is_new = edge.left_relation == attaching;
-			new_bits += TypeOfAttribute(graph, AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
-			                                               static_cast<size_t>(left_is_new ? edge.left_column
-			                                                                               : edge.right_column))) ==
-			                    ValueType::INT32
-			                ? 32u
-			                : 64u;
+			new_bits +=
+			    TypeOfAttribute(graph,
+			                    AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+			                                static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column))) ==
+			            ValueType::INT32
+			        ? 32u
+			        : 64u;
 		}
 		unsigned joined_bits = 0;
 		for (auto key : accumulated_keys_for(edges, attaching)) {
@@ -328,8 +330,9 @@ Plan BuildPlan(const QueryGraph &graph) {
 			keys.probe.clear();
 			for (const auto &edge : best->second) {
 				const bool left_is_new = edge.left_relation == best->first;
-				keys.probe.push_back(AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
-				                                 static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
+				keys.probe.push_back(
+				    AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+				                static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
 			}
 			simulated = MergeTrees(simulated, FTree::Scan(AttributesOf(graph, best->first)), keys,
 			                       JoinMode::BOTTOM_INSERT, PathStrategy::LEVELWISE);
@@ -505,8 +508,8 @@ void CheckRate(const StepStats &step, size_t step_index, size_t total_steps) {
 	}
 	throw std::runtime_error("join " + std::to_string(step_index) + " of " + std::to_string(total_steps - 1) +
 	                         " had delivered " + std::to_string(step.tuples) + " tuples in " +
-	                         std::to_string(static_cast<long long>(elapsed)) + "ms, a rate of " +
-	                         std::to_string(rate) + " tuples/ms against a floor of " + std::to_string(min_rate) +
+	                         std::to_string(static_cast<long long>(elapsed)) + "ms, a rate of " + std::to_string(rate) +
+	                         " tuples/ms against a floor of " + std::to_string(min_rate) +
 	                         ", so the stock plan is the better bet from here");
 }
 
@@ -536,9 +539,9 @@ void CheckCompression(const StepStats &step, size_t step_index, size_t total_ste
 	}
 	throw std::runtime_error("join " + std::to_string(step_index) + " of " + std::to_string(total_steps - 1) +
 	                         " left " + std::to_string(step.live) + " records standing for " +
-	                         std::to_string(step.tuples) + " tuples, a compression of " +
-	                         std::to_string(achieved) + " against a floor of " + std::to_string(floor) +
-	                         " after " + std::to_string(static_cast<long long>(elapsed)) +
+	                         std::to_string(step.tuples) + " tuples, a compression of " + std::to_string(achieved) +
+	                         " against a floor of " + std::to_string(floor) + " after " +
+	                         std::to_string(static_cast<long long>(elapsed)) +
 	                         "ms, so factorizing this query is not paying for itself");
 }
 
@@ -597,11 +600,11 @@ ExecuteResult ExecuteCount(const QueryGraph &graph, const Plan &plan, RelationSo
 			std::vector<AttributeId> accumulated_keys;
 			for (const auto &edge : step.edges) {
 				const bool left_is_new = edge.left_relation == step.relation;
-				new_keys.push_back(AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
-				                               static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
-				const auto raw =
-				    AttributeOf(graph, left_is_new ? edge.right_relation : edge.left_relation,
-				                static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column));
+				new_keys.push_back(
+				    AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+				                static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
+				const auto raw = AttributeOf(graph, left_is_new ? edge.right_relation : edge.left_relation,
+				                             static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column));
 				accumulated_keys.push_back(ShallowestEquivalent(classes, accumulated.Tree(), raw));
 			}
 
@@ -792,8 +795,7 @@ std::vector<int> ChooseSliceColumns(const QueryGraph &graph, const Plan *plan) {
 		// Covering the base wins outright; reach only breaks the tie. A class
 		// reaching six relations but not the first one still hands every bucket
 		// the whole of the first structure to build.
-		const bool better = !found || (covers && !best_covers) ||
-		                    (covers == best_covers && entry.second > best_reach);
+		const bool better = !found || (covers && !best_covers) || (covers == best_covers && entry.second > best_reach);
 		if (better) {
 			best = entry.first;
 			best_reach = entry.second;
@@ -845,10 +847,9 @@ std::vector<std::vector<int>> RankSliceColumns(const QueryGraph &graph) {
 			ranked.emplace_back(entry.second, entry.first);
 		}
 	}
-	std::sort(ranked.begin(), ranked.end(),
-	          [](const std::pair<size_t, size_t> &a, const std::pair<size_t, size_t> &b) {
-		          return a.first != b.first ? a.first > b.first : a.second < b.second;
-	          });
+	std::sort(ranked.begin(), ranked.end(), [](const std::pair<size_t, size_t> &a, const std::pair<size_t, size_t> &b) {
+		return a.first != b.first ? a.first > b.first : a.second < b.second;
+	});
 	std::vector<std::vector<int>> out;
 	out.reserve(ranked.size());
 	for (const auto &entry : ranked) {
@@ -1196,11 +1197,11 @@ BuiltRelation BuildRepresentation(const QueryGraph &graph, const Plan &plan, Rel
 			std::vector<AttributeId> accumulated_keys;
 			for (const auto &edge : step.edges) {
 				const bool left_is_new = edge.left_relation == step.relation;
-				new_keys.push_back(AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
-				                               static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
-				const auto raw =
-				    AttributeOf(graph, left_is_new ? edge.right_relation : edge.left_relation,
-				                static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column));
+				new_keys.push_back(
+				    AttributeOf(graph, left_is_new ? edge.left_relation : edge.right_relation,
+				                static_cast<size_t>(left_is_new ? edge.left_column : edge.right_column)));
+				const auto raw = AttributeOf(graph, left_is_new ? edge.right_relation : edge.left_relation,
+				                             static_cast<size_t>(left_is_new ? edge.right_column : edge.left_column));
 				accumulated_keys.push_back(ShallowestEquivalent(*built.classes, accumulated.Tree(), raw));
 			}
 			if (mode == JoinMode::TOP_INSERT) {
@@ -1361,8 +1362,8 @@ MaterializeResult ExecuteMaterializeWithinMemory(const QueryGraph &graph, const 
 }
 
 ExecuteResult ExecuteProductSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                               size_t x_relation, size_t x_column, size_t y_relation, size_t y_column,
-                               PathStrategy strategy) {
+                                size_t x_relation, size_t x_column, size_t y_relation, size_t y_column,
+                                PathStrategy strategy) {
 	ExecuteResult result;
 	auto built = BuildRepresentation(graph, plan, source, mode, strategy);
 	if (!built.ok) {
@@ -1528,9 +1529,8 @@ public:
 				// no value from the other belongs to any tuple. Taking the
 				// better of the two here regardless is the §4.6 hazard in its
 				// min/max form: it would report a value no tuple carries.
-				result.extremes[i] = (a.count == 0 || b.count == 0)
-				                         ? ExtremeIdentity(i)
-				                         : Better(i, a.extremes[i], b.extremes[i]);
+				result.extremes[i] =
+				    (a.count == 0 || b.count == 0) ? ExtremeIdentity(i) : Better(i, a.extremes[i], b.extremes[i]);
 				continue;
 			}
 			result.sums[i] = CheckedCardinalityAdd(CheckedCardinalityMul(a.sums[i], b.count),
@@ -1751,7 +1751,7 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 			return result;
 		}
 		if (aggregate.kind != Aggregate::COUNT && (aggregate.relation >= graph.RelationCount() ||
-		                                         aggregate.column >= graph.column_counts[aggregate.relation])) {
+		                                           aggregate.column >= graph.column_counts[aggregate.relation])) {
 			result.error = "summed column is not a column of the query";
 			return result;
 		}
@@ -1847,8 +1847,8 @@ GroupCountResult GroupBy(const QueryGraph &graph, const Plan &plan, RelationSour
 } // namespace
 
 GroupCountResult ExecuteGroupBy(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                               const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
-                               PathStrategy strategy) {
+                                const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
+                                PathStrategy strategy) {
 	return GroupBy(graph, plan, source, mode, keys, aggregates, strategy);
 }
 

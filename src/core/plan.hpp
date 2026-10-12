@@ -429,8 +429,7 @@ GroupCountResult ExecuteGroupBy(const QueryGraph &graph, const Plan &plan, Relat
                                 PathStrategy strategy = PathStrategy::LEVELWISE);
 
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
-                                   const std::vector<GroupKey> &keys,
-                                   PathStrategy strategy = PathStrategy::LEVELWISE);
+                                   const std::vector<GroupKey> &keys, PathStrategy strategy = PathStrategy::LEVELWISE);
 
 //! `SELECT g..., sum(x) ... GROUP BY g...`, the generalisations together.
 GroupCountResult ExecuteGroupSum(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
