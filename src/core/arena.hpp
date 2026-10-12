@@ -133,7 +133,7 @@ inline void CheckAbandoned(const SliceBudget &slice) {
 
 class Arena {
 public:
-	explicit Arena(size_t first_chunk_bytes = 64 * 1024)
+	explicit Arena(size_t first_chunk_bytes = size_t(64) * 1024)
 	    : next_chunk_bytes(first_chunk_bytes < kMinChunk ? kMinChunk : first_chunk_bytes) {
 	}
 

@@ -23,6 +23,9 @@ namespace {
 //! The cost of thread-local is that a worker thread starts with no cap rather
 //! than inheriting one, so anything that runs the engine on a thread it did not
 //! set up has to set the limit there too.
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables): these are
+// thread_local and mutable on purpose -- the paragraph above is the argument
+// for it, and the check cannot tell a per-thread budget from shared state.
 thread_local size_t g_memory_limit = 0;
 thread_local size_t g_estimate_budget = 0;
 thread_local double g_min_compression = 0;
@@ -30,6 +33,7 @@ thread_local double g_abandon_after_ms = 0;
 thread_local double g_min_rate = 0;
 thread_local bool g_second_key = false;
 thread_local std::chrono::steady_clock::time_point g_slice_start = std::chrono::steady_clock::now();
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 } // namespace
 
 void SetGlobalMemoryLimit(size_t bytes) {
@@ -674,8 +678,7 @@ FactorizedRelation FactorizedJoin(const FactorizedRelation &build, const Factori
 		snapshots.SetMemoryLimit(GetGlobalMemoryLimit());
 		ChainingHashTable<const Record *> table;
 		table.SetMemoryLimit(GetGlobalMemoryLimit());
-		const auto lower_parents_local = lower_parents;
-		IterateKeyPath(lower_plan, 0, lower_key.plan_index, lower_parents_local, lower.Rep(), lower_ctx, [&]() {
+		IterateKeyPath(lower_plan, 0, lower_key.plan_index, lower_parents, lower.Rep(), lower_ctx, [&]() {
 			const uint64_t key = lower_key.Read(lower_plan, lower.Rep(), lower_ctx);
 			auto *snapshot = reinterpret_cast<Record *>(snapshots.Allocate(sizeof(Record) * lower_ctx.size()));
 			for (size_t i = 0; i < lower_ctx.size(); i++) {

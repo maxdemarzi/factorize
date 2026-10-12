@@ -12,24 +12,26 @@ namespace {
 
 std::string Format(double value) {
 	if (value >= 1e12) {
-		return std::to_string(static_cast<long long>(value / 1e12)) + "T";
+		return std::to_string(static_cast<int64_t>(value / 1e12)) + "T";
 	}
 	if (value >= 1e9) {
-		return std::to_string(static_cast<long long>(value / 1e9)) + "B";
+		return std::to_string(static_cast<int64_t>(value / 1e9)) + "B";
 	}
 	if (value >= 1e6) {
-		return std::to_string(static_cast<long long>(value / 1e6)) + "M";
+		return std::to_string(static_cast<int64_t>(value / 1e6)) + "M";
 	}
 	if (value >= 1e3) {
-		return std::to_string(static_cast<long long>(value / 1e3)) + "K";
+		return std::to_string(static_cast<int64_t>(value / 1e3)) + "K";
 	}
-	return std::to_string(static_cast<long long>(value));
+	return std::to_string(static_cast<int64_t>(value));
 }
 
 //! Milliseconds, rounded; the tuple-count formatter's K/M/B suffixes read as
 //! nonsense on a duration.
 std::string Millis(double value) {
-	return std::to_string(static_cast<long long>(value + 0.5));
+	// llround rather than truncating (value + 0.5): the two agree on the
+	// non-negative durations this formats, and only one of them says so.
+	return std::to_string(static_cast<int64_t>(std::llround(value)));
 }
 
 std::string Round(double value) {

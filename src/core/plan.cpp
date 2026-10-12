@@ -508,7 +508,7 @@ void CheckRate(const StepStats &step, size_t step_index, size_t total_steps) {
 	}
 	throw std::runtime_error("join " + std::to_string(step_index) + " of " + std::to_string(total_steps - 1) +
 	                         " had delivered " + std::to_string(step.tuples) + " tuples in " +
-	                         std::to_string(static_cast<long long>(elapsed)) + "ms, a rate of " + std::to_string(rate) +
+	                         std::to_string(static_cast<int64_t>(elapsed)) + "ms, a rate of " + std::to_string(rate) +
 	                         " tuples/ms against a floor of " + std::to_string(min_rate) +
 	                         ", so the stock plan is the better bet from here");
 }
@@ -541,7 +541,7 @@ void CheckCompression(const StepStats &step, size_t step_index, size_t total_ste
 	                         " left " + std::to_string(step.live) + " records standing for " +
 	                         std::to_string(step.tuples) + " tuples, a compression of " + std::to_string(achieved) +
 	                         " against a floor of " + std::to_string(floor) + " after " +
-	                         std::to_string(static_cast<long long>(elapsed)) +
+	                         std::to_string(static_cast<int64_t>(elapsed)) +
 	                         "ms, so factorizing this query is not paying for itself");
 }
 

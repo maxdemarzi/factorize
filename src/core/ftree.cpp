@@ -122,6 +122,11 @@ const FNode *FTree::Find(AttributeId attribute) const {
 }
 
 FNode *FTree::Find(AttributeId attribute) {
+	// The const overload of a pair that differ only in constness. Writing the
+	// search twice to avoid the cast would be two copies of the same traversal
+	// to satisfy a check aimed at casting away a caller's const, which this is
+	// not: the object is non-const here and `this` proves it.
+	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
 	return const_cast<FNode *>(FindIn(*root, attribute));
 }
 

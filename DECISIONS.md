@@ -5678,3 +5678,56 @@ better cut on this one.
 
 `scripts/calibrate-outcome.py` recomputes all of it from measurements already
 in the repository.
+
+## D83 — CI had been red for five weeks, and the local checks could not see it
+
+The last green pipeline on this repository was 2026-09-02 ("Add a README").
+Every run since — 77 failures across the next five and a half weeks — went red,
+while `make format-check` kept reporting "Passed" on this machine.
+
+**Why the local check lied.** The repo-root `.clang-format` and `.clang-tidy`
+are git symlinks (mode 120000) into `duckdb/`. Git for Windows materialises a
+symlink as an ordinary text file containing the target path, so clang-format
+reads twenty-odd bytes of `duckdb/.clang-format`, fails to parse it as YAML,
+and prints an error — and DuckDB's `scripts/format.py` prints "Passed"
+afterwards regardless. The obvious fix, `-style=file:duckdb/.clang-format`,
+needs clang-format 14; CI pins 11.0.1, and 11 accepts the flag, ignores it, and
+formats to LLVM defaults instead. A check that cannot fail is worse than no
+check: it is why nobody looked for five weeks.
+
+`scripts/format-check-local.sh` and `scripts/format-fix-local.sh` do it the way
+that actually works — mirror the tracked sources into a scratch tree that has a
+*real* `.clang-format` at its root, format the copies there, diff. Config lookup
+walks up from each source file, so only relative paths have to survive. They
+pin clang-format 11.0.1 (`pip3 install --user clang_format==11.0.1`) and warn
+loudly on any other version, because versions disagree about formatting and
+agreeing with CI is the whole point. 44 files, clean.
+
+**Tidy was the other half.** 23 diagnostics, almost all older than this
+session's work: `google-runtime-int` on seven `long long`s, two implicit
+widenings of an `int` multiplication assigned to `size_t`/`idx_t`, a
+`(value + 0.5)` truncation that `bugprone-incorrect-roundings` is exactly
+about (now `std::llround`), and a redundant local copy in `join.cpp` that the
+call two lines down already proved unnecessary. Three are deliberate and now
+carry `NOLINT` with the reason written out: the const/non-const overload pair
+in `ftree.cpp`, the `thread_local` globals in `join.cpp`, and
+`fallback_running` in `physical_factorized.cpp`.
+
+That last one is worth its own line. `NOLINTNEXTLINE` means *literally the next
+line*. My first attempt put a three-line justification after the directive, so
+it suppressed the second line of its own comment and the declaration stayed
+flagged — 22 of 23 fixed, and the build still red. The rationale has to come
+first and the directive last.
+
+**`scripts/tidy-check-local.sh`** runs the same checks without the hour.
+`make tidy-check` configures a second non-unity DuckDB tree purely to get a
+compile database; `build/release/compile_commands.json` already lists all
+fourteen of our files individually, so clang-tidy reads that instead. It also
+intersects `git ls-files` with the database, because CI's `run-clang-tidy.py`
+filters the same way: `src/bench/standalone.cpp` is not built by the extension
+CMake, so **CI never tidies it** — it has 8 diagnostics of its own that the
+pipeline cannot see. The script names the file it skipped rather than staying
+quiet about it.
+
+Fourteen files, tidy clean, clang-tidy 18.1.1 (ubuntu-24.04's version, which is
+what the Tidy Check job installs).

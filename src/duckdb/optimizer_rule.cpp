@@ -1602,7 +1602,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					if (slack > 0 && predicted_bytes > 0) {
 						const double budget = predicted_bytes * slack;
 						replacement->estimate_budget_bytes =
-						    budget >= 9e18 ? 0 : static_cast<idx_t>(budget) + 1024 * 1024;
+						    budget >= 9e18 ? 0 : static_cast<idx_t>(budget) + idx_t(1024) * 1024;
 					}
 					replacement->estimated_cardinality = 1;
 					replacement->ResolveOperatorTypes();

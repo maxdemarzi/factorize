@@ -106,6 +106,11 @@ public:
 //! executor tasks, and one of those can be another call into GetData on this
 //! operator on this thread. Without the flag that call would become a second
 //! helper, and the next one a third, nesting a stack frame per task.
+// Per thread and mutable by design -- it is how a thread already driving the
+// fallback recognises a re-entry into GetData on itself. The suppression has
+// to be the last comment line before the declaration: NOLINTNEXTLINE means
+// literally the next line, so a rationale placed after it suppresses nothing.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static thread_local bool fallback_running = false;
 
 //! RAII for the flag above, so every exit clears it -- including the throwing
@@ -274,7 +279,7 @@ static void PrintSteps(const factorize::ExecuteResult &result, idx_t slice) {
 	for (const auto &step : result.steps) {
 		line += StringUtil::Format("[%llu: %llu recs %llu live %lld tuples %.3fx %.0fms] ",
 		                           static_cast<uint64_t>(step.relation), static_cast<uint64_t>(step.records),
-		                           static_cast<uint64_t>(step.live), static_cast<long long>(step.tuples),
+		                           static_cast<uint64_t>(step.live), static_cast<int64_t>(step.tuples),
 		                           step.Compression(), step.elapsed_ms);
 	}
 	if (!result.ok) {
