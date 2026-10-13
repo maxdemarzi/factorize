@@ -421,6 +421,8 @@ void ExecuteSteps(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(step.bytes)));
 		output.SetValue(5, row, Value::BIGINT(step.tuples));
 		output.SetValue(6, row, Value::DOUBLE(step.Compression()));
+		output.SetValue(7, row, Value::DOUBLE(step.fanout_mean));
+		output.SetValue(8, row, Value::DOUBLE(step.fanout_max));
 		row++;
 	}
 	output.SetCardinality(row);
@@ -454,8 +456,13 @@ unique_ptr<FunctionData> BindSteps(ClientContext &context, TableFunctionBindInpu
 		return_types.emplace_back(LogicalType::BIGINT);
 		names.emplace_back(name);
 	}
-	return_types.emplace_back(LogicalType::DOUBLE);
-	names.emplace_back("compression");
+	// Measured fan-out beside measured compression: the two answer different
+	// questions, and D84 added the second because the first cannot be read
+	// before step 2 (see StepStats).
+	for (const char *name : {"compression", "fanout_mean", "fanout_max"}) {
+		return_types.emplace_back(LogicalType::DOUBLE);
+		names.emplace_back(name);
+	}
 	return result;
 }
 

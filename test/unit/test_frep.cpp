@@ -290,6 +290,93 @@ static void TestOverflowIsCaught() {
 	ExpectEq<int64_t>(CheckedCardinalityMul(1000, 1000), 1000000, "ordinary multiplication is unaffected");
 }
 
+//===--------------------------------------------------------------------===//
+// Census: fan-out as measured, not estimated (D84)
+//===--------------------------------------------------------------------===//
+static void TestCensus() {
+	std::printf("Census\n");
+	enum : AttributeId { A = 0, B = 1, C = 2 };
+
+	// A over two independent children, B and C. Three roots, and the B lists
+	// are deliberately uneven -- 3, 1, 2 -- so a mean that silently counted
+	// lists instead of children would come out at 1.
+	FTree tree = FTree::Scan({A});
+	tree.Root().AddChild(std::make_unique<FNode>(std::vector<AttributeId> {B}));
+	tree.Root().AddChild(std::make_unique<FNode>(std::vector<AttributeId> {C}));
+	auto layout = Layout::FromFTree(tree, {{A, ValueType::INT64}, {B, ValueType::INT64}, {C, ValueType::INT64}});
+
+	FRepresentation frep(layout);
+	const std::vector<size_t> b_widths {3, 1, 2};
+	for (size_t root_index = 0; root_index < b_widths.size(); root_index++) {
+		auto root = frep.AppendRoot();
+		// Every level here holds exactly one payload column, so the index is 0
+		// at each of them -- SetInt64 takes a position within the level, not an
+		// attribute id.
+		frep.SetInt64(root, 0, static_cast<int64_t>(root_index));
+		for (size_t i = 0; i < b_widths[root_index]; i++) {
+			frep.SetInt64(frep.InsertChild(root, 0), 0, static_cast<int64_t>(i));
+		}
+		// One C child each, so level 0 mixes a wide slot with a narrow one.
+		frep.SetInt64(frep.InsertChild(root, 1), 0, 0);
+	}
+
+	auto census = frep.Census();
+	ExpectEq<size_t>(census.size(), 3, "a census has one entry per level");
+	ExpectEq<size_t>(census[0].records, 3, "three roots");
+	ExpectEq<size_t>(census[1].records, 6, "six B children across the three roots");
+	ExpectEq<size_t>(census[2].records, 3, "one C child per root");
+
+	// Six (record, slot) pairs at level 0: three roots, two slots each. The B
+	// slots hold 3 + 1 + 2 = 6 and the C slots 1 + 1 + 1 = 3, so nine children
+	// over six pairs.
+	ExpectEq<size_t>(census[0].populated_slots, 6, "three roots times two populated slots");
+	ExpectEq<size_t>(census[0].children, 9, "six B children plus three C children");
+	ExpectEq<size_t>(census[1].populated_slots, 0, "leaf records have no child lists");
+	ExpectEq<size_t>(census[2].populated_slots, 0, "leaf records have no child lists");
+
+	// The quantity the gate would read. Mean over the level is 9/6 = 1.5, and
+	// it is 1.5 rather than 2.0 precisely because the narrow C slots drag it
+	// down -- a representation is only as factorized as its thinnest level.
+	const double fanout = static_cast<double>(census[0].children) / static_cast<double>(census[0].populated_slots);
+	ExpectTrue(fanout > 1.49 && fanout < 1.51, "mean fan-out at level 0 is 9/6");
+
+	// A one-to-one join is the case the signal exists to catch: every slot
+	// holds exactly one child, so fan-out is exactly 1 and factorizing bought
+	// nothing but overhead.
+	FTree flat_tree = FTree::Scan({A});
+	flat_tree.Root().AddChild(std::make_unique<FNode>(std::vector<AttributeId> {B}));
+	auto flat_layout = Layout::FromFTree(flat_tree, {{A, ValueType::INT64}, {B, ValueType::INT64}});
+	FRepresentation flat(flat_layout);
+	for (int64_t i = 0; i < 4; i++) {
+		auto root = flat.AppendRoot();
+		flat.SetInt64(root, 0, i);
+		flat.SetInt64(flat.InsertChild(root, 0), 0, i);
+	}
+	auto flat_census = flat.Census();
+	ExpectEq<size_t>(flat_census[0].populated_slots, 4, "four one-child slots");
+	ExpectEq<size_t>(flat_census[0].children, 4, "holding four children between them");
+
+	// Weights, which is where the first version of this got it wrong. A record
+	// built by grouping stands for as many identical tuples as the scan found,
+	// so a single child of weight 50 is a one-to-fifty join stored in one
+	// record. Counting records instead of tuples reported fan-out of exactly
+	// 1.0 on epinions_acyclic_202_04 while its compression ran past 17,000 --
+	// a flat chain claimed for the widest case in the corpus.
+	auto weighted_layout =
+	    Layout::FromFTree(flat_tree, {{A, ValueType::INT64}, {B, ValueType::INT64}}, /* with_weights */ true);
+	FRepresentation weighted(weighted_layout);
+	for (int64_t i = 0; i < 4; i++) {
+		auto root = weighted.AppendRoot();
+		weighted.SetInt64(root, 0, i);
+		auto child = weighted.InsertChild(root, 0);
+		weighted.SetInt64(child, 0, i);
+		weighted.SetWeight(child, 50);
+	}
+	auto weighted_census = weighted.Census();
+	ExpectEq<size_t>(weighted_census[0].populated_slots, 4, "still four slots");
+	ExpectEq<size_t>(weighted_census[0].children, 200, "each holding fifty tuples in one record");
+}
+
 int main() {
 	std::printf("factorize core: layout / arena / f-representation\n\n");
 	TestLayout();
@@ -301,6 +388,8 @@ int main() {
 	TestCount();
 	std::printf("\n");
 	TestOverflowIsCaught();
+	std::printf("\n");
+	TestCensus();
 	std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
 	return g_failures == 0 ? 0 : 1;
 }

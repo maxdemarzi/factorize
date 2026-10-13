@@ -381,6 +381,52 @@ int64_t FRepresentation::Count() const {
 //===--------------------------------------------------------------------===//
 // Diagnostics
 //===--------------------------------------------------------------------===//
+namespace {
+
+//! Recurses once, counting what each level holds. Iterative over slots and
+//! recursive over depth, which is the same shape CountLive already uses: depth
+//! is the f-tree's height and bounded by the number of relations, while a
+//! single slot can hold millions of children.
+template <typename Rep, typename Census>
+void TakeCensus(const Rep &rep, Record record, std::vector<Census> &levels) {
+	const auto level_index = static_cast<size_t>(record.Level());
+	if (levels.size() <= level_index) {
+		levels.resize(level_index + 1);
+	}
+	levels[level_index].records++;
+	const size_t slots = rep.GetLayout().Level(record.Level()).slots.size();
+	const bool weighted = rep.HasWeights();
+	for (size_t slot = 0; slot < slots; slot++) {
+		size_t children = 0;
+		rep.ForEachChild(record, slot, [&](Record child) {
+			// Tuples joined with, not records stored. A record built by
+			// grouping stands for as many identical tuples as the scan found,
+			// and one child of weight 50 is a 1:50 join however it is stored --
+			// counting it as one child reports a flat chain for the widest
+			// case the engine has. Measured: epinions_acyclic_202_04 reads
+			// fan-out 1.0 at every step while its compression climbs past
+			// 17,000, which is the shape of this mistake.
+			children += weighted ? static_cast<size_t>(rep.GetWeight(child)) : 1;
+			TakeCensus(rep, child, levels);
+		});
+		// A slot pruning emptied is not a one-child slot, it is a no-child
+		// slot, and averaging it in would report "narrow lists" for a
+		// representation whose surviving lists are wide.
+		if (children > 0) {
+			levels[level_index].populated_slots++;
+			levels[level_index].children += children;
+		}
+	}
+}
+
+} // namespace
+
+std::vector<FRepresentation::LevelCensus> FRepresentation::Census() const {
+	std::vector<LevelCensus> levels;
+	ForEachRoot([&](Record root) { TakeCensus(*this, root, levels); });
+	return levels;
+}
+
 void FRepresentation::AppendString(std::string &out, Record record, const AttributeNamer &namer, int indent) const {
 	const auto &level = layout->Level(record.Level());
 	out.append(static_cast<size_t>(indent) * 2, ' ');

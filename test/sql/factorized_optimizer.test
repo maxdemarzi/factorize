@@ -2129,6 +2129,28 @@ SELECT step, live, tuples, tuples::DOUBLE / live = compression
 1	8000	4000	true
 2	12000	4000	true
 
+# Fan-out on the same query, and it is exactly 1: every cmp_* key is unique, so
+# each record joins with exactly one other and every child list holds its
+# inlined first child and nothing else. This is the shape CIDR 2025 calls
+# "lists of length 1", where their adaptive gate declines.
+#
+# Pinned here because it is also the counter-example. This query is a measured
+# win -- 148ms stock against 6ms (D63) -- on compression of 0.5 and 0.33, which
+# is to say the representation holds two to three records per tuple and the
+# speed comes from fusing the count, not from factorizing anything. So fan-out
+# of 1 does not by itself mean the engine loses, and a gate that declined on it
+# would give this query away. Whether the signal survives that is what the
+# corpus measurement in D84 is for; this test exists so the number cannot drift
+# underneath the answer.
+query IRR
+SELECT step, fanout_mean, fanout_max
+  FROM factorized_steps(['cmp_a', 'cmp_b', 'cmp_c', 'cmp_d'],
+                        ['cmp_a.j = cmp_b.k', 'cmp_b.j = cmp_c.k', 'cmp_c.j = cmp_d.k'])
+ ORDER BY step;
+----
+1	1.0	1.0
+2	1.0	1.0
+
 statement ok
 SET factorize_min_compression = 0.6;
 

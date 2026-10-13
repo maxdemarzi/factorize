@@ -172,6 +172,23 @@ struct StepStats {
 	//! (D52).
 	double elapsed_ms = 0;
 
+	//! Mean live children per populated parent slot, over the whole
+	//! representation and over whichever single level is widest.
+	//!
+	//! Why a second measured quantity when Compression() already exists.
+	//! Compression is a ratio of two cumulative totals, and D51 had to stop
+	//! consulting it before step 2 because records grow by a sum and tuples by
+	//! a product, so early on the product has not overtaken and the ratio says
+	//! nothing -- 0.94 on a 142s win against 0.50, 0.95, 0.99 on three queries
+	//! worth abandoning. Fan-out is not cumulative. It is a property of the
+	//! join that just ran: a populated slot holding one child is a tuple that
+	//! joined with exactly one other tuple, which InsertChild stores inline, so
+	//! the representation charged its overhead for a row that stayed flat. The
+	//! sum-versus-product confound that forces Compression() to wait does not
+	//! apply, which is the reason to look at it at step 0 (D84).
+	double fanout_mean = 0;
+	double fanout_max = 0;
+
 	//! Tuples per live record: how much the representation is actually saving.
 	//!
 	//! 1 means the join built one record per tuple, which is a hash join with

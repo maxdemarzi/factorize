@@ -28,6 +28,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace factorize {
 
@@ -385,6 +386,39 @@ public:
 		ForEachRoot([&](Record root) { live += CountLive(root); });
 		return live;
 	}
+
+	//! What one level of the live representation holds.
+	struct LevelCensus {
+		//! Live records at this level.
+		size_t records = 0;
+		//! (record, slot) pairs at this level that have at least one live
+		//! child. Slots emptied by pruning are excluded, because a mean taken
+		//! over them measures how much was thrown away rather than how wide
+		//! the surviving lists are.
+		size_t populated_slots = 0;
+		//! Tuples hanging off those pairs: live children, each counted as many
+		//! times as GetWeight says it stands for. A record built by grouping
+		//! denotes several identical tuples, so counting records here would
+		//! report a one-to-one join wherever grouping did its job -- which is
+		//! wherever the engine is working hardest.
+		size_t children = 0;
+	};
+
+	//! One walk of the live representation, indexed by level.
+	//!
+	//! Exists because `children / populated_slots` is the quantity CIDR 2025's
+	//! adaptive factorization found most predictive of whether factorizing
+	//! pays -- their "average chain length", correlation 0.58 with the faster
+	//! plan, the best single feature in their table. It is the n:1-versus-n:m
+	//! question asked of the data rather than of an estimate: a slot holding
+	//! exactly one child is a tuple that joined with exactly one other tuple,
+	//! which InsertChild stores inline and which therefore paid the
+	//! representation's overhead for a row that stayed flat.
+	//!
+	//! Folded into one traversal rather than added as a second: this is the
+	//! same walk LiveRecordCount() does, so a caller that wants both should
+	//! take the census and read `records` off it.
+	std::vector<LevelCensus> Census() const;
 	size_t BytesAllocated() const {
 		return arena.BytesAllocated();
 	}

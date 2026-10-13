@@ -451,8 +451,25 @@ StepStats MeasureStep(size_t relation, const FactorizedRelation &accumulated) {
 	step.elapsed_ms = ElapsedSliceMs();
 	step.relation = relation;
 	step.records = accumulated.Rep().RecordCount();
-	step.live = accumulated.Rep().LiveRecordCount();
 	step.bytes = accumulated.Rep().BytesAllocated();
+	// One walk for both: the census counts the same live records
+	// LiveRecordCount() would, and counting the children on the way costs an
+	// increment per child list rather than a second traversal.
+	size_t populated = 0;
+	size_t children = 0;
+	for (const auto &level : accumulated.Rep().Census()) {
+		step.live += level.records;
+		populated += level.populated_slots;
+		children += level.children;
+		if (level.populated_slots > 0) {
+			const double level_fanout =
+			    static_cast<double>(level.children) / static_cast<double>(level.populated_slots);
+			step.fanout_max = level_fanout > step.fanout_max ? level_fanout : step.fanout_max;
+		}
+	}
+	if (populated > 0) {
+		step.fanout_mean = static_cast<double>(children) / static_cast<double>(populated);
+	}
 	// The join has just pruned, which computes every subtree size, so this
 	// walks the roots over a warm cache rather than the representation.
 	step.tuples = accumulated.Count();
