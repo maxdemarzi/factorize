@@ -48,8 +48,8 @@ real difficulty is skew.
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
 | parallelism | working — one thread per bucket of the join key, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried: **3.00x** over the runnable corpus, faster on all 18 known-outcome queries, `hetio_acyclic_205_09` 172.9s → 51.2s (D54–D54d) |
 
-CI builds the extension on Linux, macOS, Windows and Wasm against DuckDB
-v1.5.5.
+CI builds the extension on Linux, macOS and Windows against DuckDB v1.5.5.
+Not Wasm, deliberately — see the caveat below.
 
 ```sql
 SET factorize_mode = 'auto';         -- 'force' fires on every match, ignoring the gate
@@ -166,7 +166,11 @@ SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
   the gate predicts, so a decline can be checked rather than guessed at.
 - **One DuckDB version.** The C++ extension API is version-locked; this builds
   against v1.5.5 and no other.
-- **Not built for WASM,** deliberately — see the CI configuration.
+- **Not built for WASM,** deliberately. The representation lives entirely in
+  memory and sizes itself against `memory_limit`, which wasm32's address space
+  makes meaningless, and the 3.00x comes from one thread per bucket, which
+  `wasm_mvp` and `wasm_eh` have nowhere to run. It would load and then fail on
+  anything worth using it for.
 
 ## What it does
 
