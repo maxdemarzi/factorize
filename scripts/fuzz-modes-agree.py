@@ -168,7 +168,22 @@ def make_aggregates(rng, aliases):
     *present*, so a branch whose siblings are empty must not contribute. Mixing
     them with sums in one query is what exercises that, since the emptiness a
     sum absorbs as a zero is the thing an extreme must notice.
+
+    sum(x * y) is drawn alone, because the matcher declines it beside any other
+    aggregate or a GROUP BY. It was added in D80 and left out of this list, and
+    that omission is exactly how a mode disagreement shipped: DuckDB types
+    INTEGER * INTEGER as INTEGER and raises on overflow while the fold
+    multiplied in int64 and returned a value, so `auto` answered queries `off`
+    rejected on 65 of 119 corpus queries (D86). The one check that guards mode
+    agreement had never exercised the aggregate. A cast is drawn half the time,
+    since the narrow form is declined and the widened form is the one that
+    reaches the engine -- both outcomes have to agree with `off`.
     """
+    if rng.random() < 0.15:
+        alias, _, cols = rng.choice(aliases)
+        other, _, other_cols = rng.choice(aliases)
+        cast = "::BIGINT" if rng.random() < 0.5 else ""
+        return [f"sum({alias}.{rng.choice(cols)}{cast} * {other}.{rng.choice(other_cols)})"]
     wanted = rng.choice([1, 1, 2, 3])
     chosen = []
     seen = set()

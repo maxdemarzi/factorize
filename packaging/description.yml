@@ -83,14 +83,16 @@ docs:
     The aggregates beyond count(\*) are timed as well as verified (D81), and the
     gate does not yet know which fold it is costing: it fires on the same
     queries whichever aggregate runs. On the benchmark's live corpus that is
-    1.3x for min, max and avg against 1.7x for count(\*), and 1.48x for
-    sum(x * y) over the 54 queries that produce an answer. The other 65 of that
-    rewritten corpus overflow INT32 and raise instead of answering, and the
-    gate fires on 30 of them; counting those, sum(x * y) reads 0.93x, which is
-    a measurement of how quickly each plan reaches the same error rather than
-    of how fast either computes anything (D85). In the regime these exist for:
-    on 50 of the excluded queries sum(x * y) is 7 faster against 1 slower with
-    no losses, 221s of stock against 92s.
+    1.38x for min and sum, 1.39x for max, 1.41x for avg and 1.36x for
+    sum(x * y), each over the same 119 join graphs with the same 36 queries
+    fired on, against 1.7x for count(\*). An earlier reading of 0.93x for
+    sum(x * y) -- "slower than not firing" -- was an artifact: 65 of the 119
+    queries in that corpus multiplied two INTEGER join keys whose product
+    overflows INT32, so they raised instead of answering, and the gate fired on
+    30 of those against 3 of the rest. It measured how fast each plan reached
+    the same error (D85, D86). In the regime these exist for: on 50 of the
+    excluded queries sum(x * y) is 7 faster against 1 slower with no losses,
+    221s of stock against 92s.
 
     **Known limitations**, measured rather than assumed, with the numbers in
     DECISIONS.md: the cost model's coefficients are fitted on one machine and do

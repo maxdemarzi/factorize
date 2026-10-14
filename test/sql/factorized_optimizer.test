@@ -2457,6 +2457,107 @@ SELECT sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
 ----
 NULL
 
+# A product of narrow integers is declined, because DuckDB and this engine
+# disagree about it (D86). DuckDB types INTEGER * INTEGER as INTEGER and raises
+# Out of Range on the first pair that does not fit; the fold here multiplies in
+# int64 and returns a value instead -- `auto` answering a query `off` rejects.
+# Which pairs overflow cannot be known without enumerating them, which is the
+# one thing factorization exists not to do, so the narrow case is declined.
+statement ok
+CREATE TABLE ov_r0(k INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE ov_r1(k INTEGER NOT NULL, x INTEGER NOT NULL);
+
+statement ok
+CREATE TABLE ov_r2(k INTEGER NOT NULL, y INTEGER NOT NULL);
+
+# Enough rows that the planner treats this as a real join: at one row per
+# table it folds the whole product into a projection and the region matcher
+# declines it, which says nothing about the rule under test.
+statement ok
+INSERT INTO ov_r0 SELECT i % 50 FROM range(400) t(i);
+
+statement ok
+INSERT INTO ov_r1 SELECT i % 50, 100000 FROM range(400) t(i);
+
+statement ok
+INSERT INTO ov_r2 SELECT i % 50, 100000 FROM range(400) t(i);
+
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT sum(ov_r1.x * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
+ WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+# 100000 * 100000 overflows INT32, so both modes must raise. This is the case
+# that shipped answering in one mode and erroring in the other.
+statement error
+SELECT sum(ov_r1.x * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
+ WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
+----
+Out of Range
+
+statement ok
+SET factorize_mode = 'force';
+
+statement error
+SELECT sum(ov_r1.x * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
+ WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
+----
+Out of Range
+
+# A widening cast is how a caller asks for the 64-bit product, and it is
+# matched: the fold reads the column underneath the cast, which is sound only
+# because the cast widens. Same data, now answerable.
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT sum(ov_r1.x::BIGINT * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
+ WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
+----
+256000000000000
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(ov_r1.x::BIGINT * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
+ WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
+----
+256000000000000
+
+statement ok
+SET factorize_mode = 'auto';
+
+# And the cast form has to *match*, not merely answer. DuckDB hoists the cast
+# into a projection and rebinds the aggregate onto that projection's output,
+# so two further rules have to let it through: the projection walk, which
+# otherwise refuses a computed expression, and the binding resolver, which
+# otherwise reports a column belonging to no relation. Both were missing when
+# the cast was first accepted, and sum(x * y) went from 36 fires to 0 on the
+# corpus with every test still passing (D86).
+#
+# Asserted under force, which skips the gate but not the matcher. Under auto
+# this query is declined on cost and should be: it is a 400-row join, and
+# DuckDB wins those. Asserting auto here would be asserting the cost model's
+# opinion of a toy, not whether the rule above works.
+statement ok
+SET factorize_mode = 'force';
+
+query II
+EXPLAIN SELECT sum(ov_r1.x::BIGINT * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
+ WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+statement ok
+SET factorize_mode = 'auto';
+
 # Declined beside anything else, or under a GROUP BY: the grouped walk carries
 # one value per aggregate where this needs three, and it builds a fold per
 # record it visits.

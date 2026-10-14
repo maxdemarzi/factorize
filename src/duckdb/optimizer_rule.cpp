@@ -11,6 +11,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -114,6 +115,16 @@ struct FactorizedRegion {
 	//! Order is the order found, outermost first, so `declines.front()` is
 	//! `decline`.
 	vector<string> declines;
+	//! Projection output column -> the base column it passes through.
+	//!
+	//! Only non-empty when a projection carried a widening cast. A projection
+	//! of plain column refs needs no entry: DuckDB leaves the aggregate's
+	//! bindings naming the base tables, which is why this did not exist until
+	//! sum(a::BIGINT * b) made DuckDB hoist the cast into a projection and
+	//! rebind the aggregate onto its output. Without the map the aggregate's
+	//! column "belongs to no relation of the region" and the fold is declined
+	//! (D86).
+	std::map<std::pair<idx_t, idx_t>, ColumnBinding> projection_passthrough;
 	vector<reference<LogicalGet>> relations;
 	//! The filter sitting above each relation's scan, if any. Parallel to
 	//! `relations`.
@@ -341,7 +352,8 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 	}
 	auto &proj = op.Cast<LogicalProjection>();
 	bool ok = true;
-	for (auto &expr : proj.expressions) {
+	for (idx_t position = 0; position < proj.expressions.size(); position++) {
+		auto &expr = proj.expressions[position];
 		if (expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 			// A constant per row changes no row's existence, so it changes no
 			// count. DuckDB plants one of these under the aggregate it rewrites
@@ -358,6 +370,34 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 			                "SET disabled_optimizers='compressed_materialization' to factorize this");
 			ok = false;
 			continue;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			// A widening integer cast is not a computation the island has to
+			// perform: the fold reads the column and accumulates in int64
+			// regardless, so casting INTEGER to BIGINT changes nothing it does.
+			// It has to pass here because `sum(a::BIGINT * b)` is the only form
+			// of sum(x * y) the aggregate matcher now accepts -- the narrow
+			// product is declined for disagreeing with DuckDB about overflow
+			// (D86) -- and without this the cast lands in a projection and is
+			// refused one rule earlier, which took the whole aggregate from 36
+			// fires to 0.
+			auto &cast = expr->Cast<BoundCastExpression>();
+			const auto &from = cast.child->return_type;
+			if (cast.child->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF && from.IsIntegral() &&
+			    GetTypeIdSize(from.InternalType()) <= GetTypeIdSize(cast.return_type.InternalType())) {
+				// Record what this output column really is, because the
+				// aggregate above now names the projection rather than the
+				// table and the resolver works in table terms.
+				region.projection_passthrough[{proj.table_index, position}] =
+				    cast.child->Cast<BoundColumnRefExpression>().binding;
+				continue;
+			}
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			// Mapped too, so a cast in one projection still resolves when a
+			// second pass-through projection sits above it.
+			region.projection_passthrough[{proj.table_index, position}] =
+			    expr->Cast<BoundColumnRefExpression>().binding;
 		}
 		if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			// Any other computed expression would have to be evaluated on
@@ -463,9 +503,61 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				// enumerated even though they are the join result (D80).
 				auto &function = bound.children[0]->Cast<BoundFunctionExpression>();
 				const auto function_name = StringUtil::Lower(function.function.name);
-				if ((function_name != "*" && function_name != "multiply") || function.children.size() != 2 ||
-				    function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-				    function.children[1]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				if ((function_name != "*" && function_name != "multiply") || function.children.size() != 2) {
+					Decline(region, "sum() of a computed expression");
+					ok = false;
+					continue;
+				}
+				// The product must be computed at a width where this engine and
+				// DuckDB cannot disagree, and for narrow integers they do.
+				//
+				// DuckDB types INT32 * INT32 as INT32 and raises Out of Range on
+				// the first pair that does not fit. The fold here multiplies in
+				// int64, so it returns a value where the stock plan raises --
+				// `auto` answering a query `off` rejects, which is exactly the
+				// bit-exactness the whole design claims. Measured on the
+				// rewritten sum(x * y) corpus, 65 of 119 queries diverge this
+				// way (D86).
+				//
+				// Detecting *which* pairs overflow would mean enumerating them,
+				// which is the one thing factorization exists not to do, so the
+				// narrow case is declined rather than approximated. At 64 bits
+				// and wider the two agree: DuckDB computes in int64 too, and
+				// where that overflows CheckedCardinalityMul throws, the
+				// operator falls back, and the stock plan raises the same error.
+				const auto width = function.return_type.InternalType();
+				if (width != PhysicalType::INT64 && width != PhysicalType::INT128) {
+					Decline(region, "sum() of a " + function.return_type.ToString() +
+					                    " product, which overflows at a width this engine would not");
+					ok = false;
+					continue;
+				}
+				// A widening cast around each operand is how a caller asks for
+				// the 64-bit product: sum(a::BIGINT * b). The fold reads the
+				// column underneath, so the cast must only widen -- reading an
+				// int64 column through a narrowing cast would fold values the
+				// query never asked for.
+				reference<Expression> operands[2] = {*function.children[0], *function.children[1]};
+				bool operands_ok = true;
+				for (auto &operand : operands) {
+					auto *expression = &operand.get();
+					if (expression->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+						auto &cast = expression->Cast<BoundCastExpression>();
+						const auto from = cast.child->return_type;
+						if (!from.IsIntegral() ||
+						    GetTypeIdSize(from.InternalType()) > GetTypeIdSize(cast.return_type.InternalType())) {
+							operands_ok = false;
+							break;
+						}
+						expression = cast.child.get();
+					}
+					if (expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+						operands_ok = false;
+						break;
+					}
+					operand = *expression;
+				}
+				if (!operands_ok) {
 					Decline(region, "sum() of a computed expression");
 					ok = false;
 					continue;
@@ -482,8 +574,8 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				}
 				entry.kind = factorize::Aggregate::SUM_PRODUCT;
 				entry.reads_column = true;
-				entry.sum_binding = function.children[0]->Cast<BoundColumnRefExpression>().binding;
-				entry.second_binding = function.children[1]->Cast<BoundColumnRefExpression>().binding;
+				entry.sum_binding = operands[0].get().Cast<BoundColumnRefExpression>().binding;
+				entry.second_binding = operands[1].get().Cast<BoundColumnRefExpression>().binding;
 				region.aggregates.push_back(std::move(entry));
 				continue;
 			}
@@ -838,7 +930,18 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 		size_t resolved_local[2] = {0, 0};
 		const size_t binding_count = aggregate.kind == factorize::Aggregate::SUM_PRODUCT ? 2 : 1;
 		for (size_t which = 0; which < binding_count; which++) {
-			const ColumnBinding &column_binding = which == 0 ? aggregate.sum_binding : aggregate.second_binding;
+			ColumnBinding column_binding = which == 0 ? aggregate.sum_binding : aggregate.second_binding;
+			// Chase the aggregate's binding down through any projections that
+			// renamed it. Bounded by the map's size so a cycle -- which should
+			// be impossible in a plan, but is cheap to rule out -- cannot spin.
+			for (size_t hop = 0; hop <= region.projection_passthrough.size(); hop++) {
+				auto through =
+				    region.projection_passthrough.find({column_binding.table_index, column_binding.column_index});
+				if (through == region.projection_passthrough.end()) {
+					break;
+				}
+				column_binding = through->second;
+			}
 			// A summed column is not a join key, so unlike a join key it is *added*
 			// to the scan rather than required to be there already. Appended, never
 			// inserted: the join predicates above hold local column indices, and
