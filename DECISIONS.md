@@ -5731,3 +5731,124 @@ quiet about it.
 
 Fourteen files, tidy clean, clang-tidy 18.1.1 (ubuntu-24.04's version, which is
 what the Tidy Check job installs).
+
+## D84 — Fan-out is a real second axis, and it arrives too late to be an early one
+
+D82 closed by saying the gate's problem is not its ranking but that rescues and
+losses are interleaved along the single axis it has, so further progress needs
+a second axis rather than a better cut on this one. CIDR 2025's adaptive
+factorization (Groß, ten Wolde, Boncz) names a candidate and makes the point
+that matters: the axis they add is not another plan-time feature. It is
+average chain length, read off the hash build at runtime, and it was the single
+most predictive feature in their table at 0.58 correlation with the faster
+plan. Their framing of the problem is almost verbatim D71 through D82 -- "a big
+issue for optimizers here is the lack of reliable (or any) statistics to
+predict join sizes ... errors made in estimates compound, making them
+unreliable".
+
+The equivalent here is **fan-out**: live children per populated parent slot,
+with each child counted as many tuples as its weight says it stands for. The
+representation already held it, so measuring it cost one extra accumulator in a
+traversal `LiveRecordCount` was doing anyway.
+
+**Counting records instead of tuples is the trap, and it is not subtle.** A
+record built by grouping stands for every identical row the scan found, so one
+child of weight 50 is a one-to-fifty join stored in a single record. The first
+version counted children and reported fan-out of exactly 1.0 at every step of
+`epinions_acyclic_202_04` while its compression climbed past 17,000 -- a flat
+chain claimed for one of the widest joins in the corpus. Weighted, the same
+query reads 2.2 to 3.2. This is the third time a weight has been missed in this
+engine (D80 halved `sum(x * y)` the same way); it is apparently the standing
+mistake here, and the census now has a unit test that sets a weight of 50.
+
+**Measured post-hoc, the signal is as clean as anything this project has
+found.** Over the 119 runnable queries, taking the minimum fan-out across a
+query's materialized joins:
+
+    min fan-out    queries   faster when forced
+    exactly 1.000       54                    0
+    above   1.000       65                   23
+
+Fifty-four for fifty-four. And the threshold is not fitted: 1.0 means some join
+in the plan paired every tuple with at most one partner, so the engine stored a
+flat row and charged for a tree. On the 35 queries the gate fires on, declining
+those takes regressions from 14 to 8 and the corpus from 13.01s to 12.38s,
+giving up no query that is actually faster when forced. The worst of the seven
+it declines is `watdiv_acyclic_214_05` at 0.011s stock against 0.203s ours.
+
+**And the excluded corpus did not veto it, which is a first.** Of the 320
+excluded queries whose fan-out could be measured within 120s, a floor at 1.0
+gives up 2 rescues and 5 faster to avoid 7 slower. Set against D82's best bar,
+which surrendered 36 rescues and 25 faster to avoid 4 slower and 1 lost, that
+is a different kind of number. It is still not free, and 2 rescues is the part
+to look at rather than the part to round off.
+
+**Then the part that refutes my own argument for it.** The case for fan-out was
+that it escapes the confound forcing `CheckCompression` to wait until step 2 --
+records grow by a sum and tuples by a product, so an early ratio says nothing --
+and could therefore be read at step 0. It does escape that confound and it is
+subject to a different one: a plan's first join being one-to-one says nothing
+about the plan, because the explosive join can be any later one. Checked per
+step from step 1, every threshold costs rescues. Checked from step 2 it costs
+none and cuts much less:
+
+    rule                                  excluded                  runnable
+    min over all steps (post-hoc)         2 rescues, 5 faster up    6 cut, 12.38s
+                                          7 slower avoided
+    per step, from step 1                 1-2 rescues up            3-6 cut
+    per step, from step 2, compression<10 0 rescues, 1 faster up    3 cut, 12.70s
+                                          1 slower avoided
+
+The strength was always in the *minimum over every step*, which is known only
+once every join has been paid for. That is most of the appeal of an early
+abandon gone, and the honest residue is a safe but small runtime check: three
+of fourteen regressions, 2.4% of the corpus, and those figures are modelled on
+an abandoned query costing exactly stock time, so measured gains will be
+smaller still.
+
+**And the plan-time version of the same idea is refuted, which is the finding.**
+`CostEstimate::EdgeFactor::partners` is already a predicted per-edge fan-out --
+the thing `flat` is multiplied by -- so the obvious improvement is to decline at
+plan time and pay no abandonment at all. Measured fan-out finally made that
+checkable. On the runnable corpus it looks better than the real thing: over the
+102 queries with both, declining on predicted fan-out <= 1 cuts 7 regressions
+against the measured value's 5, and loses no query that is actually faster. It
+disagrees with the measurement constantly -- 22 queries where it predicts <= 1
+and the engine measures more -- and on that corpus the disagreements are free.
+
+They are not free on the excluded corpus:
+
+    axis                             rescues up   faster up   slower avoided
+    measured fan-out <= 1                     2           5                7
+    predicted fan-out <= 1                   13          15               23
+
+Thirteen rescues. The same shape as D71, D73, D75, D81 and D82 -- better on the
+runnable corpus, paid for in answers that do not otherwise exist -- and the 22
+disagreements that cost nothing there are rescues here.
+
+So the conclusion is sharper than "fan-out helps". **The reason five plan-time
+attempts failed is not that they chose the wrong plan-time feature. The
+plan-time estimate of the right feature fails too, and in the same way.** That
+is consistent with D68, which found the edge factors carrying the entire error
+on `watdiv_acyclic_217_05` -- a product of 0.577 against a true 26,198 -- and it
+is the first direct evidence here for the thing CIDR 2025 asserts: the decision
+has to be deferred to runtime because the statistics needed to make it do not
+exist until then.
+
+**What is actually shippable from this is small, and it should be called small.**
+The only configuration that costs no rescues is the per-step check from step 2
+with a compression conjunct: three of fourteen regressions, 13.01s to 12.70s,
+one faster query given up for one slower avoided on the excluded corpus -- and
+modelled at that, since an abandoned query is charged exactly stock time here
+and would really be charged stock time plus whatever it had already spent. No
+setting is added for it. This project has shipped a default-off knob on this
+evidence before: D56's rate floor, which D63 records as not reproducing and
+calls the tenth in a row. A 2.4% modelled gain is not better evidence than
+that was.
+
+What is kept is the measurement. `scripts/collect-fanout.py` collects fan-out,
+`scripts/fanout-outcome.py` scores the runnable corpus and
+`scripts/fanout-excluded.py` scores the excluded one, which is the one that
+decides. The next attempt on this axis starts from data rather than from
+scratch, and it now has a second corpus-scale result to beat rather than a
+hypothesis to test.
