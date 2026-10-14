@@ -24,7 +24,11 @@ extension:
 
 repo:
   github: maxdemarzi/factorize
-  ref: f5968f10423cfe3e6ddab842fc3180a348d1d505
+  # v0.1.0. Verified green on the six-platform matrix (run 38602327721)
+  # before the tag was cut; the previous value named a commit whose only
+  # CI run was cancelled and which predated the fixes that made the
+  # pipeline pass at all.
+  ref: a35ace005c7349e240dc88e548deb9d3d6a1f95d
 
 docs:
   hello_world: |
