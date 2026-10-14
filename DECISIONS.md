@@ -5852,3 +5852,53 @@ What is kept is the measurement. `scripts/collect-fanout.py` collects fan-out,
 decides. The next attempt on this axis starts from data rather than from
 scratch, and it now has a second corpus-scale result to beat rather than a
 hypothesis to test.
+
+## D85 — The floor does not survive measurement, and one published number was measuring an error
+
+D84 priced the fan-out floor by assuming an abandoned query costs exactly what
+the stock plan costs, flagged that as optimistic, and declined to ship a knob
+on it. Then the per-aggregate numbers made the case look much stronger -- the
+gate is aggregate-blind, so firing wrongly costs most where the fold is
+expensive, and the modelled tables showed min 1.29x to 1.51x, max 1.25x to
+1.55x, avg 1.38x to 1.60x and sum(x * y) 0.93x to 1.11x with no wins given up
+anywhere. On that basis the floor was implemented: `factorize_min_fanout`,
+`factorize_fanout_max_compression`, the check in plan.cpp, the globals, and
+the three slice call sites.
+
+**Measured, it is worth nothing.** Over the 119 runnable queries, restricted
+to the 36 the gate fires on, auto is 2.126s and auto with the floor is 2.171s.
+Across the whole corpus 8.30s becomes 8.31s. It helped 19 queries and hurt 28,
+all of them by milliseconds. The modelled four-regressions-cut was the
+modelling artifact in its entirety: an abandoned query pays the stock plan
+*plus* everything the factorized attempt spent reaching step 2, and that is
+the whole of the predicted gain. The wiring is reverted. The instrumentation
+from D84 -- `Census`, `fanout_mean`, `fanout_max` on `factorized_steps` --
+stays, because measuring is not the thing that failed.
+
+**And measuring it properly broke something else open.** The sum(x * y) run
+produced an empty results file, which turned out to be the interesting part:
+
+    sum(x * y) corpus        n     fires   stock     auto
+    as D81 measured it      119       33   12.64s   13.65s   0.93x
+    only those that answer   54        3    7.98s    5.39s   1.48x
+    only those that overflow 65       30    4.66s    8.26s   0.56x
+
+Sixty-five of the 119 rewritten queries raise `Out of Range Error: Overflow in
+multiplication of INT32` and never produce a value, and **the gate fires on 30
+of those and only 3 of the rest**. So D81's headline for this fold -- 0.93x,
+"slower than not firing", carried into `packaging/description.yml` as a shipped
+known limitation -- is a measurement of how quickly each plan arrives at the
+same error. On the queries that compute anything, sum(x * y) is 1.48x.
+
+The corpus was built by rewriting count(\*) queries to multiply two join-key
+columns, and nothing checked that the product fits. That is the same class of
+mistake as D63's `excluded-verdict.py` reading a timing column by name: the
+harness produced a number for every row, so every row looked measured.
+
+Two guards came out of this rather than one. `description.yml` now states both
+figures and says what the 0.93x is of. And the timing helper in
+`measure-fanout-floor.sh` takes the last two `Run Time` lines rather than lines
+three and four: `.timer on` prints one per statement including the SETs, so a
+positional window reads a SET's timing whenever the number of SETs changes, and
+the first version of that script reported a 620x speedup made entirely of
+`SET factorize_min_fanout` taking 0.000s.
