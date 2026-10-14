@@ -41,9 +41,14 @@ done
 # run is executing it truncates the file under the running process.
 BIN="$(mktemp "${TMPDIR:-/tmp}/factorize-standalone.XXXXXX")"
 trap 'rm -f "$BIN"' EXIT
+# plan.cpp belongs here: BuildPlan, ExecuteCount and BuildCostSteps live in it
+# and this line was missing it, so the link failed and the script could not run
+# at all. Nothing caught it because no test builds the benchmark -- which is
+# also why its clang-tidy diagnostics were invisible until D83.
 g++ -std=c++14 -O2 -g -o "$BIN" src/bench/standalone.cpp \
     src/core/ftree.cpp src/core/layout.cpp src/core/frep.cpp \
-    src/core/materialize.cpp src/core/join.cpp src/core/cost.cpp src/core/stats.cpp
+    src/core/materialize.cpp src/core/join.cpp src/core/cost.cpp src/core/stats.cpp \
+    src/core/plan.cpp
 
 args=()
 count=0

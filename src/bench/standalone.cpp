@@ -36,6 +36,10 @@
 #include <unordered_map>
 #include <vector>
 
+// A single-translation-unit benchmark executable with no header of its own,
+// so the directive cannot leak into anything. NOLINT rather than two dozen
+// using-declarations that would need editing every time the core grows a type.
+// NOLINTNEXTLINE(google-build-using-namespace)
 using namespace factorize;
 using Clock = std::chrono::steady_clock;
 
@@ -237,6 +241,10 @@ static std::vector<Query> ParseQueryFile(const std::string &path) {
 //! only the top-K stored, a value outside the list can only be estimated by the
 //! tail average, and hetio needs a deeper list than epinions before that
 //! approximation stops dominating the error (FINDINGS F14).
+// Set from argv before any work starts: a benchmark's configuration, not
+// state. The directive goes last -- NOLINTNEXTLINE means literally the next
+// line, so a rationale after it suppresses its own comment (D83).
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static size_t g_mcv_entries = 128;
 
 struct Table {
@@ -273,7 +281,7 @@ public:
 		const char *end = cursor + content.size();
 		while (cursor < end) {
 			char *after = nullptr;
-			const long first = std::strtol(cursor, &after, 10);
+			const int64_t first = std::strtol(cursor, &after, 10);
 			if (after == cursor) {
 				break;
 			}
@@ -281,7 +289,7 @@ public:
 			if (cursor < end && *cursor == ',') {
 				cursor++;
 			}
-			const long second = std::strtol(cursor, &after, 10);
+			const int64_t second = std::strtol(cursor, &after, 10);
 			cursor = after;
 			while (cursor < end && (*cursor == '\n' || *cursor == '\r')) {
 				cursor++;
@@ -393,9 +401,12 @@ struct RunResult {
 	std::string error;
 };
 
+// Also argv-driven configuration, fixed before the first query runs.
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 static bool g_verbose = false;
 static size_t g_max_frep_bytes = 6ull << 30;
 static size_t g_max_table_cache_bytes = 3ull << 30;
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 static RunResult RunFactorized(const Query &query, const Plan &plan, TableCache &cache, JoinMode mode,
                                PathStrategy strategy) {
@@ -778,6 +789,6 @@ int main(int argc, char **argv) {
 	}
 
 	std::fprintf(stderr, "\nexecuted %zu, correct %zu, unsupported %zu, table cache %.1f MB\n", executed, correct,
-	             unsupported, cache.Bytes() / (1024.0 * 1024.0));
+	             unsupported, static_cast<double>(cache.Bytes()) / (1024.0 * 1024.0));
 	return 0;
 }
