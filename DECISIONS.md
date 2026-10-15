@@ -5972,3 +5972,58 @@ for the cast form first asserted that `auto` fires on it, and failed -- not
 because the matcher refused, but because the gate declined a 400-row join on
 cost, correctly. Asserting `auto` there was asserting the cost model's opinion
 of a toy. It asserts `force`, which skips the gate and not the matcher.
+
+## D87 — The rescues are not a count(*) artifact, and sum(x * y) is 64 bits short
+
+Every per-fold number this project had came from the 119 runnable queries --
+the regime where the extension is least useful, because DuckDB answers those
+already. The 481 excluded queries are the ones it exists for, 244 of them have
+no answer without it, and they had only ever been measured with count(*). That
+the aggregates rescue the same queries was assumed from the day they shipped.
+
+Measured, on a fixed random sample of 120 excluded queries shared by every
+fold, 60s cap, both modes timed:
+
+    fold      fires   RESCUE   faster   slower   neither   lost
+    min          76       45       34        7        34      0
+    max          76       47       33        7        33      0
+    avg          76       45       31       10        34      0
+    sumprod      76        7       23       15        75      0
+
+**min, max and avg are interchangeable** -- identical fire counts, rescues
+within two of each other, and **zero losses across 480 measured queries**. The
+assumption held, which is worth knowing rather than assuming, because the
+corollary did not.
+
+**The corollary: "excluded" is a property of count(*), not of the join.** The
+first version of this measurement timed only `auto`, reasoning that a query
+whose stock plan times out materialising more than 1e9 tuples must time out
+whatever the fold, since it is the join that does not finish. The spot-check
+written to confirm that refuted it on its first two queries -- stock finishes
+`min` on `dblp_acyclic_205_07` within 30s, which it cannot do for count(*) --
+and across the sample stock finishes 38 to 41 of 120. A third of the corpus
+stops being excluded when the aggregate changes. Any future claim about the
+excluded corpus has to say which aggregate it is about.
+
+**sum(x * y) rescues 7 where the others rescue 45, and it is not slowness.**
+Of 20 of its "neither" queries sampled under `force`, 17 report *factorized
+count or sum exceeds the representable range* and 3 hit the memory budget. The
+answer is the problem: a product of two ~1e5 values summed over ~1e10 tuples
+is on the order of 1e20, and int64 stops at 9.2e18. DuckDB's own sum returns
+HUGEINT, so **the stock plan can represent an answer this engine cannot**.
+
+That is a limit rather than a bug, and the engine is honest about it:
+CheckedCardinalityMul and CheckedCardinalityAdd throw, the operator falls back,
+and the count of wrong answers stays zero -- which is also why this costs
+rescues instead of producing nonsense.
+
+**It is also the clearest improvement this session has produced, and the only
+one where the measurement came before the idea.** Widening ProductSum's four
+accumulators to int128 would put roughly 64 of those 75 within reach. Nothing
+about the bilinear combine changes; only the width does. Not attempted here.
+
+`sum` was deliberately not measured. min, max and avg had already agreed to
+within two queries each, which left it nearly free of information at two hours
+a fold, while sumprod was the one with a different cost profile and turned out
+to be where everything interesting was. `scripts/measure-excluded-aggregates.sh`
+runs it on the same sample if that judgement needs revisiting.
