@@ -14,7 +14,7 @@
 extension:
   name: factorize
   description: Answers count(*) over many-to-many equi-join graphs without materialising the join
-  version: 0.1.0
+  version: 0.1.1
   language: C++
   build: cmake
   license: MIT
@@ -24,11 +24,11 @@ extension:
 
 repo:
   github: maxdemarzi/factorize
-  # v0.1.0. Verified green on the six-platform matrix (run 38602327721)
-  # before the tag was cut; the previous value named a commit whose only
-  # CI run was cancelled and which predated the fixes that made the
-  # pipeline pass at all.
-  ref: a35ace005c7349e240dc88e548deb9d3d6a1f95d
+  # v0.1.1. Verified green on the six-platform matrix before the tag was
+  # cut. v0.1.0 is deliberately not used: it answers sum(x * y) over two
+  # INTEGER columns where the stock plan raises Out of Range, which D86
+  # fixes.
+  ref: d2c8478cfaae8c75550b5d55170bc24086c8a1a8
 
 docs:
   hello_world: |
