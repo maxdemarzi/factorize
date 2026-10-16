@@ -214,6 +214,10 @@ struct ExecuteResult {
 	//! fold cannot tell the two apart: a total of zero is what both an empty
 	//! join and a join of zeroes produce.
 	int64_t tuples = 0;
+	//! The product-sum's total, which needs 128 bits where `count` has 64.
+	//! Set only by ExecuteProductSum; every other entry point leaves it zero
+	//! and reports through `count` as before (D88).
+	Int128 product_sum;
 	//! Records and bytes in the last materialized f-representation. Zero when
 	//! the plan was a single fused count join, which never materializes.
 	size_t records = 0;

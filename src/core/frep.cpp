@@ -256,7 +256,7 @@ FRepresentation::ProductSum FRepresentation::SubtreeProductSum(Record record, At
 	if (has_x && has_y) {
 		// Both columns on one record: the product is exact per tuple, and no
 		// independence is needed or claimed.
-		here.sum_xy = CheckedCardinalityMul(CheckedCardinalityMul(value_x, value_y), here.count);
+		here.sum_xy = CheckedMul128By64(MultiplyWide(value_x, value_y), here.count);
 	}
 
 	// Each slot's children are alternatives, so their quantities add; the slots
@@ -270,7 +270,7 @@ FRepresentation::ProductSum FRepresentation::SubtreeProductSum(Record record, At
 			slot.count = CheckedCardinalityAdd(slot.count, child_sum.count);
 			slot.sum_x = CheckedCardinalityAdd(slot.sum_x, child_sum.sum_x);
 			slot.sum_y = CheckedCardinalityAdd(slot.sum_y, child_sum.sum_y);
-			slot.sum_xy = CheckedCardinalityAdd(slot.sum_xy, child_sum.sum_xy);
+			slot.sum_xy = CheckedAdd128(slot.sum_xy, child_sum.sum_xy);
 		});
 		below = CombineProductSums(below, slot);
 	}
@@ -292,10 +292,12 @@ FRepresentation::ProductSum FRepresentation::CombineProductSums(const ProductSum
 	out.count = CheckedCardinalityMul(a.count, b.count);
 	out.sum_x = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_x, b.count), CheckedCardinalityMul(a.count, b.sum_x));
 	out.sum_y = CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_y, b.count), CheckedCardinalityMul(a.count, b.sum_y));
-	out.sum_xy =
-	    CheckedCardinalityAdd(CheckedCardinalityMul(a.sum_xy, b.count), CheckedCardinalityMul(a.count, b.sum_xy));
-	out.sum_xy = CheckedCardinalityAdd(out.sum_xy, CheckedCardinalityMul(a.sum_x, b.sum_y));
-	out.sum_xy = CheckedCardinalityAdd(out.sum_xy, CheckedCardinalityMul(a.sum_y, b.sum_x));
+	// Int128 * int64 for the carried subtotals, int64 * int64 widening to 128
+	// for the cross terms. No 128-by-128 product appears, which is why none
+	// is implemented.
+	out.sum_xy = CheckedAdd128(CheckedMul128By64(a.sum_xy, b.count), CheckedMul128By64(b.sum_xy, a.count));
+	out.sum_xy = CheckedAdd128(out.sum_xy, MultiplyWide(a.sum_x, b.sum_y));
+	out.sum_xy = CheckedAdd128(out.sum_xy, MultiplyWide(a.sum_y, b.sum_x));
 	return out;
 }
 

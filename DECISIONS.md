@@ -6027,3 +6027,67 @@ within two queries each, which left it nearly free of information at two hours
 a fold, while sumprod was the one with a different cost profile and turned out
 to be where everything interesting was. `scripts/measure-excluded-aggregates.sh`
 runs it on the same sample if that judgement needs revisiting.
+
+## D88 — Widening one accumulator takes sum(x * y) from 7 rescues to 46
+
+D87 measured sum(x * y) on the excluded corpus rescuing 7 queries where min
+and max rescue 45, and found the cause was not speed: 17 of 20 sampled
+failures reported *factorized count or sum exceeds the representable range*.
+A product of two ~1e5 values summed over ~1e10 tuples is ~1e20 and int64 stops
+at 9.2e18. DuckDB's own sum returns HUGEINT, so the stock plan could represent
+an answer this engine could not.
+
+    sumprod, 120 excluded queries   before   after      min
+    RESCUE                               7      46       45
+    faster                              23      30       34
+    slower                              15      10        7
+    neither                             75      34       34
+
+Thirty-nine more queries answered, and 34 is exactly min's and avg's "neither"
+count -- the overflow ceiling is gone entirely and what remains is the floor no
+fold clears in 60s. sum(x * y) is an ordinary fold again rather than the
+outlier.
+
+**Neither obvious wide type was available.** `src/core` is deliberately free of
+DuckDB (core-test.sh builds it standalone), which rules out `hugeint_t`; and
+CI builds a plain-MSVC Windows target, which has no `__int128` -- the same
+constraint frep.hpp already records for __builtin_mul_overflow. So
+`src/core/int128.hpp` is a portable signed 128-bit integer with exactly the
+operations the bilinear combine performs: widen, add, multiply by a 64-bit
+value, compare, render. No division, no general 128-by-128 multiply.
+
+**Only `sum_xy` is widened.** count, sum_x and sum_y stay 64 bits because
+nothing measured overflows them, and because keeping them there is what holds
+the combine to Int128 * int64 and int64 * int64. A 128-by-128 product never
+appears, so none is implemented -- less code in the one area of this codebase
+with the worst bug history.
+
+**Two mistakes, both caught, and the second is the instructive one.**
+
+The first CheckedMul128By64 threw whenever its left operand exceeded 63 bits,
+reasoning that the fold never builds one wider. That is backwards: the left
+operand *is* the running sum_xy, wide in precisely the queries this type was
+added for, and a 1e20 subtotal times a count of 10 fits comfortably. It would
+have shipped looking like a fix while leaving the measured failure untouched,
+and no test would have caught it because none existed for that function.
+
+Then the test for it failed at -O2 while passing at -O1 under sanitizers. The
+implementation was right both times; **the oracle had undefined behaviour**. It
+computed the expected product as a signed __int128 and divided back out to
+decide whether the true product was representable -- a multiplication that is
+UB exactly when it overflows, which is the case the check exists to detect. At
+-O2 the compiler may assume the overflow cannot happen and fold the check
+away. Representability is now decided on unsigned magnitudes before any
+multiplication. This is the second time arithmetic-guard code here has had UB
+inside the logic meant to prevent it (see frep.hpp on the negative-operand
+bug); the difference is that this one would have blessed a broken
+implementation rather than broken a working one.
+
+test/unit/test_int128.cpp checks against the compiler's native __int128 where
+it has one -- 200,000 random products, sums, scalings and renderings -- which
+is available to the test precisely because it is not available to the
+implementation.
+
+Verified: 119/119 auto == off on the sum(x * y) corpus, 978 SQL assertions, 22
+core suites at -O1 with sanitizers and -O2, fuzzer 150 queries 0 disagreements
+(50 taken over, up from 47), format and tidy clean.

@@ -1395,14 +1395,21 @@ ExecuteResult ExecuteProductSum(const QueryGraph &graph, const Plan &plan, Relat
 		// Roots are alternatives, so their quantities add. Only the product term
 		// is answered; the other three exist so that the recursion below a root
 		// can combine, and are of no interest once it has.
-		int64_t total = 0;
+		Int128 total;
 		int64_t tuples = 0;
 		rep.ForEachRoot([&](Record root) {
 			const auto sums = rep.SubtreeProductSum(root, x, y);
-			total = CheckedCardinalityAdd(total, sums.sum_xy);
+			total = CheckedAdd128(total, sums.sum_xy);
 			tuples = CheckedCardinalityAdd(tuples, sums.count);
 		});
-		result.count = total;
+		result.product_sum = total;
+		// `count` keeps reporting the answer when it fits, so every caller
+		// that predates the widening still works; the 128-bit field is what
+		// the operator reads.
+		result.count =
+		    (total.high == 0 && total.low <= 0x7FFFFFFFFFFFFFFFULL)
+		        ? static_cast<int64_t>(total.low)
+		        : (total.high == -1 && total.low >= 0x8000000000000000ULL ? static_cast<int64_t>(total.low) : 0);
 		result.tuples = tuples;
 		result.records = rep.RecordCount();
 		result.bytes = rep.BytesAllocated();

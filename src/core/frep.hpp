@@ -22,6 +22,7 @@
 #pragma once
 
 #include "arena.hpp"
+#include "int128.hpp"
 #include "layout.hpp"
 
 #include <cstdint>
@@ -363,7 +364,15 @@ public:
 		int64_t count = 0;
 		int64_t sum_x = 0;
 		int64_t sum_y = 0;
-		int64_t sum_xy = 0;
+		//! 128 bits, and only this one. D87 measured sum(x * y) rescuing 7
+		//! excluded queries where min and max rescue 45, and 17 of 20 sampled
+		//! failures were this field overflowing: ~1e5 squared over ~1e10
+		//! tuples is ~1e20 against int64's 9.2e18. The other three stay 64
+		//! bits because they do not overflow on anything measured, and
+		//! because keeping them there is what holds the combine down to
+		//! Int128 * int64 and int64 * int64 -- a 128-by-128 multiply is the
+		//! one operation this type deliberately does not implement.
+		Int128 sum_xy;
 	};
 	ProductSum SubtreeProductSum(Record record, AttributeId x, AttributeId y) const;
 	//! The bilinear product of two independent tuple sets (see the .cpp).

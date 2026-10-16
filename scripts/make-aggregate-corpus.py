@@ -32,6 +32,9 @@ KINDS = {
     "max": lambda a, b: f"max({a})",
     "avg": lambda a, b: f"avg({a})",
     "sum": lambda a, b: f"sum({a})",
+    # count(c), not count(*): it reads a column the fold would otherwise never
+    # touch, and is count(*) exactly when that column cannot be NULL.
+    "countc": lambda a, b: f"count({a})",
     # The cast is load-bearing, not cosmetic -- see the module docstring.
     "sumprod": lambda a, b: f"sum({a}::BIGINT * {b})",
 }

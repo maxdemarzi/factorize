@@ -288,6 +288,14 @@ static void PrintSteps(const factorize::ExecuteResult &result, idx_t slice) {
 	Printer::Print(line);
 }
 
+static Value FoldedWideValue(const factorize::Int128 &total, const LogicalType &type) {
+	const hugeint_t wide(total.high, total.low);
+	if (type.id() == LogicalTypeId::DECIMAL) {
+		return Value::DECIMAL(wide, DecimalType::GetWidth(type), DecimalType::GetScale(type));
+	}
+	return Value::HUGEINT(wide).DefaultCastAs(type);
+}
+
 static Value FoldedValue(int64_t total, const LogicalType &type) {
 	if (type.id() == LogicalTypeId::DECIMAL) {
 		return Value::DECIMAL(hugeint_t(total), DecimalType::GetWidth(type), DecimalType::GetScale(type));
@@ -601,8 +609,13 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		chunk.SetCardinality(1);
 		// No tuples means nothing was summed, and SQL answers NULL rather than
 		// zero -- the same rule every aggregate but count(*) follows here.
+		// The 128-bit field, not `count`: the product-sum is the one fold whose
+		// answer routinely exceeds int64, which is what D87 measured and D88
+		// widened. hugeint_t is {upper, lower} in the same order and signedness
+		// as Int128 is {high, low}, so the handover is a field copy.
 		chunk.SetValue(0, 0,
-		               result.tuples > 0 ? FoldedValue(result.count, aggregate_types[0]) : Value(aggregate_types[0]));
+		               result.tuples > 0 ? FoldedWideValue(result.product_sum, aggregate_types[0])
+		                                 : Value(aggregate_types[0]));
 		gstate.handed_out = 1;
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
