@@ -58,9 +58,27 @@ docs:
 
     **What it is for.** Queries whose join result is too large to produce. On
     the 442 queries of the cardinality-estimation benchmark whose results exceed
-    1e9 tuples, this answers 244 that stock DuckDB does not finish in sixty
-    seconds, in a median of 0.09 s. One query it answers counts 10.8 trillion
-    results in 24 seconds where the stock plan produces nothing in 180.
+    1e9 tuples, this answers 244 `count(\*)` queries that stock DuckDB does not
+    finish in sixty seconds, in a median of 0.09 s. One of them counts 10.8
+    trillion results in 24 seconds where the stock plan produces nothing in 180.
+
+    That 244 is specific to `count(\*)`, and deliberately says so: which queries
+    stock DuckDB cannot finish depends on the aggregate, not only on the join.
+    Over a random 120-query sample of the same corpus, with both plans timed
+    and a sixty-second cap, stock finishes 38 to 41 of them once the fold is
+    not `count(\*)` -- about a third of the corpus stops being out of reach.
+
+    The rescues survive the change of aggregate, which had been assumed rather
+    than measured until it was:
+
+        fold          rescued   faster   slower   neither   lost
+        min                45       34        7        34      0
+        max                47       33        7        33      0
+        avg                45       31       10        34      0
+        sum(x * y)         46       30       10        34      0
+
+    Zero losses across all four. "Neither" is the floor neither plan clears
+    inside the cap.
 
     **What it is not for.** Queries DuckDB already handles. For a plain
     count(\*) DuckDB carries no payload columns through a join and counts empty
@@ -83,9 +101,13 @@ docs:
     The aggregates beyond count(\*) are timed as well as verified (D81), and the
     gate does not yet know which fold it is costing: it fires on the same
     queries whichever aggregate runs. On the benchmark's live corpus that is
-    1.38x for min and sum, 1.39x for max, 1.41x for avg and 1.36x for
-    sum(x * y), each over the same 119 join graphs with the same 36 queries
-    fired on, against 1.7x for count(\*). An earlier reading of 0.93x for
+    1.38x for min and sum, 1.39x for max, 1.41x for avg, 1.36x for
+    sum(x * y) and 2.04x for count(c), each over the same 119 join graphs with
+    the same 36 queries fired on, against 1.7x for count(\*). count(c) leads
+    because it is only accepted where the column cannot be NULL, which makes
+    the fold a count again. bool_and and bool_or are not listed separately:
+    the matcher compiles them to the min and max folds with the same binding,
+    so they are those rows with a BOOLEAN result type. An earlier reading of 0.93x for
     sum(x * y) -- "slower than not firing" -- was an artifact: 65 of the 119
     queries in that corpus multiplied two INTEGER join keys whose product
     overflows INT32, so they raised instead of answering, and the gate fired on
