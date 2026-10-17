@@ -49,7 +49,14 @@ MIRROR="$(mktemp -d)"
 trap 'rm -rf "$MIRROR"' EXIT
 cp "$CONFIG" "$MIRROR/.clang-format"
 
-mapfile -t FILES < <(git ls-files 'src/*.cpp' 'src/*.hpp' 'src/*.h' 'test/*.cpp' 'test/*.hpp')
+# --others --exclude-standard as well as tracked files: `git ls-files`
+# alone lists only what is already committed, so a brand-new file is
+# invisible until after it is added -- which is exactly when it is most
+# likely to be misformatted. src/core/int128.hpp and
+# test/unit/test_int128.cpp were both skipped that way, the check
+# reported the same 44 files before and after they existed, and CI's
+# Format Check caught what this did not (D88).
+mapfile -t FILES < <(git ls-files --cached --others --exclude-standard 'src/*.cpp' 'src/*.hpp' 'src/*.h' 'test/*.cpp' 'test/*.hpp' | sort -u)
 BAD=0
 for f in "${FILES[@]}"; do
     mkdir -p "$MIRROR/$(dirname "$f")"

@@ -81,7 +81,8 @@ static void TestBoundaries() {
 	// signed value is undefined; MultiplyWide takes magnitudes as unsigned
 	// for exactly this.
 	ExpectTrue(ToString(MultiplyWide(kMin, 1)) == "-9223372036854775808", "INT64_MIN * 1");
-	ExpectTrue(ToString(MultiplyWide(kMin, -1)) == "9223372036854775808", "INT64_MIN * -1 is representable at 128 bits");
+	ExpectTrue(ToString(MultiplyWide(kMin, -1)) == "9223372036854775808",
+	           "INT64_MIN * -1 is representable at 128 bits");
 	ExpectTrue(ToString(MultiplyWide(kMin, kMin)) == "85070591730234615865843651857942052864", "INT64_MIN squared");
 	ExpectTrue(ToString(MultiplyWide(kMax, kMax)) == "85070591730234615847396907784232501249", "INT64_MAX squared");
 
@@ -94,11 +95,9 @@ static void TestBoundaries() {
 
 	// The case the first CheckedMul128By64 wrongly rejected: a subtotal far
 	// wider than 64 bits, scaled by a small count.
-	ExpectTrue(ToString(CheckedMul128By64(MultiplyWide(10000000000LL, 10000000000LL), 10)) ==
-	               "1000000000000000000000",
+	ExpectTrue(ToString(CheckedMul128By64(MultiplyWide(10000000000LL, 10000000000LL), 10)) == "1000000000000000000000",
 	           "a 1e20 subtotal times 10 is representable");
-	ExpectTrue(ToString(CheckedMul128By64(MultiplyWide(10000000000LL, 10000000000LL), -3)) ==
-	               "-300000000000000000000",
+	ExpectTrue(ToString(CheckedMul128By64(MultiplyWide(10000000000LL, 10000000000LL), -3)) == "-300000000000000000000",
 	           "and signed");
 	bool threw = false;
 	try {
@@ -201,14 +200,13 @@ static void TestAgainstNative() {
 		const Native native_wide = ToNative(wide);
 		const Magnitude mag_wide =
 		    native_wide < 0 ? ~static_cast<Magnitude>(native_wide) + 1 : static_cast<Magnitude>(native_wide);
-		const Magnitude mag_scale = scale < 0 ? ~static_cast<Magnitude>(static_cast<Native>(scale)) + 1
-		                                      : static_cast<Magnitude>(scale);
+		const Magnitude mag_scale =
+		    scale < 0 ? ~static_cast<Magnitude>(static_cast<Native>(scale)) + 1 : static_cast<Magnitude>(scale);
 		const Magnitude kMagnitudeMax = (static_cast<Magnitude>(1) << 127) - 1;
 		const bool representable = mag_scale == 0 || mag_wide <= kMagnitudeMax / mag_scale;
 		const bool negative = (native_wide < 0) != (scale < 0);
 		const Magnitude product = representable ? mag_wide * mag_scale : 0;
-		const Native expected =
-		    negative ? -static_cast<Native>(product) : static_cast<Native>(product);
+		const Native expected = negative ? -static_cast<Native>(product) : static_cast<Native>(product);
 		try {
 			const Int128 got = CheckedMul128By64(wide, scale);
 			if (representable && ToNative(got) == expected) {
