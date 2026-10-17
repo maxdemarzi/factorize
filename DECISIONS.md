@@ -6176,3 +6176,48 @@ new structural idea whose core measurement we already have and could not
 make pay, plus an architectural change -- per-bucket routing -- that is sound
 arithmetically, unsupported by the fallback today, and unattested anywhere.
 That is a better position than D82 left, and it is not yet a plan.
+
+## D90 — All six folds on the excluded corpus, and the one real loss in 720 queries
+
+D87 measured four folds and left `sum` out deliberately, on the grounds that
+min, max and avg agreed to within two queries and it would cost two hours for
+nearly no information. D88's widening then changed what sum(x * y) can answer,
+and count(c) had never been measured anywhere. Both gaps are now closed, on
+the same 120-query sample, same 60s cap, both modes timed:
+
+    fold        fires   stock done   rescued   faster   slower   neither   lost
+    min            76        41/120        45       34        7        34      0
+    max            76        40/120        47       33        7        33      0
+    avg            76        41/120        45       31       10        34      0
+    sum            76        41/120        46       31        9        33      1
+    count(c)       78        43/120        59       29       13        18      1
+    sum(x * y)     76        40/120        46       30       10        34      0
+
+`sum` lands where min, max and avg already were, which is what D87 predicted
+when it skipped it -- the judgement was right, and now it is checked rather
+than asserted.
+
+**count(c) is the outlier, in the good direction.** 59 rescues against 45-47,
+and 18 "neither" against 33-34. The reason is structural: the matcher only
+accepts count(c) where the column cannot be NULL, which makes the fold a
+counter again, so it behaves like count(*) rather than like a value-reading
+aggregate. It is the cheapest fold and it reaches furthest.
+
+**Two losses, and only one of them is real.** These are the first
+wrong-direction outcomes in the study; the first four folds had none across
+480 queries.
+
+  * `sum` on `dblp_acyclic_211_14` -- stock finished in 58.78s against a 60s
+    cap. Two percent the other way and this is a "slower", not a "lost". It is
+    an artifact of where the cap falls, and should not be counted as a
+    regression.
+  * `count(c)` on `watdiv_acyclic_217_10` -- stock 5.96s, ours past 60s, and
+    under `force` it does produce the answer, so it is slow rather than
+    unable. This one is real, and it is not new: the same query appears in
+    four earlier entries, including one recording it going "from failing in
+    23s to not finishing in 300s". The single genuine loss in 720 measured
+    queries is a query already known to defeat the gate.
+
+So the aggregates are not hiding anything. Six folds, 720 query-measurements,
+one genuine regression, and it is one the gate was already failing on before
+any of this work.

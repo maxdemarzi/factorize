@@ -75,10 +75,20 @@ docs:
         min                45       34        7        34      0
         max                47       33        7        33      0
         avg                45       31       10        34      0
+        sum                46       31        9        33      1
+        count(c)           59       29       13        18      1
         sum(x * y)         46       30       10        34      0
 
-    Zero losses across all four. "Neither" is the floor neither plan clears
-    inside the cap.
+    "Neither" is the floor neither plan clears inside the cap. count(c) reaches
+    furthest because the matcher only accepts it where the column cannot be
+    NULL, which makes the fold a counter again.
+
+    Two of the 720 measurements go the wrong way, and one of those is the cap:
+    `sum` on dblp_acyclic_211_14 has the stock plan finishing in 58.8s against
+    a 60s limit. The other, count(c) on watdiv_acyclic_217_10, is a real
+    regression -- 5.9s stock against more than 60s here -- on a query this
+    project has recorded the gate failing on since well before these
+    measurements.
 
     **What it is not for.** Queries DuckDB already handles. For a plain
     count(\*) DuckDB carries no payload columns through a join and counts empty
