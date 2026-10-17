@@ -83,12 +83,20 @@ docs:
     furthest because the matcher only accepts it where the column cannot be
     NULL, which makes the fold a counter again.
 
-    Two of the 720 measurements go the wrong way, and one of those is the cap:
-    `sum` on dblp_acyclic_211_14 has the stock plan finishing in 58.8s against
-    a 60s limit. The other, count(c) on watdiv_acyclic_217_10, is a real
-    regression -- 5.9s stock against more than 60s here -- on a query this
-    project has recorded the gate failing on since well before these
-    measurements.
+    The slower column is mostly not this engine. Splitting the same runs by
+    whether the gate fired, every one of those slowdowns but two sits among
+    the queries it *declined* -- where `auto` runs the stock plan and the
+    difference is two timings of the same work, median ratio 0.98 over 151
+    pairs. Across 458 fired queries there are two bad outcomes, both under
+    count(c): one is the 60s cap falling just past a 58.8s stock plan, and the
+    other is watdiv_acyclic_217_10, which this project has recorded the cost
+    model failing on since well before these measurements.
+
+    Where it does regress is the corpus it is not for. On the queries DuckDB
+    can already materialise, 45% of the queries the gate fires on come out
+    slower. And `auto` costs about 2 to 4 milliseconds to decline -- the
+    statistics sampling behind the decision -- which is invisible past 100ms
+    and around 20% on a 10ms query.
 
     **What it is not for.** Queries DuckDB already handles. For a plain
     count(\*) DuckDB carries no payload columns through a join and counts empty

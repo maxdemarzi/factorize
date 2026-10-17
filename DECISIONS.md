@@ -6275,3 +6275,63 @@ correction that is right on its own terms still cannot cut the axis, because
 the queries worth keeping and the queries worth dropping are not separated
 along it. D89's per-bucket routing remains the only direction that does not
 depend on cutting it.
+
+## D92 — The gate's excluded-corpus "slower" queries are ones it declined, and the real regressions are elsewhere
+
+D87 and D90 reported 7 to 13 slower queries per fold on the excluded corpus
+and carried those numbers into `packaging/description.yml`. Splitting the same
+measurements by whether the gate actually fired says they belong somewhere
+else:
+
+    fold                  rescued  faster  slower  lost  neither
+    min        fired           45      15       0     0       16
+               declined         0      19       7     0       18
+    max        fired           46      14       0     0       16
+               declined         1      19       7     0       17
+    avg        fired           45      15       0     0       16
+               declined         0      16      10     0       18
+    sum        fired           46      14       0     0       16
+               declined         0      17       9     1       17
+    count(c)   fired           59      15       1     1        2
+               declined         0      14      12     0       16
+    sum(x * y) fired           46      14       0     0       16
+               declined         0      16      10     0       18
+
+**Across 458 fired queries there are two bad outcomes**, both in count(c), one
+of them `watdiv_acyclic_217_10` which D91 dissected. Every other "slower" sits
+in the declined population, where `auto` *is* the stock plan and the number is
+two runs of the same thing: over 151 such pairs the median `auto/off` is
+0.980 and 93% fall within 25% of 1.0. A ratio centred slightly below one is
+what noise looks like.
+
+So the gate's decisions on the corpus this engine exists for are close to
+perfect, and the earlier entries understated it by attributing run-to-run
+variance to the engine. Correcting upward is still correcting.
+
+**The real regressions are on the runnable corpus, and they are not subtle.**
+The same split there:
+
+    among queries the gate fires on:  78 slower of 174  (45%)
+
+That is the population worth working on, and it is the opposite of the one
+D89's per-bucket routing was designed to protect. Routing bounds the cost of
+being wrong on a query where the stock plan takes minutes; on the runnable
+corpus the stock plan takes milliseconds, the regressions are small in
+absolute terms, and an exploration bucket is most of the query. **Avenue A was
+aimed at the corpus that turned out not to need it.**
+
+**And a cost nobody had measured.** Among the 406 runnable queries the gate
+declines outright -- no FACTORIZED operator in the plan at all -- `auto` is
+still slower than `off`:
+
+    stock time        n   median auto/off   implied fixed cost
+    4 - 20 ms       222             1.218            2.4 ms
+    20 - 100 ms     119             1.120            3.7 ms
+    100 ms - 1 s     60             1.000            0.0 ms
+
+A ratio that shrinks as the query grows and vanishes by 100ms is a fixed cost,
+not a proportional one: deciding costs roughly 2 to 4 milliseconds, which is
+the statistics sampling the gate does before it can decline. On a 10ms query
+that is 20%. It is a floor on what `auto` can achieve on short queries no
+matter how good the gate becomes, and it argues for a cheap structural
+pre-filter -- shape, relation count, key types -- before any sampling runs.
