@@ -6335,3 +6335,46 @@ the statistics sampling the gate does before it can decline. On a 10ms query
 that is 20%. It is a floor on what `auto` can achieve on short queries no
 matter how good the gate becomes, and it argues for a cheap structural
 pre-filter -- shape, relation count, key types -- before any sampling runs.
+
+## D93 — The gate's 2ms is all sampling, and the same tables are sampled every query
+
+D92 found that `auto` is slower than `off` by a margin that shrinks with query
+size and disappears past 100ms, on the 406 runnable queries the gate declines
+outright. A fixed cost, implied at 2 to 4ms. This identifies it exactly.
+
+Across the 69 short declined queries, four runs each, fastest of the last
+three:
+
+    auto, sampling on (16384 rows)    median auto/off  1.158
+    auto, sampling off (0 rows)       median auto/off  1.000
+    median cost of the sampling itself              +2.00 ms
+
+So it is entirely the statistics sampling, and with sampling off the overhead
+is not merely smaller but *gone* -- 1.000, not 1.02. The gate's structural
+checks, cost arithmetic and plan surgery cost nothing measurable; reading
+16384 rows per relation costs everything.
+
+Reordering will not help, because the cheap checks already run first: the
+shape match, the key-type check and the LIMIT rule all decline before
+`CatalogStats` is constructed. What reaches sampling has already passed
+everything free.
+
+**The waste is that nothing is reused.** `CatalogStats` is built per query and
+`UseSampledStatistics` re-reads 16384 rows per relation every time, for tables
+that have not changed between queries. A session issuing many queries over the
+same schema -- which is the normal case, and the case the CE corpus is -- pays
+the full sample on every one of them. The statistics of a read-only table are
+the same statistics each time.
+
+A cache keyed by table and physical column, invalidated when the table
+changes, would take this to roughly zero on the second and later queries. It
+is worth noting what the risk is and is not: stale statistics make the gate
+decide badly, which costs time, and cannot make an answer wrong -- `auto`
+remains bit-exact against `off` whatever the gate decides. The hazards are
+the ordinary ones of a mutable global in an optimizer extension, lifetime and
+thread safety, not correctness of results.
+
+Not implemented here. The measurement is the part worth having first, and a
+global cache in this position deserves its own pass rather than the end of a
+long one. `factorize_gate_sample_rows` already exists if anyone wants to trade
+decision quality for the 2ms today.
