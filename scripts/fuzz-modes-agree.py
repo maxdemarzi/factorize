@@ -148,10 +148,24 @@ def make_query(rng, tables):
         # Ordered by every column, so two runs that agree as sets also agree as
         # text -- and so a duplicated group cannot hide behind a reordering.
         ordering = ", ".join(str(i + 1) for i in range(len(keys) + len(aggregates)))
+        # A LIMIT on top a third of the time. The engine stops building once
+        # the prefix is complete rather than counting the whole join, which is
+        # a different code path from the unlimited grouped walk and one the
+        # ORDER BY above makes checkable: ordered by every column, the first n
+        # rows are the same n rows in both modes.
+        limit = f" LIMIT {rng.randrange(1, 6)}" if rng.random() < 0.34 else ""
         return (
             f"SELECT {selected}, {', '.join(aggregates)} FROM {froms} WHERE {where} "
-            f"GROUP BY {selected} ORDER BY {ordering};"
+            f"GROUP BY {selected} ORDER BY {ordering}{limit};"
         )
+    # EXISTS, which stops at the first witness instead of counting. Supported
+    # since D23 and never fuzzed: like sum(x * y) before D86, it is a shipped
+    # entry point that the one check guarding mode agreement has never
+    # exercised. Its failure mode is the opposite of a count's -- a count that
+    # is wrong by one is visible, while an EXISTS is a single bit and is wrong
+    # only by being wrong.
+    if rng.random() < 0.12:
+        return f"SELECT EXISTS (SELECT 1 FROM {froms} WHERE {where});"
     return f"SELECT {', '.join(make_aggregates(rng, aliases))} FROM {froms} WHERE {where};"
 
 
