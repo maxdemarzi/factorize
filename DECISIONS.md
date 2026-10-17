@@ -6221,3 +6221,57 @@ wrong-direction outcomes in the study; the first four folds had none across
 So the aggregates are not hiding anything. Six folds, 720 query-measurements,
 one genuine regression, and it is one the gate was already failing on before
 any of this work.
+
+## D91 — The one real loss, dissected: both halves of its error are real and fixing either does not help
+
+D90 found exactly one genuine wrong-direction outcome in 720 measured
+queries: `count(c)` on `watdiv_acyclic_217_10`, 5.96s for the stock plan
+against more than 60s here. Six population-level attempts on the gate have
+been refuted, so this one query was taken apart instead. D68 did the same for
+`watdiv_acyclic_217_05` and it produced the sharpest finding in the line.
+
+**The gate predicts ours 45.2s, DuckDB 370.7s -- an 8.2x win. DuckDB takes
+7.19s.** The prediction of our own side is roughly right; the error is
+entirely in the other one, and it is 52x. It decomposes exactly:
+
+    cardinality   predicted 9.308e10, true 8.611e9      10.8x too high
+    per-tuple     model 3.982 ns, actual 0.835 ns        4.8x too slow
+    product                                               52x  (observed 52x)
+
+**The rate half is a real, systematic, corpus-wide error.** `EngineCost`
+charges a flat `per_output_ms`, fitted at 3.981e-6 from a measurement of 27M
+tuples in 94ms. Measured over the 41 excluded queries where the stock plan
+finishes and the join size is known, the rate is not flat at all:
+
+    join tuples        n   median ns/tuple
+    1e8 - 1e9          2        4.337
+    1e9 - 1e10        28        3.336
+    1e10 - 1e11        9        1.555
+
+Above 1e9 the fit is `ns/tuple ~ output^-0.373`. At 1e10-1e11 the model
+over-charges DuckDB 2.6x, and over-charging DuckDB is precisely what makes
+the gate fire when it should not.
+
+**And correcting it is a bad trade, scored offline before any code changed.**
+Re-pricing `duckdb_ms` with the measured exponent and re-running the fire
+decision over the excluded corpus:
+
+    stops firing on   19 rescues, 11 faster, 9 neither, 2 slower, 1 lost
+
+Thirty good outcomes surrendered to avoid three. Ten to one, the wrong way,
+which is the shape of every attempt since D71.
+
+**This is the strongest form of D82's finding so far.** The earlier attempts
+could be dismissed as having chosen bad features or tuned a threshold on the
+wrong axis. This one corrects a term that is *demonstrably wrong* -- measured,
+systematic, in the direction that would explain the failures -- and it still
+surrenders ten good outcomes per bad one. Both halves of this query's 52x
+error have now been attacked: D82 calibrated the size/speedup axis and this
+re-prices the rate. Neither separates the populations.
+
+What that rules out is worth stating plainly: the gate's problem is not a
+wrong coefficient, and it is not a missing term in the cost model. A model
+correction that is right on its own terms still cannot cut the axis, because
+the queries worth keeping and the queries worth dropping are not separated
+along it. D89's per-bucket routing remains the only direction that does not
+depend on cutting it.
