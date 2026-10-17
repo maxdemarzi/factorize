@@ -6091,3 +6091,73 @@ implementation.
 Verified: 119/119 auto == off on the sum(x * y) corpus, 978 SQL assertions, 22
 core suites at -O1 with sanitizers and -O2, fuzzer 150 queries 0 disagreements
 (50 taken over, up from 47), format and tidy clean.
+
+## D89 — What the literature has for the gate, and how much of it we already have
+
+D82 closed the plan-time line: the gate's axis orders queries well and cannot
+be cut, because rescues and losses interleave along it. D84 tested the
+runtime axis the literature recommends (CIDR 2025's chain length, as fan-out)
+and D85 refuted it on measurement. Six attempts, one conclusion each time.
+This is a survey of what else exists, done before attempting a seventh.
+
+**POLAR (Justen et al., PVLDB 17) is the one structurally new idea**, and it
+is prototyped in DuckDB: up to 9x with **under 7% overhead on every benchmark
+query**. A multiplexer routes tuple *chunks* among alternative plans; an
+initialization phase sends a few tuples down each to measure its
+*resistance*; a routing strategy then sends most chunks to the winner; an
+adaptive union consolidates. Resistance is counted in **intermediates
+produced, not wall time** -- cheaper to measure and far more stable. The
+exploration carries a probabilistic bound.
+
+Every attempt here has either predicted before the query (D71, D73, D75, D81,
+D82) or abandoned during it on an absolute threshold (D37, D51, D84). None
+has raced the alternatives on this query's own data with a bounded cost for
+having tried. Bounded overhead is exactly the property the gate has never
+had.
+
+**Then the part worth being honest about: we already have POLAR's
+measurement, under another name.** `step.tuples` is the flat intermediate
+count -- precisely what DuckDB's plan would materialise at that point -- and
+`step.live` is what this engine built instead. Their ratio is
+`StepStats::Compression()`, which is a resistance ratio between the two
+plans, already measured per join, already wired to an abandon (D37), and
+already shipped *disabled* because at 0.6 it abandoned 17 of 248 out-of-sample
+queries. The core quantity POLAR introduces is one this project computed in
+D37 and could not make pay.
+
+What is genuinely missing is narrower, and worth stating precisely:
+
+  1. **Bounded regret.** The abandon throws away everything spent so far and
+     then pays the stock plan in full, so a query can cost 59s of factorizing
+     plus the whole stock runtime. `abandon_after_ms` bounds *when the check
+     runs*, not what being wrong costs. POLAR bounds the latter.
+  2. **Partial commitment.** Every decision here is all-or-nothing for the
+     whole query. POLAR routes fractions of the input.
+
+The second is the interesting one, because the architecture is already
+shaped for it: Phase 4 partitions by bucket of the join key for parallelism
+(D20), buckets are independent, and a count over a bucket is the same whoever
+computes it -- so per-bucket counts sum. Factorizing some buckets and leaving
+others to the stock plan is arithmetically sound today. What prevents it is
+that the fallback replaces the *whole* plan, so there is no way to hand
+DuckDB one bucket.
+
+**And no one appears to have done it.** A search for prior art on choosing a
+specialised operator for some partitions and a generic one for others within
+a single query, on each partition's statistics, returns nothing that matches:
+the closest work routes partitions among alternative *join orders* (eddies
+with horizontal partitioning) or switches operator variants at compile time.
+That absence cuts both ways. It is a reason the idea is worth trying and a
+reason to expect it not to work, since nothing establishes that it does.
+
+Also noted, for the regime: a systematic evaluation of plan-based adaptive
+query processing (arXiv 2511.16455, Nov 2025) finds that on in-memory systems
+such as DuckDB, cardinality refinement from executed sub-plans drives most of
+the gain, while on disk-based systems it adds measurable overhead for none.
+This engine is in the half where runtime feedback is supposed to pay.
+
+**Nothing is implemented on the strength of this.** The honest summary is one
+new structural idea whose core measurement we already have and could not
+make pay, plus an architectural change -- per-bucket routing -- that is sound
+arithmetically, unsupported by the fallback today, and unattested anywhere.
+That is a better position than D82 left, and it is not yet a plan.
