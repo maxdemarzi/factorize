@@ -6137,10 +6137,25 @@ What is genuinely missing is narrower, and worth stating precisely:
 The second is the interesting one, because the architecture is already
 shaped for it: Phase 4 partitions by bucket of the join key for parallelism
 (D20), buckets are independent, and a count over a bucket is the same whoever
-computes it -- so per-bucket counts sum. Factorizing some buckets and leaving
-others to the stock plan is arithmetically sound today. What prevents it is
-that the fallback replaces the *whole* plan, so there is no way to hand
-DuckDB one bucket.
+computes it -- so per-bucket counts sum. ExecuteCountSliced states the
+property outright: bucketing on an equivalence class's value "partitions the
+output, and the parts sum to the whole".
+
+**And handing DuckDB a bucket is not blocked, which this entry first claimed
+it was.** A bucket is not a private data structure; `SlicedSource` defines one
+as a *filter on the join key* -- keep the row when `HashKey(key) % slices ==
+slice`. A predicate is something the stock plan can carry too, and the
+optimizer rule already performs this kind of surgery: it keeps the original
+subtree wholesale as `replacement->fallback`, and it already moves the
+region's filters across. Nor does the complement need a scan per bucket: one
+stock plan filtered to *everything not factorized* is a single extra pass,
+which is the same trade slicing already makes.
+
+What it does need is real: the fallback runs today only when the factorized
+path raises, so routing would make both paths run on every such query and the
+operator would have to union two results rather than choose between them.
+Mechanical, but not small, and it changes the operator's shape rather than
+adding a setting.
 
 **And no one appears to have done it.** A search for prior art on choosing a
 specialised operator for some partitions and a generic one for others within
