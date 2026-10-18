@@ -145,6 +145,12 @@ public:
 
 	//! Only sampled reads are usable as statistics; a caller that needs data
 	//! must not get a sample by accident.
+	//! The sample size in force, which is part of the gate's cache key: a
+	//! sample of 256 rows and one of 16384 are different statistics.
+	idx_t SampleLimit() const {
+		return sample_limit;
+	}
+
 	bool Sampled() const {
 		return sample_limit != 0;
 	}

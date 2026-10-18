@@ -2,6 +2,7 @@
 
 #include "factorize/logical_factorized.hpp"
 #include "factorize/calibration.hpp"
+#include "factorize/stats_cache.hpp"
 #include "factorize/storage_source.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1245,6 +1246,34 @@ public:
 		exact->SetSampleLimit(rows);
 	}
 
+	//! `exact->Stats`, remembered between queries.
+	//!
+	//! Keyed on the table, the column, the sample size and the row count the
+	//! catalog reported, so a table that grows or shrinks re-samples. Filters
+	//! are part of the key through that row count: the sampling scan applies
+	//! pushed-down filters, so two queries filtering the same table
+	//! differently see different cardinalities and therefore different keys.
+	factorize::ColumnStats CachedSample(size_t relation, size_t column, double rows) {
+		auto &get = region.relations[relation].get();
+		auto table = get.GetTable();
+		if (!table || column >= relations[relation].columns.size()) {
+			return exact->Stats(relation, column);
+		}
+		// Catalog-qualified, not just schema-qualified. Two attached databases
+		// can each hold main.edges with entirely different contents, and a key
+		// of "main.edges" would serve one of them the other's statistics.
+		const auto key = factorize::StatsCacheKey(
+		    table->ParentCatalog().GetName() + "." + table->schema.name + "." + table->name,
+		    relations[relation].columns[column], static_cast<idx_t>(exact->SampleLimit()), rows);
+		auto &cache = ObjectCache::GetObjectCache(context);
+		if (auto hit = cache.Get<factorize::CachedColumnStats>(key)) {
+			return hit->stats;
+		}
+		auto computed = exact->Stats(relation, column);
+		cache.Put(key, make_shared_ptr<factorize::CachedColumnStats>(computed));
+		return computed;
+	}
+
 	factorize::ColumnStats Stats(size_t relation, size_t column) override {
 		if (exact && !exact->Sampled()) {
 			return exact->Stats(relation, column);
@@ -1282,7 +1311,14 @@ public:
 			// the relation. One multiplication by the ratio, taken against the
 			// catalog's filter-aware row count rather than the table's size,
 			// because the sampling scan applies the same pushed-down filters.
-			auto sampled = exact->Stats(relation, column);
+			//
+			// Cached across queries, because opening the sampling scan is the
+			// gate's entire fixed cost -- 2ms, which is 20% of a 10ms query --
+			// and the same unchanged tables are re-read for every one (D93).
+			// Only sampled statistics are cached; exact ones are a diagnostic
+			// mode that is supposed to scan. See stats_cache.hpp for why a
+			// stale entry costs time and cannot cost correctness.
+			auto sampled = CachedSample(relation, column, stats.rows);
 			const double scale = sampled.rows > 0 ? stats.rows / sampled.rows : 0.0;
 			if (scale > 0) {
 				// A value the sample saw a handful of times is not a hub, it is

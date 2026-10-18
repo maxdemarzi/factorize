@@ -6409,3 +6409,42 @@ Worth recording as a method note: this cost half an hour to refute and would
 have been a plausible one-line "optimisation" to ship on the strength of
 D93 alone. The measurement that justified looking at sampling did not justify
 any particular fix to it.
+
+## D95 — Caching the gate's samples removes its fixed cost entirely
+
+D92 measured it, D93 located it in statistics sampling, D94 ruled out the
+cheap fix by showing the cost is the per-relation scan setup rather than the
+rows read. What remains is to not open the scan, which is possible because the
+statistics of an unchanged table are the same statistics every query.
+
+    69 short declined queries        before      after
+    median auto/off, sampling on      1.158      1.000
+    cost of the sampling             +2.00 ms   +0.00 ms
+
+    gate decisions over 119 queries   36 fire    36 fire, none changed
+
+The entry lives in DuckDB's `ObjectCache`, which already provides thread
+safety, LRU eviction and per-database lifetime -- all the parts of "a mutable
+global in an optimizer extension" that were the reason D93 declined to write
+one at the end of a long session.
+
+**A stale entry cannot make an answer wrong.** Everything cached here feeds the
+gate, and the gate chooses between two plans that agree: `auto` is bit-exact
+against `off` whichever it picks. The worst a wrong entry does is cost time,
+which is the currency the cache exists to save, and that is what justifies a
+heuristic key rather than real invalidation.
+
+The key is catalog, schema, table, physical column, sample size and the
+catalog's row count. The row count is the invalidation: an insert or delete
+misses and re-samples. A change leaving the count identical hits a stale
+entry, which is accepted -- the sample was 16384 rows of a table that may hold
+millions, so it approximated the data before anything went stale.
+
+Reviewing the key caught a bug before it shipped. It was first written as
+schema and table only, so two attached databases each holding `main.edges`
+would have served one of them the other's statistics. Catalog-qualified now.
+
+What this does not do is make the *first* query cheap. The measurement keeps
+the fastest of four runs, so it reports the warm case, which is the case that
+matters: a session issuing one query pays 2ms it would have paid anyway, and
+a session issuing hundreds over a fixed schema pays it once.
