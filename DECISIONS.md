@@ -6529,3 +6529,63 @@ reports a population five times larger than exists. D87 chose that design
 deliberately so folds could be compared with each other, which is right --
 but comparing folds and counting queries want different arithmetic, and this
 used the first for the second.
+
+## D98 — The gate fires on its own worst estimates, and that is why no correction has worked
+
+Dissecting the two queries that cost the most (D91, D97) found the same shape
+twice: the gate's estimate of *our* time is close, and its estimate of
+DuckDB's is 37x to 52x too high, almost all of it cardinality. 217_10
+predicted 9.3e10 tuples against a true 8.6e9; 217_01 predicted 1.46e10
+against a true 4.8e8. Measured across the whole runnable corpus, the
+estimator is not biased so much as unreliable:
+
+    predicted / true result size      n
+    under by 2x or more              21
+    within 2x                        27
+    over by 2-10x                    14
+    over by 10-100x                  27
+    over by 100x or more             30
+
+    median 7.1x over, spread 2.06 decades
+
+Four orders of magnitude. No constant divisor reaches an error like that, and
+D82's power law -- achieved ~ 0.146 * predicted^0.516 -- halving it is about
+what a fit can do against a spread that wide.
+
+**And then the part that explains everything else:**
+
+    gate fires      n=35   median over-estimate   94.8x
+    gate declines   n=84   median over-estimate    1.9x
+
+Fifty times apart. The gate is not firing on a random sample of its own
+predictions; it is firing on the ones it got most wrong, and necessarily so.
+It fires when predicted DuckDB time beats predicted ours by the margin, and
+predicted DuckDB time is proportional to the predicted result size, so a
+large over-estimate of that size *is* the thing that makes a query look worth
+taking. The decision rule and the error are the same quantity.
+
+This is the winner's curse, mirrored: a conventional optimizer picks the plan
+whose own cost it most underestimated, and this picks queries whose
+alternative's cost it most overestimated.
+
+It accounts for every result in the sequence:
+
+  * why the ranking is good and the cut is not (D82). Genuinely large wins
+    are predicted large, so the ordering carries real signal -- but the
+    threshold slices into the error tail rather than the signal.
+  * why six global corrections failed (D71, D73, D75, D81, D82, D91).
+    Rescaling the axis moves every query together and cannot change *which*
+    ones sit in the tail. The one correction that was demonstrably right on
+    its own terms (D91's rate exponent) failed for exactly this reason.
+  * why the excluded corpus is nearly perfect and the runnable one is not
+    (D92). Where the true result exceeds 1e9 tuples, even a 100x
+    over-estimate still describes a query DuckDB cannot finish, so the
+    decision survives being wrong. Where the result is small, the same error
+    inverts the answer.
+
+What it implies is a different kind of fix. Anything that shifts the
+estimate's centre is useless; what would help is reducing its *variance*, or
+checking the estimate against reality before committing to it. The per-bucket
+probe in D89 is the second of those, and D92 showed it aimed at the corpus
+that does not need it -- but on the runnable corpus, where a bucket is cheap
+and the error inverts decisions, it is pointed at the right population.
