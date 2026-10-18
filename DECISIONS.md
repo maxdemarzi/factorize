@@ -6448,3 +6448,49 @@ What this does not do is make the *first* query cheap. The measurement keeps
 the fastest of four runs, so it reports the warm case, which is the case that
 matters: a session issuing one query pays 2ms it would have paid anyway, and
 a session issuing hundreds over a fixed schema pays it once.
+
+## D96 — C, D and E measured instead of dismissed, and the ranking was wrong
+
+These three were set aside on reasoning: cyclic queries and non-integer keys
+as "projects rather than tasks", vectorised layout as "a rewrite". Reasoning
+has been corrected by measurement repeatedly in this sequence, so they were
+counted.
+
+**D -- non-integer join keys -- is measurably zero here.** Asking the gate for
+its reason on all 119 runnable queries, every decline is a cost decision:
+"too small to be worth it", or a predicted time against DuckDB's. Not one
+says the key is not an integer. On this corpus key types never block
+anything, so widening them would unlock nothing that can be observed.
+
+**C -- cyclic queries -- cannot be measured with what is here, and the reason
+matters.** Both corpora contain zero cyclic queries, but that is a property
+of how they were built, not of the benchmark: `ce-to-factorized-count.py`
+takes `--pattern _acyclic` by default, so the cyclic files were filtered out
+at the start. They exist. Measuring C means converting them, which needs the
+FactDB query files that are not checked out here. So C's value is unknown
+rather than small, and every coverage number this project reports is about
+acyclic queries because that is the only kind it has ever looked at.
+
+**E -- vectorised layout -- is the best-evidenced lead remaining, and it was
+ranked last.** Of the 84 fired-and-slower queries across five folds, 16.33s
+is lost in total. Split by where the time is:
+
+    stock time        n   lost    share   median ratio
+    4 - 50 ms        53   4.81s     29%        4.98x
+    50 - 500 ms      15   0.95s      6%        1.31x
+    0.5 - 5 s        16  10.56s     65%        1.49x
+
+A layout change buys throughput, so it reaches the third row and not the
+first. That row is 65% of all time lost, and its median regression is 1.49x
+-- inside the 1.46-1.66x FFX reports for packed vectors alone. At 1.66x it
+would recover up to 9.02s, 55% of everything this engine loses to
+regressions.
+
+The first row is a different problem wearing a similar face: 53 queries at a
+median 4.98x, but only 4.81s between them, because a 5x loss on a 10ms query
+is 40ms. That is fixed overhead on work too small to be worth factorising,
+and the gate firing on them at all is the fault rather than the layout.
+
+So the order was wrong. D is empty on the evidence available, C has no
+evidence available, and E -- the one dismissed as a rewrite -- is where the
+measurable time is.
