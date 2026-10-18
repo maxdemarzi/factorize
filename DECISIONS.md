@@ -6589,3 +6589,62 @@ checking the estimate against reality before committing to it. The per-bucket
 probe in D89 is the second of those, and D92 showed it aimed at the corpus
 that does not need it -- but on the runnable corpus, where a bucket is cheap
 and the error inverts decisions, it is pointed at the right population.
+
+## D99 — Racing a bucket is refuted on both corpora, and the gate was never as broken as the query counts said
+
+Two things close out this thread, and the second is a correction to how the
+whole of it has been framed.
+
+**The race does not pay, and both corpora rule it out for opposite reasons.**
+D89 proposed probing a bucket of each plan before committing; D92 showed it
+aimed at the excluded corpus, where it cannot work because running one bucket
+of the *stock* plan costs 73s and 83s on the two tried -- an eighth of an
+explosive join is still explosive. D98 then argued the runnable corpus is
+where the estimator's error actually inverts decisions, and exploration there
+is affordable by definition. Measured, over the 36 queries the gate fires on:
+
+    bucket-0 race as a predictor of the whole-query outcome
+      says run us, and we win     15
+      says run us, and we lose     0      <- never makes the costly error
+      says hand over, we'd lose   10
+      says hand over, we'd win    11      <- and gives up this much
+      accuracy 69%
+
+    firing on all of them (today)      2.51s
+    never firing                      14.72s
+    racing a bucket, then committing   6.48s
+
+The race is perfectly safe and not worth having. It never commits to a query
+it will lose, which is more than the gate manages, and it is still 2.6x worse
+than today because it surrenders 11 of 26 winnable queries and pays an
+exploration fee on every query to do it. On fast queries the fee is most of
+the query.
+
+So avenue A is closed. It is too expensive where the stakes are high and too
+cautious where it is cheap.
+
+**And the framing was wrong.** D92 reported "the real regressions are on the
+runnable corpus: 78 of 174 fired queries slower", and everything since has
+reasoned from it. Counted in seconds rather than queries:
+
+    fold       won  lost   gained    lost      net
+    avg         19    17    9.17s   3.09s   +6.08s
+    max         18    18    9.23s   3.17s   +6.07s
+    min         20    16    9.36s   3.23s   +6.14s
+    sum         18    18    9.21s   3.07s   +6.14s
+    sumprod     18    18   10.35s   3.77s   +6.58s
+
+    47.34s gained, 16.33s lost, net +31.01s
+
+Eighty-seven of 180 fired queries are slower and they cost 34% of what the
+faster ones save. The losses are real and worth 16s, but the gate firing is
+worth +31s against not firing, on a corpus where the stock plan takes about
+20s per fold. A perfect oracle would deliver +47s; this delivers +31s.
+
+That is a different object from the one six entries have been trying to fix.
+The gate is not broken; it is leaving a third of its available benefit on the
+table, in losses that are individually small and collectively a third of the
+gains. D98 still explains why no correction to the estimate has closed that
+gap, and nothing here contradicts it -- but "the gate fires wrongly on half
+its queries" and "the gate captures two thirds of what is available" are the
+same measurement reported two ways, and only the second is in proportion.
