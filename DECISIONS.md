@@ -6494,3 +6494,38 @@ and the gate firing on them at all is the fault rather than the layout.
 So the order was wrong. D is empty on the evidence available, C has no
 evidence available, and E -- the one dismissed as a rewrite -- is where the
 measurable time is.
+
+## D97 — Correcting D96: those are 4 queries measured five times, not 16 queries
+
+D96 reported 84 fired-and-slower queries losing 16.33s, with 16 of them in
+the 0.5-5s band carrying 65% of it. Both numbers are sums over five folds of
+the same corpus, and the entry did not say what that means.
+
+    84 fired-and-slower pairs      19 distinct queries
+    16 pairs in the 0.5-5s band     4 distinct queries
+    16.33s lost                     3.27s per fold, over 119 queries
+
+The four, by what one fold loses on each:
+
+    watdiv_acyclic_217_01    5 folds   1.98x   1.58s per fold
+    watdiv_acyclic_212_05    1 fold    1.53x   0.49s
+    watdiv_acyclic_216_10    5 folds   1.45x   0.37s
+    epinions_acyclic_216_16  5 folds   1.08x   0.06s
+
+So the case for a vectorised layout is not "55% of 16.33s". It is about 2.5s
+per fold, in four queries, of which one is 1.58s -- half the recoverable time
+is a single query. The proportions in D96 hold; the scale does not, and a
+rewrite argued from 16 queries is a different proposition from one argued
+from four.
+
+That one query is now the obvious next thing rather than the layout.
+Dissecting `watdiv_acyclic_217_10` (D91) was the most productive step in the
+gate line, and `watdiv_acyclic_217_01` is worth more of the remaining
+regression time than every other query put together.
+
+The mistake is worth naming: five folds over one corpus is five measurements
+of the same join graphs with a different fold on top, and summing them
+reports a population five times larger than exists. D87 chose that design
+deliberately so folds could be compared with each other, which is right --
+but comparing folds and counting queries want different arithmetic, and this
+used the first for the second.
