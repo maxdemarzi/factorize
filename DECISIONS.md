@@ -6378,3 +6378,34 @@ Not implemented here. The measurement is the part worth having first, and a
 global cache in this position deserves its own pass rather than the end of a
 long one. `factorize_gate_sample_rows` already exists if anyone wants to trade
 decision quality for the 2ms today.
+
+## D94 — The 2ms is opening the scan, not reading the rows, so a smaller sample is the wrong fix
+
+D93 located the gate's fixed cost in statistics sampling and suggested a cache.
+The cheaper-looking fix is to sample fewer rows, so that was tried first.
+
+**It decides worse.** Over the 119 runnable queries, sampling 256 rows instead
+of 16384 changes exactly one decision -- and changes it the wrong way.
+`watdiv_acyclic_208_00` is declined on the full sample and fired on the small
+one, and it measures 0.154s under the stock plan against 5.008s forced. The
+large sample is the reason that query is declined. 4096 and 1024 rows differ
+on the same single query, so the whole range from 256 to 4096 buys the same
+mistake.
+
+**And it saves nothing.** Over 40 declined queries, 16384 rows total 4.142s
+and 256 rows total 4.787s -- no gain, slightly worse, which is noise either
+way on a 4-second total. Set against D93's measurement that *zero* rows costs
+nothing at all, the shape is clear: the cost is not proportional to rows read.
+It is the per-relation setup of opening a sampling scan, paid once per
+relation whether that scan then reads 256 rows or 16384.
+
+So the obvious economy is not available. The sample size is already as small
+as it can be without making worse decisions, and making it smaller would not
+help if it were. What remains is D93's cache, which removes the scan rather
+than shortening it, and which is now the only route to the 2ms rather than
+the more complicated of two.
+
+Worth recording as a method note: this cost half an hour to refute and would
+have been a plausible one-line "optimisation" to ship on the strength of
+D93 alone. The measurement that justified looking at sampling did not justify
+any particular fix to it.
