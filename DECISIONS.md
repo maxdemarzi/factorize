@@ -6648,3 +6648,55 @@ gains. D98 still explains why no correction to the estimate has closed that
 gap, and nothing here contradicts it -- but "the gate fires wrongly on half
 its queries" and "the gate captures two thirds of what is available" are the
 same measurement reported two ways, and only the second is in proportion.
+
+## D100 — Eight attempts, one shape: every rule tried declines queries, and declining always costs more than it saves
+
+D98 said the remaining options were to reduce the estimate's variance or to
+check it against reality. The check was refuted in D99. This tries the
+variance side with the cheapest instrument available, and the result closes
+the line.
+
+**DuckDB has its own cardinality estimator and the gate ignores it.** Over the
+119 runnable queries, against the true result sizes:
+
+    the gate's estimator   median  7.10x over   spread 2.06 decades
+    DuckDB's estimator     median  6.28x over   spread 1.86 decades
+
+Marginally better and no use on its own. But on the 35 queries the gate fires
+on they disagree spectacularly and in opposite directions -- ours a median
+94.8x *over*, DuckDB's 0.17x, six times *under*. Two independent estimators
+that far apart should mark the query as one nobody can predict, which is
+exactly the confidence signal D98 asked for and it costs nothing: both
+numbers exist at plan time.
+
+**It does not work, in either direction.** Large disagreement tracks winning,
+not error -- median 902x where factorizing won against 41x where it lost --
+because a gate estimate far above DuckDB's means the join really is
+explosive, which is the condition factorization exists for. So the signal is
+confounded with the answer.
+
+Inverting it, and declining when the two estimators *agree*, cuts losses by
+count and loses by the clock:
+
+    floor   declined  wins lost  losses cut    total    vs today
+        0          0          0           0    5.21s      +0.00s
+       50         12          4           8    8.49s      +3.28s
+      300         20          9          11    9.23s      +4.02s
+
+Cutting twice as many losses as wins costs three and a quarter seconds.
+
+**That is the eighth attempt and they all have the same shape.** D71's
+coefficient, D73's features, D75's calibration, D81's fold cost, D82's
+calibrated bar, D84's fan-out floor, D91's rate correction, D99's race, and
+this. Every one is a rule for *declining queries the gate currently fires
+on*, and every one loses, for a reason D99 made measurable: the gate's wins
+are large and its losses are small -- 47.34s gained against 16.33s lost. A
+rule that trades wins for losses at two-to-one by count still loses by time,
+because the units are not queries.
+
+So the conclusion is not that the gate needs a better rule. It is that
+**there is no rule of this kind left worth looking for**, and the measurable
+improvement is in making the engine faster on the queries it loses rather
+than in declining them. That is E, and it is now the only direction with
+evidence behind it: four queries, about 2.5s per fold, median regression
+1.49x, sitting in the range a packed layout is reported to recover.
