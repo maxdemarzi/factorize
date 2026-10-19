@@ -6700,3 +6700,44 @@ improvement is in making the engine faster on the queries it loses rather
 than in declining them. That is E, and it is now the only direction with
 evidence behind it: four queries, about 2.5s per fold, median regression
 1.49x, sitting in the range a packed layout is reported to recover.
+
+## D101 — The dominant regression is cache misses, and the engine already does 8x less work
+
+E -- a packed vectorised layout -- was argued from a ratio: four queries, a
+median 1.49x regression, inside the 1.46-1.66x FFX reports for layout alone.
+A ratio is not a diagnosis, so before any rewrite, cachegrind on
+`watdiv_acyclic_217_01`, the query worth more regression time than all the
+others together.
+
+    factorize_mode          off (DuckDB)        force (this engine)
+    instructions                  58.5bn                      7.1bn
+    D1 misses                     433.7M                      81.8M
+    LL misses                       0.42M                     24.6M
+    stalled on DRAM at ~80ns       0.03s                      1.96s
+
+    measured:  stock 1.55s, factorized 3.08s -- a gap of 1.53s
+    predicted from LL misses alone:              a gap of 1.93s
+
+**This engine executes 8.2x fewer instructions than DuckDB for the same query
+and loses anyway.** It touches 5.3x less data in L1 terms. What it does is
+miss last-level cache 58 times more often, and those misses account for the
+whole regression to within the precision of a crude per-miss constant.
+
+That is the layout hypothesis, confirmed as directly as this project can
+confirm anything. An arena of records chained by pointers is the access
+pattern that defeats a cache hierarchy; DuckDB's columnar vectors stream
+through it. The factorized representation is doing exactly what it claims --
+a fraction of the work -- and handing the saving back at the memory bus.
+
+**It also sets the ceiling honestly, which the ratio did not.** Removing the
+stalls entirely would put this query at about 1.1s against DuckDB's 1.55s, so
+the algorithm is already ahead and only the layout is behind. But no layout
+removes them entirely: the data does not fit in cache, and a packed layout
+improves locality rather than abolishing it. At the 1.66x FFX reports, 3.08s
+becomes 1.86s -- still 1.2x slower than stock, not a win. A 1.98x regression
+would become about 1.2x.
+
+So E is real, well-diagnosed, and worth less than "we would beat DuckDB". It
+converts the largest regression into a small one. That is the honest size of
+the prize, and it is the first direction in this sequence where the mechanism
+was measured before the work was proposed rather than after it failed.
