@@ -446,12 +446,37 @@ std::vector<CostStep> BuildCostSteps(const QueryGraph &graph, const Plan &plan, 
 namespace {
 
 //! What one materialized join left behind.
+//! Whether anything will read the per-step census this query.
+//!
+//! The floors read `live`; a caller that wants the numbers themselves says so
+//! through SetGlobalStepDetail. Checked rather than assumed, because the
+//! walk costs a traversal of the whole representation.
+bool StepDetailWanted() {
+	return GetGlobalStepDetail() || GetGlobalMinCompression() > 0 || GetGlobalMinRate() > 0;
+}
+
 StepStats MeasureStep(size_t relation, const FactorizedRelation &accumulated) {
 	StepStats step;
 	step.elapsed_ms = ElapsedSliceMs();
 	step.relation = relation;
 	step.records = accumulated.Rep().RecordCount();
 	step.bytes = accumulated.Rep().BytesAllocated();
+	// The census is a full traversal of the representation, and cachegrind
+	// puts 29.4% of this engine's last-level read misses inside it on
+	// `watdiv_acyclic_217_01` -- more than any other function, and that query
+	// is the largest regression in the corpus (D101).
+	//
+	// Nothing reads what it produces unless something asked. `live` feeds the
+	// compression and rate floors, both of which default to 0 and return
+	// immediately; `fanout_mean` and `fanout_max` feed a floor that D85
+	// measured and reverted. Otherwise the fields reach only the
+	// `explain_steps` diagnostic line and the `factorized_steps` table
+	// function, which are requests rather than defaults. So the walk happens
+	// when one of those is on, and not on the path a query normally takes.
+	if (!StepDetailWanted()) {
+		step.tuples = accumulated.Count();
+		return step;
+	}
 	// One walk for both: the census counts the same live records
 	// LiveRecordCount() would, and counting the children on the way costs an
 	// increment per child list rather than a second traversal.

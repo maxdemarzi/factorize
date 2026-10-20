@@ -312,6 +312,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		if (!gstate.groups) {
 			factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
 			                           abandon_after_ms, min_rate, second_key);
+			factorize::SetGlobalStepDetail(explain_steps);
 			SharedRelations source(client, relations);
 			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, group_keys,
 			                                        aggregates);
@@ -599,6 +600,7 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		}
 		factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression, abandon_after_ms,
 		                           min_rate, second_key);
+		factorize::SetGlobalStepDetail(explain_steps);
 		SharedRelations source(context.client, relations);
 		const auto result = factorize::ExecuteProductSum(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
 		                                                 aggregates[0].relation, aggregates[0].column,
@@ -636,6 +638,7 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 	// having no data race.
 	factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression, abandon_after_ms,
 	                           min_rate, second_key);
+	factorize::SetGlobalStepDetail(explain_steps);
 	// After SetGlobalLimits, which clears it: the buckets of this query share
 	// one verdict, so the first to give up stops the rest rather than leaving
 	// each to spend the same time reaching it (D54b).

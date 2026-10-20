@@ -786,6 +786,13 @@ static void TestRateFloorAbandonsAtTheLastJoin() {
 static void TestCompressionFloorAbandons() {
 	Group scope("a join that does not compress is abandoned, one that does is not");
 
+	// This reads the per-step numbers directly, including in the runs with the
+	// floor switched off, so it has to ask for them. Producing them walks the
+	// whole representation and is skipped unless something will read it
+	// (D101). A floor turns it on by itself, which is why leaving this out
+	// failed exactly the two "check off" assertions and nothing else.
+	SetGlobalStepDetail(true);
+
 	// Chain: keys are unique, so the join is a permutation and the whole
 	// representation holds one tuple per record or worse.
 	MemorySource chain_source;
@@ -890,6 +897,7 @@ static void TestCompressionFloorAbandons() {
 	Expect(star_on.count == star_off.count, "compression floor: the star's count is unchanged, " +
 	                                            std::to_string(star_on.count) + " against " +
 	                                            std::to_string(star_off.count));
+	SetGlobalStepDetail(false);
 }
 
 int main() {

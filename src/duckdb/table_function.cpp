@@ -407,8 +407,12 @@ void ExecuteSteps(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		throw InvalidInputException("factorized_steps: %s", plan.reason);
 	}
 	StorageSource source(context, bind_data.relations);
+	// This function is the request: without it the per-step walk is skipped
+	// as dead work on the normal path (D101).
+	factorize::SetGlobalStepDetail(true);
 	const auto result =
 	    factorize::ExecuteCountWithinMemory(bind_data.graph, plan, source, factorize::JoinMode::BOTTOM_INSERT);
+	factorize::SetGlobalStepDetail(false);
 	if (!result.ok) {
 		throw InvalidInputException("factorized_steps: %s", result.error);
 	}

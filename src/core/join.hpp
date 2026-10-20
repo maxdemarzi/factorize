@@ -217,6 +217,16 @@ size_t GetGlobalEstimateBudget();
 //! exception, so it abandons to the replaced plan (section 7.5) exactly as the
 //! estimate budget does -- the two share a mechanism and differ only in what
 //! they consult (D37).
+//! Whether per-step statistics are wanted beyond what the floors need.
+//!
+//! Off by default, because producing them walks the whole representation and
+//! on the corpus's largest regression that walk is 29.4% of every last-level
+//! read miss the engine suffers (D101). `factorized_steps` and the
+//! `explain_steps` diagnostic turn it on, because those are requests for
+//! exactly the numbers it computes.
+void SetGlobalStepDetail(bool wanted);
+bool GetGlobalStepDetail();
+
 void SetGlobalMinCompression(double tuples_per_record);
 double GetGlobalMinCompression();
 

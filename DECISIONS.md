@@ -6741,3 +6741,54 @@ So E is real, well-diagnosed, and worth less than "we would beat DuckDB". It
 converts the largest regression into a small one. That is the honest size of
 the prize, and it is the first direction in this sequence where the mechanism
 was measured before the work was proposed rather than after it failed.
+
+## D102 — A third of the engine's time went to statistics nothing read, and D101 measured the instrument
+
+D101 profiled the corpus's largest regression and concluded the whole of it
+was cache misses from the representation's layout: 24.6M last-level misses
+against DuckDB's 0.42M, a predicted 1.93s of stalls against a measured 1.53s
+gap. The conclusion was that E -- a packed vectorised layout -- was real and
+worth about "the largest regression becomes a small one".
+
+Before rewriting anything, cg_annotate was asked where the misses were.
+
+    29.39% of all last-level read misses:  TakeCensus
+    27.34%:                                SubtreeSize
+
+`TakeCensus` is `MeasureStep`'s walk, which fills `step.live` and the fan-out
+fields. Nothing reads them on the path a query normally takes. The
+compression and rate floors both default to 0 and return on their first line;
+the fan-out floor they were added for was measured and reverted in D85; what
+remains are the `explain_steps` diagnostic line and the `factorized_steps`
+table function, which are requests. The engine was walking the entire
+representation once per materialized join to compute numbers it then threw
+away.
+
+Skipping it unless something will read it:
+
+    runnable corpus, 119 queries, both modes `auto`
+      before   stock 21.13s   auto 13.02s   1.62x
+      after    stock 21.75s   auto  9.10s   2.39x
+
+Thirty percent off this engine's time, with stock moving 3% between runs.
+Answers verified against the published sizes on three of the four queries
+that moved most, and `auto` still agrees with `off` -- 978 SQL assertions, 150
+fuzzer queries, zero disagreements.
+
+**The cost is older than the instrumentation that revealed it.** Before D84
+added `Census`, `MeasureStep` called `LiveRecordCount()`, which performs the
+same full recursive traversal. D84's fan-out work -- whose floor D85 then
+refuted as worthless -- is what put a named function in the profile and made
+the walk visible. The measurement that failed paid for itself by accident.
+
+**And D101 is wrong as written.** It attributed every one of those misses to
+the representation's access pattern, when nearly a third were a diagnostic.
+Profiling `off` against `force` measures the engine and the instrument
+together, and the entry reported their sum as the engine. That is D96's
+mistake wearing different clothes: both reported a measurement at face value
+without asking what else was inside it.
+
+So E's case is void, not merely reduced. Its four queries (D97) have moved by
+factors of 1.6 to 33, the regression it was sized against has largely gone,
+and whether a packed layout is worth anything now has to be re-derived from
+the new baseline rather than inherited from the old one.

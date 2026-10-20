@@ -28,6 +28,7 @@ namespace {
 // for it, and the check cannot tell a per-thread budget from shared state.
 thread_local size_t g_memory_limit = 0;
 thread_local size_t g_estimate_budget = 0;
+thread_local bool g_step_detail = false;
 thread_local double g_min_compression = 0;
 thread_local double g_abandon_after_ms = 0;
 thread_local double g_min_rate = 0;
@@ -53,6 +54,14 @@ void SetGlobalEstimateBudget(size_t bytes) {
 
 size_t GetGlobalEstimateBudget() {
 	return g_estimate_budget;
+}
+
+void SetGlobalStepDetail(bool wanted) {
+	g_step_detail = wanted;
+}
+
+bool GetGlobalStepDetail() {
+	return g_step_detail;
 }
 
 void SetGlobalMinCompression(double tuples_per_record) {
@@ -110,6 +119,7 @@ void SetGlobalLimits(size_t memory_bytes, size_t estimate_budget_bytes, double m
 	ThreadBudget().peak.store(ThreadBudget().used.load());
 	g_estimate_budget = estimate_budget_bytes;
 	g_min_compression = min_compression;
+	g_step_detail = false;
 	g_abandon_after_ms = abandon_after_ms;
 	g_min_rate = min_rate;
 	g_second_key = second_key;
