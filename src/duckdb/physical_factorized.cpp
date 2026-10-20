@@ -313,16 +313,22 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
 			                           abandon_after_ms, min_rate, second_key);
 			factorize::SetGlobalStepDetail(explain_steps);
-			SharedRelations source(client, relations);
 			// A MIN or MAX over an acyclic join does not need the join. The
 			// reducer reads the inputs and nothing else, which on the excluded
 			// corpus is the difference between a median 0.069s and not
 			// finishing at all (D106). Falls through when the graph is not a
 			// shape it can promise, so the fold still answers everything.
 			if (reduce_extremes && IsUngroupedExtreme() && factorize::ReducibleByExtremeReduction(graph)) {
-				const auto extreme =
-				    factorize::ExecuteExtremeReduced(graph, source, aggregates[0].relation, aggregates[0].column,
-				                                     aggregates[0].kind == factorize::Aggregate::MIN);
+				// `StorageSource`, not `SharedRelations`. SharedRelations reads
+				// every relation in its constructor and copies each out of the scan
+				// buffer, which buys re-reads across threads and slices -- the
+				// reducer wants neither. It visits each relation once, in order,
+				// and keeps only the surviving keys, so one relation at a time is
+				// exactly its access pattern and the copy is pure loss (D112).
+				StorageSource reduced_source(client, relations);
+				const auto extreme = factorize::ExecuteExtremeReduced(graph, reduced_source, aggregates[0].relation,
+				                                                      aggregates[0].column,
+				                                                      aggregates[0].kind == factorize::Aggregate::MIN);
 				if (!extreme.ok) {
 					throw InvalidInputException("factorize: %s", extreme.error);
 				}
@@ -336,6 +342,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 				}
 				gstate.groups = std::move(groups);
 			} else {
+				SharedRelations source(client, relations);
 				auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
 				                                        group_keys, aggregates);
 				if (!result.ok) {
