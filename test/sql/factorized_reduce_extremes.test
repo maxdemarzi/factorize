@@ -1,0 +1,113 @@
+# name: test/sql/factorized_reduce_extremes.test
+# description: min and max answered by semijoin reduction agree with the fold and with stock
+# group: [sql]
+
+require factorize
+
+# A MIN over an acyclic join does not need the join (D106). The reducer reads
+# the inputs, keeps the keys that survive bottom-up, and takes the extreme
+# over the rows that are left. What it must never do is differ from the fold
+# it replaces, so every case here is asserted against factorize_mode='off'.
+
+statement ok
+CREATE TABLE a AS SELECT * FROM (VALUES (1,10),(2,20),(3,30),(4,40)) t(s, d);
+
+statement ok
+CREATE TABLE b AS SELECT * FROM (VALUES (10,100),(20,200),(30,300)) t(s, d);
+
+statement ok
+CREATE TABLE c AS SELECT * FROM (VALUES (100,7),(200,8)) t(s, d);
+
+statement ok
+SET factorize_min_work_ms = 0;
+
+statement ok
+SET factorize_min_gain = 0;
+
+# a.d = b.s = ..., b.d = c.s: a chain of three. Rows 3 and 4 of `a` drop out,
+# so the extremes are over {1, 2} and not over {1, 2, 3, 4} -- which is the
+# whole point, and what an unreduced min would get wrong.
+statement ok
+SET factorize_mode = 'off';
+
+query III
+SELECT min(a.s), max(a.s), count(*) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+1	2	2
+
+statement ok
+SET factorize_mode = 'auto';
+
+query I
+SELECT min(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+1
+
+query I
+SELECT max(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+2
+
+query II
+EXPLAIN SELECT min(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# The extreme may sit on a column that is not a join key, and on a relation
+# that is not the one the tree would naturally root at.
+query I
+SELECT max(c.d) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+8
+
+# An empty join is NULL, not the identity of the fold. A reducer that drops
+# every row has to report that it dropped every row.
+statement ok
+CREATE TABLE empty_side AS SELECT * FROM (VALUES (999,999)) t(s, d);
+
+query I
+SELECT min(a.s) FROM a, empty_side WHERE a.d = empty_side.s;
+----
+NULL
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT min(a.s) FROM a, empty_side WHERE a.d = empty_side.s;
+----
+NULL
+
+# Grouped min is not the reducer's shape -- it needs a value per group, which
+# a reducer does not produce -- so it must fall through to the fold and still
+# be right.
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+SELECT b.d, min(a.s) FROM a, b WHERE a.d = b.s GROUP BY b.d ORDER BY b.d;
+----
+100	1
+200	2
+300	3
+
+# Turning the reducer off must change the timing and nothing else.
+statement ok
+SET factorize_reduce_extremes = false;
+
+query II
+SELECT min(a.s), max(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+1	2
+
+statement ok
+SET factorize_reduce_extremes = true;
+
+# force bypasses the gate, not the reducer's own shape test.
+statement ok
+SET factorize_mode = 'force';
+
+query II
+SELECT min(a.s), max(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
+----
+1	2

@@ -138,6 +138,7 @@ PhysicalOperator &LogicalFactorized::CreatePlan(ClientContext &context, Physical
 	factorized.min_rate = min_rate;
 	factorized.second_key = second_key;
 	factorized.parallel_fallback = parallel_fallback;
+	factorized.reduce_extremes = reduce_extremes;
 	factorized.explain_steps = explain_steps;
 	factorized.grouped = grouped;
 	factorized.limited = limited;

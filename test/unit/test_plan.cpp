@@ -331,6 +331,153 @@ static void TestAcyclicityIsDecidedByGYO() {
 	Expect(!IsAcyclic(malformed), "a predicate naming a relation the graph lacks is refused, not indexed");
 }
 
+//! The reducer must agree with a nested loop, on random data, every time.
+//!
+//! ExecuteExtremeReduced never forms a tuple of the join, so no intermediate
+//! it produces can be checked against anything -- the only honest test is the
+//! answer, against a join computed the slow and obvious way. Randomised over
+//! chains, stars and bushy trees, with domains small enough that empty joins
+//! and ties happen often rather than never: SQL's min over no rows is NULL,
+//! and a reducer that drops every tuple has to report that rather than
+//! return the identity (D106).
+static void TestReducedExtremeAgreesWithANestedLoop() {
+	Group scope("min and max by reduction agree with a nested loop over random trees");
+
+	uint64_t seed = 0x9E3779B97F4A7C15ull;
+	auto next = [&seed](int64_t bound) {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		return static_cast<int64_t>(seed % static_cast<uint64_t>(bound));
+	};
+
+	int empty_joins = 0;
+	int checked = 0;
+	for (int trial = 0; trial < 300; trial++) {
+		const size_t relations = 2 + static_cast<size_t>(next(4)); // 2..5
+		const int64_t domain = 3 + next(5);
+
+		// A random tree: every relation after the first hangs off an earlier
+		// one, which is exactly the shape the reducer requires.
+		QueryGraph graph;
+		graph.column_counts.assign(relations, 2);
+		graph.column_types.assign(relations, {ValueType::INT32, ValueType::INT32});
+		for (size_t child = 1; child < relations; child++) {
+			const size_t parent = static_cast<size_t>(next(static_cast<int64_t>(child)));
+			graph.predicates.push_back(Predicate {parent, static_cast<int>(next(2)), child, static_cast<int>(next(2))});
+		}
+
+		MemorySource source;
+		std::vector<std::vector<std::vector<int64_t>>> rows(relations);
+		for (size_t r = 0; r < relations; r++) {
+			const size_t n = 1 + static_cast<size_t>(next(8));
+			std::vector<int64_t> first(n), second(n);
+			for (size_t i = 0; i < n; i++) {
+				first[i] = next(domain);
+				second[i] = next(domain);
+			}
+			rows[r] = {first, second};
+			source.Add(rows[r]);
+		}
+
+		// The oracle: every combination of one row per relation, kept when
+		// every predicate holds.
+		bool any = false;
+		int64_t smallest = 0;
+		int64_t largest = 0;
+		std::vector<size_t> at(relations, 0);
+		for (;;) {
+			bool matches = true;
+			for (const auto &predicate : graph.predicates) {
+				const int64_t left = rows[predicate.left_relation][static_cast<size_t>(predicate.left_column)]
+				                         [at[predicate.left_relation]];
+				const int64_t right = rows[predicate.right_relation][static_cast<size_t>(predicate.right_column)]
+				                          [at[predicate.right_relation]];
+				if (left != right) {
+					matches = false;
+					break;
+				}
+			}
+			if (matches) {
+				const int64_t value = rows[0][0][at[0]];
+				if (!any || value < smallest) {
+					smallest = value;
+				}
+				if (!any || value > largest) {
+					largest = value;
+				}
+				any = true;
+			}
+			size_t carry = 0;
+			for (; carry < relations; carry++) {
+				if (++at[carry] < rows[carry][0].size()) {
+					break;
+				}
+				at[carry] = 0;
+			}
+			if (carry == relations) {
+				break;
+			}
+		}
+		if (!any) {
+			empty_joins++;
+		}
+
+		const auto low = ExecuteExtremeReduced(graph, source, 0, 0, true);
+		const auto high = ExecuteExtremeReduced(graph, source, 0, 0, false);
+		checked++;
+		if (!low.ok || !high.ok) {
+			Expect(false, "trial " + std::to_string(trial) + ": refused a tree it should accept");
+			continue;
+		}
+		if (low.any != any || high.any != any) {
+			Expect(false, "trial " + std::to_string(trial) + ": disagreed about whether the join is empty");
+			continue;
+		}
+		if (any && (low.value != smallest || high.value != largest)) {
+			Expect(false, "trial " + std::to_string(trial) + ": min " + std::to_string(low.value) + " vs " +
+			                  std::to_string(smallest) + ", max " + std::to_string(high.value) + " vs " +
+			                  std::to_string(largest));
+		}
+	}
+	Expect(checked == 300, "every trial ran");
+	// Without empty joins the `any` half of this is untested, and an empty
+	// join is the case a reducer gets wrong by returning the identity.
+	Expect(empty_joins >= 20, "the sweep produced empty joins to check: " + std::to_string(empty_joins));
+}
+
+//! What it refuses, and why that is the conservative side.
+static void TestReducedExtremeRefusesWhatItCannotPromise() {
+	Group scope("the reducer declines a cycle, a non-tree and a column it does not have");
+
+	QueryGraph triangle;
+	triangle.column_counts.assign(3, 2);
+	triangle.column_types.assign(3, {ValueType::INT32, ValueType::INT32});
+	triangle.predicates = {Predicate {0, 1, 1, 0}, Predicate {1, 1, 2, 0}, Predicate {2, 1, 0, 0}};
+	MemorySource source;
+	for (size_t i = 0; i < 3; i++) {
+		source.Add({{1, 2}, {1, 2}});
+	}
+	Expect(!ExecuteExtremeReduced(triangle, source, 0, 0, true).ok, "a triangle is refused");
+
+	// Acyclic, and still refused: three predicates over three relations is not
+	// a spanning tree even though equality propagation makes it one class.
+	QueryGraph redundant;
+	redundant.column_counts.assign(3, 1);
+	redundant.column_types.assign(3, {ValueType::INT32});
+	redundant.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}, Predicate {0, 0, 2, 0}};
+	Expect(IsAcyclic(redundant), "the redundant star is acyclic");
+	Expect(!ExecuteExtremeReduced(redundant, source, 0, 0, true).ok,
+	       "a redundant predicate is refused rather than classified");
+
+	QueryGraph chain;
+	chain.column_counts.assign(2, 2);
+	chain.column_types.assign(2, {ValueType::INT32, ValueType::INT32});
+	chain.predicates = {Predicate {0, 1, 1, 0}};
+	Expect(!ExecuteExtremeReduced(chain, source, 0, 9, true).ok, "a column the relation does not have is refused");
+	Expect(!ExecuteExtremeReduced(chain, source, 9, 0, true).ok, "a relation the query does not have is refused");
+}
+
 //! Slicing has to be exact, not approximate: the count assembled from N
 //! partitions must equal the count taken whole, for every N. Every output tuple
 //! assigns one value to the sliced attribute, so bucketing on that value cuts
@@ -975,6 +1122,10 @@ int main() {
 	TestRedundantStarAccepted();
 	std::printf("\n");
 	TestAcyclicityIsDecidedByGYO();
+	std::printf("\n");
+	TestReducedExtremeAgreesWithANestedLoop();
+	std::printf("\n");
+	TestReducedExtremeRefusesWhatItCannotPromise();
 	std::printf("\n");
 	TestSlicingIsExact();
 	std::printf("\n");

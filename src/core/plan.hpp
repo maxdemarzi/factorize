@@ -385,6 +385,56 @@ enum class Aggregate : uint8_t {
 	AVG
 };
 
+//! A MIN or MAX answered by reducing instead of joining.
+struct ExtremeResult {
+	bool ok = false;
+	//! The extreme over the join. Meaningless unless `any` -- SQL's min over
+	//! no rows is NULL, and a reducer that eliminates every tuple has to say
+	//! so rather than return the identity.
+	int64_t value = 0;
+	bool any = false;
+	//! Rows read across every relation, which is the whole cost of this and
+	//! the quantity the gate needs to weigh it against a join.
+	size_t rows_scanned = 0;
+	std::string error;
+};
+
+//! The extreme of one column over an acyclic join, without the join.
+//!
+//! A MIN or MAX does not need the join's tuples, only which of the aggregated
+//! column's values take part in one. Yannakakis' reducer answers exactly
+//! that: rooted at the relation holding the column, each relation is semijoin
+//! reduced against its children bottom-up, and a root row survives iff it
+//! extends to a complete join tuple. The extreme over the surviving rows is
+//! the extreme over the join, at O(sum of inputs) against the join's O(output)
+//! -- and the corpus this engine exists for is *defined* by output above 1e9.
+//!
+//! Measured before it was built (D106). Over the 120-query excluded sample,
+//! for both `min` and `max`: every query answered where stock DuckDB times
+//! out on 80 of them, median 0.069s, and 34 of them had no answer from either
+//! engine. Where both finish the median is 53x. Two of the 120 are slower
+//! this way, both joins already under 0.1s, so this needs the gate in front
+//! of it exactly as the f-representation does.
+//!
+//! Refused rather than approximated when the predicates are not exactly a
+//! spanning tree of the relations. A leftover predicate is either a cycle --
+//! where the reduction is unsound -- or redundant under equality propagation,
+//! where it is sound but telling the two apart is a correctness decision and
+//! this takes the conservative side. Every one of the 120 measured queries is
+//! a tree, so the conservative rule costs nothing that has been seen.
+//!
+//! This does not generalise to COUNT or SUM. Those need the size of the join,
+//! which a reducer never computes; that is what the f-representation is for.
+//! Whether ExecuteExtremeReduced applies to this graph at all.
+//!
+//! Asked by the gate as well as the operator: the two have to agree, because
+//! the gate prices a reducer the operator then has to be able to run. A
+//! spanning tree of the relations, and genuinely acyclic.
+bool ReducibleByExtremeReduction(const QueryGraph &graph);
+
+ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &source, size_t relation, size_t column,
+                                    bool want_min);
+
 //! Sums one column over the join without materializing it.
 //!
 //! The column has to be scanned to be summed, which makes this the first thing

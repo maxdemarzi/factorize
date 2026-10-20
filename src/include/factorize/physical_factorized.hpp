@@ -56,6 +56,8 @@ public:
 	bool second_key = false;
 	//! Be a parallel source even while carrying the fallback; off (D54a).
 	bool parallel_fallback = false;
+	//! Answer an ungrouped MIN or MAX by reducing rather than folding; on.
+	bool reduce_extremes = true;
 	//! Print what each materialized join left behind, for factorize_explain.
 	bool explain_steps = false;
 	bool grouped = false;
@@ -84,6 +86,18 @@ public:
 	//! the only shape with a fused, sliced, parallel path behind it.
 	bool IsPlainCount() const {
 		return !grouped && aggregates.size() == 1 && aggregates[0].kind == factorize::Aggregate::COUNT;
+	}
+
+	//! True when the answer is one ungrouped MIN or MAX, which a semijoin
+	//! reducer answers from the inputs alone. The graph has to allow it too --
+	//! `factorize::ReducibleByExtremeReduction` -- and the gate asks the same
+	//! pair of questions, because it prices a plan this then has to run.
+	//!
+	//! bool_and and bool_or are planned as MIN and MAX over 0/1 and reduce the
+	//! same way.
+	bool IsUngroupedExtreme() const {
+		return !grouped && aggregates.size() == 1 &&
+		       (aggregates[0].kind == factorize::Aggregate::MIN || aggregates[0].kind == factorize::Aggregate::MAX);
 	}
 
 public:

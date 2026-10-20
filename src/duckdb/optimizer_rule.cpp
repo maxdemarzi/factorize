@@ -1519,6 +1519,17 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// exactly those and was dead on this path for as long as the hardcoded
 	// argument stood (D105).
 	const bool acyclic = factorize::IsAcyclic(graph);
+	// The gate has to price the plan the operator will actually run. An
+	// ungrouped MIN or MAX over a graph the reducer accepts is answered from
+	// the inputs, so charging it for an f-representation declines queries that
+	// take milliseconds -- which is what happened to 23 of the 24 slowest on
+	// the excluded corpus (D104, explained in D106). Both sides ask the same
+	// pair of questions so they cannot drift apart.
+	thresholds.reduce_extremes = BooleanSetting(context, "factorize_reduce_extremes", true) && !region.grouped &&
+	                             region.aggregates.size() == 1 &&
+	                             (region.aggregates[0].kind == factorize::Aggregate::MIN ||
+	                              region.aggregates[0].kind == factorize::Aggregate::MAX) &&
+	                             acyclic && factorize::ReducibleByExtremeReduction(graph);
 	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), acyclic, thresholds);
 	reason = estimate.reason;
 	predicted_bytes = estimate.bytes;
@@ -1743,6 +1754,7 @@ static void RewriteRecursive(ClientContext &context, unique_ptr<LogicalOperator>
 					replacement->min_rate = DoubleSetting(context, "factorize_min_rate", 0.0);
 					replacement->second_key = BooleanSetting(context, "factorize_second_key", false);
 					replacement->parallel_fallback = BooleanSetting(context, "factorize_parallel_fallback", true);
+					replacement->reduce_extremes = BooleanSetting(context, "factorize_reduce_extremes", true);
 					replacement->explain_steps = explain;
 					const auto slack = DoubleSetting(context, "factorize_estimate_slack", 2.0);
 					if (slack > 0 && predicted_bytes > 0) {
@@ -1963,6 +1975,10 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "catalog, which has no MCV list; measurement only, it scans every relation to decide "
 	                          "whether to scan every relation",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("factorize_reduce_extremes",
+	                          "Answer an ungrouped min or max over an acyclic join with a semijoin reducer "
+	                          "instead of folding an f-representation",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("factorize_explain",
 	                          "Print, per aggregate, whether the factorize rule took the plan over and why not",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));

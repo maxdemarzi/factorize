@@ -291,7 +291,11 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	for (const auto &step : steps) {
 		input_rows += step.key.rows;
 	}
-	estimate.ours_ms = thresholds.ours.Estimate(input_rows, estimate.factorized_records);
+	// A reducer reads the inputs and keeps a set of keys per relation; it
+	// never forms a record of the join, so the per-output term is zero and so
+	// is the representation it would otherwise be charged for.
+	estimate.ours_ms = thresholds.reduce_extremes ? thresholds.ours.Estimate(input_rows, 0)
+	                                              : thresholds.ours.Estimate(input_rows, estimate.factorized_records);
 	estimate.duckdb_ms = thresholds.duckdb.Estimate(input_rows, estimate.flat_tuples);
 
 	// Only what is built: a fused last join counts its output without ever
@@ -302,6 +306,11 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	}
 	estimate.bytes =
 	    held * (thresholds.bytes_per_record + thresholds.bytes_per_relation * static_cast<double>(steps.size()));
+	if (thresholds.reduce_extremes) {
+		// One hash set of distinct keys per relation, bounded by the rows that
+		// feed it -- not a representation of the join, which is the term above.
+		estimate.bytes = input_rows * thresholds.bytes_per_record;
+	}
 
 	if (thresholds.require_acyclic && !acyclic) {
 		estimate.reason = "cyclic join graph";
@@ -358,6 +367,23 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 		                  "ms, under the " + Millis(thresholds.min_duckdb_work_ms) + "ms floor";
 		return estimate;
 	}
+	// A reducer is priced as a reducer, and still bet like everything else.
+	//
+	// It was briefly not. The argument was that our cost is one pass over the
+	// inputs and DuckDB must read those inputs too, so a reducer is a scan
+	// against a scan plus the join -- therefore the margin against an estimate
+	// D107 measured as wrong by a median factor of 79 was only getting in the
+	// way. On the excluded corpus that fired 23 more queries and won 301s.
+	//
+	// It is wrong, and the runnable corpus said so: `min` went from 1.32x to
+	// 0.42x, firing on 108 queries instead of 35 and losing 45.2s to win 15.7s.
+	// DuckDB does not have to read the inputs. Filters push into its scans, a
+	// hash join quits a probe early, and zone maps skip whole row groups --
+	// `yago_acyclic_Tree_6_09` answers in 0.049s where scanning everything
+	// takes 2.5s. "Our cost is certain" is true and does not imply "our cost is
+	// lower".
+	//
+	// So the reducer changes what the gate prices, not whether it bets.
 	if (estimate.duckdb_ms < thresholds.margin * estimate.ours_ms) {
 		// The sizes go in the decline too, not only the times, and not only when
 		// it fires. A decline reading "123ms against 21ms" says the gate said no

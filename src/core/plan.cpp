@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <stdexcept>
 
 namespace factorize {
@@ -207,6 +208,128 @@ bool IsAcyclic(const QueryGraph &graph) {
 		}
 	}
 	return live.empty();
+}
+
+namespace {
+
+//! One non-root node of the reduction tree: who it hangs from, and on which
+//! columns. `own_column` is the key its parent probes it by.
+struct ReductionNode {
+	size_t parent = 0;
+	size_t own_column = 0;
+	size_t parent_column = 0;
+};
+
+} // namespace
+
+bool ReducibleByExtremeReduction(const QueryGraph &graph) {
+	return graph.predicates.size() + 1 == graph.RelationCount() && IsAcyclic(graph);
+}
+
+ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &source, size_t relation, size_t column,
+                                    bool want_min) {
+	ExtremeResult result;
+	const size_t relations = graph.RelationCount();
+	if (relation >= relations || column >= graph.column_counts[relation]) {
+		result.error = "aggregated column is not a column of the query";
+		return result;
+	}
+	if (!ReducibleByExtremeReduction(graph)) {
+		result.error = graph.predicates.size() + 1 != relations
+		                   ? "the predicates are not a spanning tree, so the reduction is not known to be sound"
+		                   : "cyclic join graph";
+		return result;
+	}
+
+	// Root at the relation holding the aggregated column and walk outwards.
+	std::vector<ReductionNode> node(relations);
+	std::vector<std::vector<size_t>> children(relations);
+	std::vector<bool> placed(relations, false);
+	std::vector<size_t> order;
+	order.reserve(relations);
+	order.push_back(relation);
+	placed[relation] = true;
+	std::vector<bool> used(graph.predicates.size(), false);
+	for (size_t head = 0; head < order.size(); head++) {
+		const size_t parent = order[head];
+		for (size_t i = 0; i < graph.predicates.size(); i++) {
+			if (used[i]) {
+				continue;
+			}
+			const auto &predicate = graph.predicates[i];
+			size_t child = 0;
+			size_t child_column = 0;
+			size_t parent_column = 0;
+			if (predicate.left_relation == parent && !placed[predicate.right_relation]) {
+				child = predicate.right_relation;
+				child_column = static_cast<size_t>(predicate.right_column);
+				parent_column = static_cast<size_t>(predicate.left_column);
+			} else if (predicate.right_relation == parent && !placed[predicate.left_relation]) {
+				child = predicate.left_relation;
+				child_column = static_cast<size_t>(predicate.left_column);
+				parent_column = static_cast<size_t>(predicate.right_column);
+			} else {
+				continue;
+			}
+			node[child] = ReductionNode {parent, child_column, parent_column};
+			children[parent].push_back(child);
+			placed[child] = true;
+			used[i] = true;
+			order.push_back(child);
+		}
+	}
+	if (order.size() != relations) {
+		result.error = "join graph is disconnected";
+		return result;
+	}
+
+	// Children before parents, so a relation is reduced only once everything
+	// below it has been. One relation is read at a time, because
+	// RelationSource only guarantees its columns until the next one is asked
+	// for -- the surviving keys are copied out before moving on.
+	std::vector<std::unordered_set<int64_t>> surviving(relations);
+	bool extreme_set = false;
+	for (size_t i = order.size(); i-- > 0;) {
+		const size_t current = order[i];
+		const auto &columns = source.Columns(current);
+		const size_t rows = columns.empty() ? 0 : columns[0].size();
+		result.rows_scanned += rows;
+		std::unordered_set<int64_t> keys;
+		for (size_t row = 0; row < rows; row++) {
+			bool survives = true;
+			for (const size_t child : children[current]) {
+				const size_t probe = node[child].parent_column;
+				if (surviving[child].find(columns[probe][row]) == surviving[child].end()) {
+					survives = false;
+					break;
+				}
+			}
+			if (!survives) {
+				continue;
+			}
+			if (current == relation) {
+				const int64_t value = columns[column][row];
+				if (!extreme_set || (want_min ? value < result.value : value > result.value)) {
+					result.value = value;
+					extreme_set = true;
+				}
+			} else {
+				keys.insert(columns[node[current].own_column][row]);
+			}
+		}
+		if (current != relation) {
+			// An empty relation empties the whole join, and continuing would
+			// read every remaining input to discover it.
+			if (keys.empty()) {
+				result.ok = true;
+				return result;
+			}
+			surviving[current] = std::move(keys);
+		}
+	}
+	result.ok = true;
+	result.any = extreme_set;
+	return result;
 }
 
 Plan BuildPlan(const QueryGraph &graph) {

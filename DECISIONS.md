@@ -7223,3 +7223,105 @@ getting wrong stops being on the critical path at all.
 
 `factorize_learn_cardinality` stays off and stays table-keyed. Nothing here
 earns a change to it, and the plumbing is still the expensive part.
+
+## D108 — The reducer, built; and the gate change that came with it was wrong
+
+D106 measured a semijoin reducer and said it was worth building. This builds
+it: `ExecuteExtremeReduced` roots the join tree at the relation holding the
+aggregated column, reduces each relation against its children bottom-up, and
+takes the extreme over the rows that survive. No tuple of the join is ever
+formed.
+
+**What it refuses.** Exactly a spanning tree of the relations, and
+`IsAcyclic` (D105). A leftover predicate is either a cycle, where the
+reduction is unsound, or redundant under equality propagation, where it is
+sound -- and telling those apart is a correctness decision, so it takes the
+conservative side and declines both. All 120 measured queries are trees, so
+the conservative rule costs nothing that has been seen.
+
+**How it is tested.** Not against an intermediate, because it produces none:
+300 random trees of 2-5 relations over small domains, min and max, against a
+nested loop over the full cross-product. Small domains on purpose -- at least
+20 of the 300 have empty joins, which is the case a reducer gets wrong by
+returning the fold's identity where SQL wants NULL.
+
+### The part that was wrong
+
+Wiring the operator changed nothing, because the gate still declined.
+`job_acyclic_109_08` priced the reducer correctly at 429ms and then declined
+it against a predicted DuckDB time of 440ms -- for a query DuckDB takes 45s
+over. So the margin was removed for reducible extremes, on this argument: our
+cost is one pass over the inputs with row counts from the catalog, DuckDB has
+to read those same inputs and then do the join, and D107 had just measured
+DuckDB's estimate wrong by a median factor of 79 with no key able to fix it.
+
+On the excluded corpus that looked conclusive:
+
+    0 answer disagreements over 85 comparisons against the fold
+    faster on 76 of 85, 75.8s against the fold's 376.9s
+    gains 303.9s, loses 2.8s
+    30 of the 34 queries with no answer from either engine, answered
+
+**And it was a 3x regression for every ordinary user.** The runnable corpus:
+`min` went 1.32x to **0.42x**, firing on 108 queries instead of 35, losing
+45.2s to win 15.7s.
+
+The argument's false step is "DuckDB has to read those same inputs". It does
+not. Filters push into its scans, a hash join quits a probe early, zone maps
+skip whole row groups: `yago_acyclic_Tree_6_09` answers in 0.049s where
+reading everything takes 2.5s. *Our cost is certain* is true, and does not
+imply *our cost is lower*.
+
+So the margin stands, and the reducer changes what the gate prices rather
+than whether it bets. One line of cost model, not a new policy.
+
+### What shipped, measured on both corpora
+
+Runnable corpus, the regime where the extension is least useful and where the
+rejected policy did its damage:
+
+      min   fires 35 -> 57   stock 20.48s   auto 7.19s   1.32x -> 2.85x
+      max   fires  0 -> 57   stock 20.33s   auto 7.17s           2.84x
+
+`min` gains 15.28s against 2.00s lost. The extra 22 fires are earned rather
+than forced: the gate makes the same bet it always did, on a cost that is now
+the cost of the plan it will run.
+
+Excluded corpus, 120 `min` queries, reducer against the fold on one binary:
+
+      114 of 120 answered, against 86 before
+      28 of the 34 with no answer from either engine, answered
+      0 answer disagreements over 85 comparisons
+      where both run: gains 207.4s, loses 28.4s
+
+And what a user actually sees, `auto` before against `auto` now:
+
+      85 queries both finish   365.4s -> 204.2s, faster on 71, slower on 14
+      29 that could not finish before, now do, median 0.964s
+      0 that could finish before and cannot now
+
+The 14 are not regressions. For twelve of them the figure measured for the
+fold *in the same session* sits within noise of the new one --
+`job_acyclic_109_08` at 48.03s against the fold's 46.95s -- which says the
+gate declined and `auto` is the stock plan, so the gap against an older run
+is the 12-36% machine drift D103 measured. The exception is
+`job_acyclic_109_91`: declined at 26.18s where this engine's fold answers in
+3.70s, which is D104's miss unchanged, and the reducer makes it sting more
+rather than causing it.
+
+Six queries still fail. Four never reach the gate at all -- the matcher
+declines them with "not a scan: PROJECTION", which predates all of this and
+is now the only thing standing between this corpus and a complete answer set.
+
+**Known headroom, unclaimed.** On `job_acyclic_109_08` this reducer takes
+3.47s where the hand-written SQL of D106 takes 0.457s. Same algorithm, 8x
+apart: row-at-a-time probing into `unordered_set` against DuckDB's vectorised
+hash joins. Nothing here is tuned, and the measurement that would say whether
+it is worth tuning has not been done.
+
+**What the episode is really about.** The reducer and its pricing are one
+line of cost model and were right. The policy stacked on top scored +301.1s
+on the excluded corpus with zero wrong answers, and was a 3x regression for
+every `min` an ordinary user runs. One corpus endorsed it, the other
+condemned it, and the only reason the right one won is that both were
+measured before anything was committed.

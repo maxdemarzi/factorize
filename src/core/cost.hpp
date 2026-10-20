@@ -298,6 +298,16 @@ struct CostThresholds {
 	//! it would have anyway. That this also saved the machine was a misreading
 	//! -- stock DuckDB and the fallback both fill DuckDB's limit on it (D43).
 	double memory_slack = 8.0;
+	//! Price this as a semijoin reducer rather than as an f-representation.
+	//!
+	//! Set by the rule when the region is an ungrouped MIN or MAX over a graph
+	//! `ReducibleByExtremeReduction` accepts. A reducer builds no
+	//! representation: its cost is its inputs and nothing else, and its memory
+	//! is a set of distinct keys per relation rather than a representation of
+	//! the join. Without this the gate prices the fold it is not going to run
+	//! and declines queries a reducer answers in milliseconds -- 23 of the 24
+	//! slowest on the excluded corpus (D106).
+	bool reduce_extremes = false;
 	//! Refuse cyclic join graphs.
 	bool require_acyclic = true;
 	//! Decline when the work DuckDB is predicted to do -- its per-row and

@@ -314,14 +314,37 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			                           abandon_after_ms, min_rate, second_key);
 			factorize::SetGlobalStepDetail(explain_steps);
 			SharedRelations source(client, relations);
-			auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT, group_keys,
-			                                        aggregates);
-			if (!result.ok) {
-				throw InvalidInputException("factorize: %s", result.error);
+			// A MIN or MAX over an acyclic join does not need the join. The
+			// reducer reads the inputs and nothing else, which on the excluded
+			// corpus is the difference between a median 0.069s and not
+			// finishing at all (D106). Falls through when the graph is not a
+			// shape it can promise, so the fold still answers everything.
+			if (reduce_extremes && IsUngroupedExtreme() && factorize::ReducibleByExtremeReduction(graph)) {
+				const auto extreme =
+				    factorize::ExecuteExtremeReduced(graph, source, aggregates[0].relation, aggregates[0].column,
+				                                     aggregates[0].kind == factorize::Aggregate::MIN);
+				if (!extreme.ok) {
+					throw InvalidInputException("factorize: %s", extreme.error);
+				}
+				auto groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>();
+				if (extreme.any) {
+					// One group, no keys: the ungrouped shape. An empty join
+					// leaves none, and the path below turns that into the NULL
+					// SQL asks for.
+					groups->push_back({{}, {extreme.value}});
+					gstate.counts = {1};
+				}
+				gstate.groups = std::move(groups);
+			} else {
+				auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
+				                                        group_keys, aggregates);
+				if (!result.ok) {
+					throw InvalidInputException("factorize: %s", result.error);
+				}
+				gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(
+				    std::move(result.groups));
+				gstate.counts = std::move(result.counts);
 			}
-			gstate.groups =
-			    make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(std::move(result.groups));
-			gstate.counts = std::move(result.counts);
 		}
 	}
 

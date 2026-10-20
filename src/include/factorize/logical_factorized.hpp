@@ -90,6 +90,7 @@ public:
 	//! Be a parallel source even while carrying the fallback; off (D54a).
 	bool parallel_fallback = false;
 	//! Print what each materialized join left behind, for factorize_explain.
+	bool reduce_extremes = true;
 	bool explain_steps = false;
 	//! The join order, decided when the region was matched. Ordering at match
 	//! time is what lets an unorderable graph be a decline instead of a query
