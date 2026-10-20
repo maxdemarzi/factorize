@@ -144,6 +144,71 @@ AttributeId ShallowestEquivalent(EquivalenceClasses &classes, const FTree &tree,
 //! recursive calls per tree level.
 static constexpr size_t kMaxRelations = 500;
 
+bool IsAcyclic(const QueryGraph &graph) {
+	if (graph.predicates.empty()) {
+		return true;
+	}
+	// A predicate naming a relation the graph does not have would index past
+	// `edges`. BuildPlan reports that shape as an error rather than trusting
+	// it, and this is a public entry point, so the malformed graph answers
+	// "not provably acyclic" -- the direction that declines and leaves the
+	// stock plan to it, rather than crashing or guessing.
+	for (const auto &predicate : graph.predicates) {
+		if (predicate.left_relation >= graph.RelationCount() || predicate.right_relation >= graph.RelationCount()) {
+			return false;
+		}
+	}
+	EquivalenceClasses classes(graph);
+	// Hyperedges over join variables only. A column no predicate touches sits
+	// in exactly one hyperedge, so GYO's first rule would strip it anyway.
+	std::vector<std::set<size_t>> edges(graph.RelationCount());
+	for (const auto &predicate : graph.predicates) {
+		edges[predicate.left_relation].insert(
+		    classes.Find(AttributeOf(graph, predicate.left_relation, static_cast<size_t>(predicate.left_column))));
+		edges[predicate.right_relation].insert(
+		    classes.Find(AttributeOf(graph, predicate.right_relation, static_cast<size_t>(predicate.right_column))));
+	}
+	std::vector<std::set<size_t>> live;
+	for (auto &edge : edges) {
+		if (!edge.empty()) {
+			live.push_back(std::move(edge));
+		}
+	}
+	for (bool changed = true; changed && !live.empty();) {
+		changed = false;
+		std::map<size_t, size_t> occurrences;
+		for (const auto &edge : live) {
+			for (const auto vertex : edge) {
+				occurrences[vertex]++;
+			}
+		}
+		for (auto &edge : live) {
+			for (auto it = edge.begin(); it != edge.end();) {
+				if (occurrences[*it] == 1) {
+					it = edge.erase(it);
+					changed = true;
+				} else {
+					++it;
+				}
+			}
+		}
+		live.erase(std::remove_if(live.begin(), live.end(), [](const std::set<size_t> &edge) { return edge.empty(); }),
+		           live.end());
+		for (size_t i = 0; i < live.size(); i++) {
+			bool contained = false;
+			for (size_t j = 0; j < live.size() && !contained; j++) {
+				contained = i != j && std::includes(live[j].begin(), live[j].end(), live[i].begin(), live[i].end());
+			}
+			if (contained) {
+				live.erase(live.begin() + static_cast<std::ptrdiff_t>(i));
+				changed = true;
+				break;
+			}
+		}
+	}
+	return live.empty();
+}
+
 Plan BuildPlan(const QueryGraph &graph) {
 	if (graph.RelationCount() > kMaxRelations) {
 		Plan plan;

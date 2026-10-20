@@ -1,0 +1,108 @@
+# name: test/sql/factorized_cyclic.test
+# description: auto declines cyclic join graphs, and every mode answers them correctly
+# group: [sql]
+
+require factorize
+
+# The gate was documented as refusing cyclic queries outright -- cost.hpp's
+# `require_acyclic`, "the paper reports them 32% slower". It did not: the
+# optimizer rule passed `acyclic` as a hardcoded true, on the argument that
+# BuildPlan had already refused anything that cannot be arranged as a tree.
+# BuildPlan had not. Over the 758 cyclic CE queries it accepts 8, answers
+# every one correctly, and takes 15.157s against stock's 0.620s doing it --
+# 24x, and 48x on the worst of them (D105).
+#
+# Both halves are asserted here because only one was ever broken: the answers
+# were right throughout, and the plan choice was not.
+#
+# What this file cannot assert is the gate's *reason*. `factorize_explain`
+# prints it to the console rather than into a result set, and on tables this
+# small the cost checks would decline the cycle anyway -- so a decline here is
+# necessary but not sufficient evidence. The exact test lives in
+# test/unit/test_plan.cpp (TestAcyclicityIsDecidedByGYO, whose load-bearing
+# case is a four-cycle BuildPlan completes and IsAcyclic refuses), and the
+# behavioural evidence is the corpus going from 8 fires to 0.
+
+statement ok
+CREATE TABLE a AS SELECT * FROM (VALUES (1,10),(1,11),(2,11)) t(s,d);
+
+statement ok
+CREATE TABLE b AS SELECT * FROM (VALUES (1,20),(1,21),(2,21)) t(s,d);
+
+statement ok
+CREATE TABLE c AS SELECT * FROM (VALUES (10,30),(11,31),(11,30)) t(s,d);
+
+statement ok
+CREATE TABLE d AS SELECT * FROM (VALUES (20,30),(21,31),(20,31)) t(s,d);
+
+statement ok
+CREATE TABLE e AS SELECT * FROM (VALUES (1,10),(1,11),(2,11)) t(s,d);
+
+# The floors are what would otherwise decline every query on nine rows, and
+# they hide the distinction this file is about.
+statement ok
+SET factorize_min_work_ms = 0;
+
+statement ok
+SET factorize_min_gain = 0;
+
+# a.s = b.s, a.d = c.s, b.d = d.s, c.d = d.d -- the shape of dblp_cyclic_q2_07,
+# one of the 8 BuildPlan accepts. Not the triangle: BuildPlan refuses that one
+# structurally, which is why the triangle never exposed the defect.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM a, b, c, d WHERE a.s = b.s AND a.d = c.s AND b.d = d.s AND c.d = d.d;
+----
+5
+
+statement ok
+SET factorize_mode = 'auto';
+
+query I
+SELECT count(*) FROM a, b, c, d WHERE a.s = b.s AND a.d = c.s AND b.d = d.s AND c.d = d.d;
+----
+5
+
+query II
+EXPLAIN SELECT count(*) FROM a, b, c, d WHERE a.s = b.s AND a.d = c.s AND b.d = d.s AND c.d = d.d;
+----
+physical_plan	<!REGEX>:.*FACTORIZED.*
+
+# An acyclic query over the same tables must still be taken over, or the
+# refusal is just the rule switching itself off.
+query I
+SELECT count(*) FROM a, b, c WHERE a.s = b.s AND a.d = c.s;
+----
+8
+
+query II
+EXPLAIN SELECT count(*) FROM a, b, c WHERE a.s = b.s AND a.d = c.s;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# Two relations joined on two columns have as many predicates as relations and
+# are acyclic. Counting edges calls that a cycle; D28 found the planner doing
+# exactly that to composite keys, and src/bench/standalone.cpp carried the same
+# heuristic until D105. Pinned here so the hypergraph reading cannot regress to
+# an edge count.
+query I
+SELECT count(*) FROM a, e WHERE a.s = e.s AND a.d = e.d;
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM a, e WHERE a.s = e.s AND a.d = e.d;
+----
+physical_plan	<REGEX>:.*FACTORIZED.*
+
+# force means force: it bypasses the gate, so it still factorizes the cycle,
+# and must still produce the right answer while doing so.
+statement ok
+SET factorize_mode = 'force';
+
+query I
+SELECT count(*) FROM a, b, c, d WHERE a.s = b.s AND a.d = c.s AND b.d = d.s AND c.d = d.d;
+----
+5

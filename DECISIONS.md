@@ -6869,6 +6869,187 @@ one of the two where engine throughput is on the critical path and therefore
 the only one where engine optimisation registers.
 
 **This also relocates the next question.** The 24 queries at 1.02x and 342s
-are where this corpus spends its time, and we neither help nor hurt them. Any
-future performance work on the excluded corpus has to start there, and it is
-an I/O and spill question rather than a representation-layout one.
+are where this corpus spends its time. *Corrected in D104: they are 1.02x
+because the gate declined on 23 of them, so `auto` is stock DuckDB there and
+those timings describe neither this engine nor a tie between two plans. The
+sentence above read as though both plans ran; only one did.*
+## D104 — The declines on the excluded corpus are right, 22 times out of 23, and the exception is D98 running backwards
+
+D103 put 94% of our time on the excluded corpus -- 342s of 365s -- in 24
+queries running at 1.02x against stock, and read that as both plans doing the
+same dominant work. The `fired` column, in the same file, says the gate
+declined on 23 of the 24. `auto` *is* stock there. Those timings were never
+about this engine, and reading a ratio of 1.02x as a tie was reading a number
+that could not have been anything else.
+
+The question that actually sat behind them had never been asked: **is the
+gate right to decline?** 340s is a large thing to leave unexamined on the
+argument that it looks like a tie.
+
+### Forced against stock, all 23, same session
+
+                 off 355.13s   force 354.28s   1.002x
+                 answers agree 23/23
+
+      force wins by >5%      7 queries   +24.83s
+      force loses by >5%    10 queries   -23.96s
+      within noise           6 queries
+                                        net +0.87s
+
+Firing all 23 is a wash. **The gate is reading this corpus correctly**, which
+is the opposite of what D100 found on the runnable corpus, and the reason the
+two differ is worth stating: the runnable queries are small enough that the
+gate's fixed overheads dominate its decision, and these are not.
+
+Both modes are timed adjacent in one session because D103 showed this machine
+drifts 12-36% between runs. Answers are compared, not just clocks.
+
+### Except one, and it is the mirror of D98
+
+    job_acyclic_109_91     off 22.45s   force 3.41s   6.58x   +19.04s
+
+Repeated three times: off 22.61 / 26.18 / 22.19s, force 3.63 / 3.47 / 3.35s,
+answer 106 every time. It is real, and it is larger than the whole net --
+without it, firing the other 22 loses 18.2s.
+
+Asking the gate why:
+
+    gate predicted: ... flat 5.924e+06 ours 625.6ms duckdb 354.7ms
+    declined: gate says no: predicted 626ms against DuckDB's 355ms
+
+DuckDB took 22,446ms, not 355ms -- 63x. The prediction is proportional to the
+predicted flat result, and the published size of this query is
+**8,583,847,812** tuples against the 5.924e6 the gate assumed: a 1,449x
+underestimate.
+
+D98 explained the fires: the gate fires where the alternative's cost was most
+*over*estimated, because the prediction is proportional to a result size
+whose error is one-sided in the queries that clear the margin. This is the
+same mechanism with the sign flipped -- it declines where that cost was most
+*under*estimated. One estimator, two failure modes, and the second was
+invisible for as long as nobody ran a declined query forced.
+
+**What this does not license.** Twenty-two of these declines are correct, and
+seven of the ten losses are larger than the six wins outside `109_91`. The
+finding is not "decline less". It is that a single estimate off by three
+orders of magnitude costs 19s on one query, and that the gate has no way to
+notice, because nothing downstream ever compares its prediction to what
+happened.
+
+## D105 — The cyclic half of the corpus, measured at last, and the guard against it was never connected
+
+D96 set C aside as "no evidence available": measuring cyclic queries "needs
+the FactDB query files that are not checked out here". They are checked out,
+at `../FactDB/bench/ce/queries`, and D1 permits reading benchmark query
+files. 39 cyclic files hold 760 live queries across dblp, epinions, watdiv
+and yago. hetio's are commented out in the benchmark itself, as are 601
+acyclic ones -- the corpus's own convention, not something applied here. The
+blocker was never the licence or the data. Nobody looked in the directory.
+
+**Two tools had to exist first.** `tmp/ce_runnable_sql.psv`, which nearly
+every measurement script reads, had no generator in the repo; it was made by
+hand and the cyclic half was never converted. `scripts/ce-to-sql-psv.py` is
+that generator, and it was validated by regenerating the acyclic side:
+all 119 runnable queries reproduced, identical SQL modulo keyword case,
+identical published sizes. 758 of the 760 cyclic queries run against `ce.db`
+as loaded; two want `dblp4`/`dblp10`, which are absent.
+
+The filenames were not trusted either, because D28 had already found the
+label unreliable in one direction. `scripts/classify-acyclicity.py` decides
+alpha-acyclicity by GYO reduction and agrees with the corpus exactly:
+**758/758 cyclic, 1830/1830 acyclic.**
+
+### What the measurement found
+
+    758 queries, 30s cap, three modes
+      auto vs off answer disagreements      0
+      force vs off answer disagreements     0
+      off vs published result size          0 mismatches
+
+Correctness is intact and always was. The plan choice was not:
+
+    the 8 the gate fired on        off      auto    ratio
+    watdiv_cyclic_q3_09          0.156     7.457    0.02x
+    watdiv_cyclic_q2_14          0.116     4.137    0.03x
+    yago_cyclic_Petal_9_26       0.067     2.448    0.03x
+    watdiv_cyclic_q2_24          0.111     0.671    0.16x
+    watdiv_cyclic_q2_02          0.055     0.271    0.20x
+    epinions_cyclic_q10_23       0.045     0.079    0.57x
+    epinions_cyclic_q10_42       0.037     0.053    0.69x
+    watdiv_cyclic_q3_04          0.034     0.042    0.82x
+    TOTAL                        0.620    15.157    0.04x
+
+Every one slower, 24x in aggregate and 48x at worst, in the mode a user gets
+by default. Across the whole cyclic corpus `auto` ran at 0.864x against
+stock, and all of that deficit is these 8.
+
+### Why, and it is not what the comments said
+
+`cost.hpp` describes `require_acyclic` as refusing cyclic graphs outright --
+"the paper reports them 32% slower". That threshold was never reached on the
+DuckDB path: `optimizer_rule.cpp` called `EstimateCost` with `acyclic`
+hardcoded to `true`, annotated "BuildPlan has already refused anything that
+cannot be arranged as a tree."
+
+BuildPlan had not. It refuses a triangle -- which is why the existing unit
+test, written against a triangle, passed throughout -- but accepts a
+four-cycle like `dblp_cyclic_q2_07`, computes it, and gets the right answer
+300x slower than stock. The guard that was documented was dead, and the
+guard that was credited with the work does something else.
+
+`QueryGraph::cyclic` has existed since the first planner, documented for
+exactly this, and nothing on the DuckDB path ever set it.
+
+Three places described the behaviour and none implemented it: the field, the
+threshold, and README's own list of what the rule declines -- "outer joins,
+non-integer keys, cyclic join graphs, computed join keys -- is declined
+silently and answered by the stock plan". That sentence is true as of this
+entry and was not before it. A claim repeated in three files is not evidence
+that anything checks it, and nothing here did until the corpus was run.
+
+### The fix
+
+`IsAcyclic` (`src/core/plan.cpp`) decides alpha-acyclicity by GYO over the
+engine's own equivalence classes, and both `EstimateCost` call sites pass it.
+Counting edges is not this test: two relations joined on two columns have as
+many predicates as relations and are acyclic, which is what D28 found the
+planner getting wrong about composite keys. `src/bench/standalone.cpp` still
+carried that edge count and now uses the same function, so the engine and its
+bench harness mean one thing by the word.
+
+Cost measured rather than assumed, since it runs per candidate region: 17us
+on a 12-relation chain, 147us at 64, 14.3ms at the 500-relation cap, with
+cyclic graphs an order of magnitude cheaper because GYO stalls early.
+
+    the same 8        off      auto before   auto after
+    TOTAL           0.620         15.157         0.616
+    cyclic corpus    0.864x  ->  1.055x        0 fired (was 8)
+
+Those 8 go from 24.4x slower than stock to 1.01x -- which is to say they are
+now the stock plan, which is the whole intent. D103's lesson is applied here
+too: stock mode is the control, and it moved 0.5% between the two runs (59.8s
+to 60.1s), so for once the before and after are directly comparable.
+
+**What refusing gives up, stated rather than hidden.** 49 cyclic queries
+exist where `force` beats stock, worth 5.26s in total. A blanket refusal
+forgoes all of it to avoid 14.5s of measured loss. That is the right trade at
+this ratio and it is still a trade; forcing the whole cyclic corpus costs
+129.4s against stock's 59.8s, so there is no version of "fire more here" that
+pays.
+
+### The regression check that mattered more than the fix
+
+A false `cyclic` verdict would silently stop the engine firing and cost the
+2.39x, and it would not show up as a failing test anywhere. Re-measuring the
+runnable corpus against the new binary:
+
+      fires before 36, after 36 -- the identical set, nothing added, nothing lost
+      per-query auto time, after / (before x stock drift): median 1.011
+
+Stock drifted 5.7% between the runs and the residual 0.5s is 65% concentrated
+in three queries with others faster, which is noise; `IsAcyclic` costs 17us a
+query and cannot produce half a second across 119 of them.
+
+Validated: 113 core checks and 999 SQL assertions over 7 cases, 0 failures,
+asan+ubsan clean; 200 fuzzer queries, 0 disagreements, 56 taken over; the
+cyclic corpus re-measured end to end at 0 fires and 0 disagreements.

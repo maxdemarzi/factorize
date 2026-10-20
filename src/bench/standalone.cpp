@@ -225,8 +225,15 @@ static std::vector<Query> ParseQueryFile(const std::string &path) {
 			query.predicates.push_back(predicate);
 		}
 
-		// A connected graph with more edges than n-1 has a cycle.
-		query.cyclic = query.predicates.size() >= query.tables.size();
+		// Was `predicates.size() >= tables.size()`, on the reasoning that a
+		// connected graph with more than n-1 edges has a cycle. That counts a
+		// graph where the object is a hypergraph: two relations joined on two
+		// columns have as many predicates as relations and are acyclic, and so
+		// is a star whose three predicates name one equivalence class. D28
+		// found the planner making the same mistake and stopped it there; this
+		// copy outlived it. GYO decides it exactly, and the engine and its
+		// bench harness now mean the same thing by the word.
+		query.cyclic = !IsAcyclic(query.Graph());
 		if (!query.tables.empty()) {
 			queries.push_back(std::move(query));
 		}

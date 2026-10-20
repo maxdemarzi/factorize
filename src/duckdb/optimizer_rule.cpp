@@ -1511,8 +1511,15 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// The operator's IsPlainCount, restated: only then is the last join fused.
 	thresholds.last_join_fused =
 	    !region.grouped && region.aggregates.size() == 1 && region.aggregates[0].kind == factorize::Aggregate::COUNT;
-	// BuildPlan has already refused anything that cannot be arranged as a tree.
-	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
+	// This used to pass `true` unconditionally, on the argument that BuildPlan
+	// had already refused anything that cannot be arranged as a tree. It had
+	// not: of the 758 cyclic CE queries, BuildPlan accepts 8, answers every
+	// one correctly, and spends 24x stock's time doing it -- 0.620s against
+	// 15.157s, the worst of them 48x. `require_acyclic` was written to refuse
+	// exactly those and was dead on this path for as long as the hardcoded
+	// argument stood (D105).
+	const bool acyclic = factorize::IsAcyclic(graph);
+	const auto estimate = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), acyclic, thresholds);
 	reason = estimate.reason;
 	predicted_bytes = estimate.bytes;
 	predicted_flat = estimate.flat_tuples;
@@ -1600,7 +1607,7 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 		return false;
 	}
 	stats.UseCatalogOnly();
-	const auto fallback = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), true, thresholds);
+	const auto fallback = factorize::EstimateCost(factorize::BuildCostSteps(graph, plan, stats), acyclic, thresholds);
 	if (!fallback.fire) {
 		return false;
 	}

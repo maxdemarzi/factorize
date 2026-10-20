@@ -129,6 +129,33 @@ struct Plan {
 //! disconnected graph, which this refuses rather than turning into a product.
 Plan BuildPlan(const QueryGraph &graph);
 
+//! Whether the join hypergraph is alpha-acyclic, by GYO reduction.
+//!
+//! `QueryGraph::cyclic` has existed since the first planner and nothing on the
+//! DuckDB path has ever set it: the optimizer rule calls EstimateCost with
+//! `acyclic` hardcoded true, on the argument that BuildPlan has already
+//! refused anything that cannot be arranged as a tree. Measured against the
+//! 758 cyclic CE queries, that argument is wrong for 8 of them -- BuildPlan
+//! accepts them, answers them correctly, and takes 24x longer than stock
+//! doing it (D105).
+//!
+//! Counting edges against relations is not this test. A doubled edge between
+//! two relations gives as many predicates as relations and is acyclic, which
+//! is what D28 found when the planner was refusing composite keys as cyclic;
+//! `src/bench/standalone.cpp` still carries that heuristic. The hypergraph is
+//! the right object: vertices are equivalence classes of joined attributes,
+//! hyperedges are relations, and GYO removes an ear -- a vertex in exactly one
+//! hyperedge, or a hyperedge contained in another -- until nothing can be
+//! removed. Alpha-acyclic exactly when nothing is left.
+//!
+//! This runs on every candidate region, and the containment scan restarts
+//! after each removal, so the cost was measured rather than argued: 17us on a
+//! 12-relation chain, 147us at 64, and 14.3ms at `kMaxRelations`. Cyclic
+//! graphs are an order of magnitude cheaper, since GYO stalls early. The
+//! realistic end of that range is free, and the far end belongs to a query
+//! whose planning dominates it either way.
+bool IsAcyclic(const QueryGraph &graph);
+
 //! Supplies relation data on demand.
 //!
 //! Materializing every relation up front would defeat the point on the queries

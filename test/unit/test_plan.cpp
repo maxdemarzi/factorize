@@ -273,6 +273,64 @@ static void TestRedundantStarAccepted() {
 	Expect(plan.complete, "star with a redundant predicate: BuildPlan must complete");
 }
 
+//! IsAcyclic is a different question from "does BuildPlan complete", and the
+//! gap between them is the defect it exists for.
+//!
+//! The four-relation cycle below is the shape of `dblp_cyclic_q2_07`, one of
+//! the 8 cyclic CE queries BuildPlan accepts. It answers correctly and takes
+//! 23.2s against stock's 0.076s -- 300x -- so "BuildPlan refused it" was never
+//! what kept cyclic queries out, and the gate had nothing else (D105). The
+//! case that matters here is therefore the one where the two disagree:
+//! BuildPlan completes and IsAcyclic still says cyclic.
+static void TestAcyclicityIsDecidedByGYO() {
+	Group scope("IsAcyclic decides alpha-acyclicity, including where BuildPlan completes");
+
+	auto two_columns = [](size_t relations) {
+		QueryGraph graph;
+		graph.column_counts.assign(relations, 2);
+		graph.column_types.assign(relations, {ValueType::INT32, ValueType::INT32});
+		return graph;
+	};
+
+	QueryGraph chain = two_columns(3);
+	chain.predicates = {Predicate {0, 1, 1, 0}, Predicate {1, 1, 2, 0}};
+	Expect(IsAcyclic(chain), "a chain is acyclic");
+
+	QueryGraph triangle = two_columns(3);
+	triangle.predicates = {Predicate {0, 1, 1, 0}, Predicate {1, 1, 2, 0}, Predicate {2, 1, 0, 0}};
+	Expect(!IsAcyclic(triangle), "a triangle is cyclic");
+
+	// Two relations, two predicates: as many edges as relations, and acyclic.
+	// An edge count calls this cyclic, which is what D28 found the planner
+	// doing to composite-key joins and what src/bench/standalone.cpp still does.
+	QueryGraph doubled = two_columns(2);
+	doubled.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 1, 1, 1}};
+	Expect(IsAcyclic(doubled), "a doubled edge between two relations is acyclic");
+
+	QueryGraph star;
+	star.column_counts = {1, 1, 1};
+	star.column_types = {{ValueType::INT32}, {ValueType::INT32}, {ValueType::INT32}};
+	star.predicates = {Predicate {0, 0, 1, 0}, Predicate {1, 0, 2, 0}, Predicate {0, 0, 2, 0}};
+	Expect(IsAcyclic(star), "one equivalence class named three times is acyclic");
+
+	// a.s = b.s, a.d = c.s, b.d = d.s, c.d = d.d
+	QueryGraph square = two_columns(4);
+	square.predicates = {Predicate {0, 0, 1, 0}, Predicate {0, 1, 2, 0}, Predicate {1, 1, 3, 0},
+	                     Predicate {2, 1, 3, 1}};
+	Expect(!IsAcyclic(square), "a four-cycle is cyclic");
+	Expect(BuildPlan(square).complete, "a four-cycle is nonetheless accepted by BuildPlan");
+
+	QueryGraph alone = two_columns(1);
+	Expect(IsAcyclic(alone), "a graph with no predicates is acyclic");
+
+	// Public entry point, so a graph that indexes past its own relations has to
+	// be answered rather than trusted: "not provably acyclic" declines, which
+	// is the direction that leaves the stock plan to it.
+	QueryGraph malformed = two_columns(2);
+	malformed.predicates = {Predicate {0, 0, 7, 0}};
+	Expect(!IsAcyclic(malformed), "a predicate naming a relation the graph lacks is refused, not indexed");
+}
+
 //! Slicing has to be exact, not approximate: the count assembled from N
 //! partitions must equal the count taken whole, for every N. Every output tuple
 //! assigns one value to the sliced attribute, so bucketing on that value cuts
@@ -915,6 +973,8 @@ int main() {
 	TestCyclicGraphRejected();
 	std::printf("\n");
 	TestRedundantStarAccepted();
+	std::printf("\n");
+	TestAcyclicityIsDecidedByGYO();
 	std::printf("\n");
 	TestSlicingIsExact();
 	std::printf("\n");
