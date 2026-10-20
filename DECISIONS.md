@@ -7139,3 +7139,87 @@ Nothing is implemented here. This entry is the measurement that says a
 reducer is worth building, and `scripts/semijoin-rewrite.py` is the rewrite
 it was measured with. Yannakakis is 1981 textbook material, so building it
 raises no question under D1.
+
+## D107 — Shape is a better key than tables and still changes nothing, which is the third time
+
+D75 built runtime calibration keyed on tables, measured it doing nothing, and
+named its own successor: "keyed on the join shape rather than the tables".
+This tests that, and the headline is that the suggestion is wrong twice over
+-- shape alone is *worse* than tables, and the combination that does beat
+tables still fails the only test that matters.
+
+**The dataset is better than D75 could build.** Ground truth comes from the
+corpus's published result sizes rather than from queries this engine
+finished. D75 could only learn from what completed, which is the small end;
+published sizes cover queries nobody can run. 1938 acyclic queries priced by
+the gate, **592 of them over 1e9**, which is where D104 found the estimator
+1,449x low and is precisely the range a finished-query store cannot see. The
+raw error is enormous: log(actual/predicted) has a spread of x79.
+
+Every key scored leave-one-out, so no query informs its own correction.
+
+    key                                groups   variance explained   residual
+    per table (D75 reproduced)            269                  39%      x30.5
+    table set                            1858                   2%      x75.3
+    dataset                                 6                  32%      x37.2
+    relation count                          8                  15%      x55.9
+    class degrees                          31                  22%      x47.8
+    class + relation degrees               31                  22%      x47.8
+    predicted magnitude (decade)           17                  17%      x53.3
+    dataset x shape                        93                  60%      x15.7
+    dataset x magnitude                    61                  60%      x16.0
+    dataset x shape x magnitude           439                  59%      x16.2
+
+**Shape on its own explains 22% where the tables explain 39%.** What reaches
+60% is shape *within a dataset* -- and `dataset x magnitude` reaches the same
+60% with no shape analysis at all, just the dataset and which decade the
+estimate already sits in. Adding shape to magnitude makes it worse. Three
+different keys stop at the same 60% and the same x16, which is the signature
+of a ceiling rather than of a feature that needs refining.
+
+### The test that matters, which is not variance explained
+
+A model can halve the residual and move nothing, because the decision turns
+on whether one predicted time clears another by 1.5x and most queries are
+nowhere near that line. So the decisions were replayed, leave-one-out, and
+each change scored against what the corpus actually measured.
+
+The replay reproduces 118 of the 119 real decisions when the correction is
+zero -- the one exception is declined on memory rather than on the margin --
+so it is modelling the gate and not something else.
+
+    key            changes   better   worse   net     seconds
+    dataset x shape     28       14      14    +0      -45.8
+    dataset x magnitude 20        9      11    -2       -2.7
+    per table            1        0       1    -1       -0.2
+
+Fourteen against fourteen. The seconds are worse than the count: the shape
+correction newly fires `yago_acyclic_Chain_9_73`, which stock answers in
+1.345s and this engine takes 45.392s over -- one 34x loss that outweighs
+every gain. And the per-table row reproduces D75's finding almost exactly:
+one decision changes, in the wrong direction.
+
+### What three failures in a row say
+
+D73 tried four plan-time features. D75 tried per-table history. This tried
+join shape, magnitude, and their combinations, on ten times the data and
+across the whole range of result sizes. Every one explains some variance and
+none of them moves a decision the right way.
+
+They were all asking the same question -- *what kind of query is this?* -- and
+the answer keeps being that the error does not live in the kind. It lives in
+how particular values in particular columns happen to combine, which is a
+property of the data and not of the query's shape, size, tables or dataset.
+A grouping cannot reach it, because every grouping averages exactly the
+variation that carries the signal.
+
+So the direction is not a better key. It is either measuring instead of
+predicting -- sampling the join, or starting a plan and abandoning it when it
+exceeds what was predicted, which `factorize_abandon_after_ms` already has
+the shape of -- or **not needing the prediction**. D106 is the second kind
+and is why it is worth more than this: a semijoin reducer is O(input)
+whatever the join size, so for MIN and MAX the estimate the gate keeps
+getting wrong stops being on the critical path at all.
+
+`factorize_learn_cardinality` stays off and stays table-keyed. Nothing here
+earns a change to it, and the plumbing is still the expensive part.
