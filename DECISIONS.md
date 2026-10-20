@@ -7567,3 +7567,61 @@ Six of the nine did not become fires: they reach the gate now and are
 declined on cost, which is the gate's business and D104's problem, not the
 matcher's. `dblp_acyclic_211_14` is one of them -- 328ms predicted against
 335ms, then 64s of stock.
+
+## D112 — The gap is not the copy, and the source change pays in memory instead
+
+D109 attributed the reducer's remaining distance from D106's hand-written SQL
+to `RelationSource` materialising whole relations, and called closing it an
+interface change. Measured, both halves of that are wrong.
+
+**Re-measured adjacent, because both figures were stale:**
+
+    job_acyclic_109_08   ours 0.768s   DuckDB's EXISTS plan 0.503s   1.53x
+    job_acyclic_109_33        0.966s                        0.413s   2.34x
+    dblp_acyclic_211_15       0.960s                        0.318s   3.01x
+
+The gap is real and ranges 1.5x to 3x rather than being one number.
+
+**The copy is not it.** `SharedRelations` reads every relation in its
+constructor and copies each out of the scan buffer, which buys re-reads
+across threads and slices. The reducer wants neither: it visits each relation
+once, in order, and keeps only a set of surviving keys, so `StorageSource`'s
+one-relation-at-a-time buffer is exactly its access pattern. Switching to it:
+
+    0.768s -> 0.802s     0.966s -> 0.963s     0.960s -> 0.950s
+
+Nothing, within noise. The hypothesis was wrong.
+
+**It pays somewhere that was not predicted.** Peak RSS on
+`job_acyclic_109_08` goes 370,084 KB to 292,840 KB -- **21% less memory** --
+because SharedRelations holds every relation at once and StorageSource holds
+one. On the corpus that produced 16GB of spill files in a single run that is
+worth having, so the change stays, on the evidence that justifies it rather
+than the evidence that motivated it.
+
+**Where the gap actually is.** The profile after the key set (D109) is a
+different shape:
+
+    before             after
+    43.2% allocator    0.5% allocator
+    17.3% reducer      42.6% reducer (its probing now inlined into it)
+    5.45G Ir total     3.25G Ir total
+
+What remains is `ExecuteExtremeReduced` at 42.6% against DuckDB's vectorised
+hash joins doing the same work, plus 26.8% in `AppendChunk`/`AppendTyped`
+building the int64 vectors it reads. A scalar row-at-a-time probe loop
+against vectorised execution -- which is E, the packed-layout idea D96 ranked
+first and D102 killed for the f-representation path, arriving again by
+another road. That it keeps reappearing is not evidence it is worth more this
+time.
+
+Excluded corpus unchanged at 117 of 120 answered, 85 of 85 answers agreeing.
+
+**A note on how this entry nearly went missing.** The append that should have
+written it was chained behind `&&` after a command whose last stage was
+`grep -c`, which exits non-zero when it counts zero -- so the write never
+ran, while the `echo` confirming it was a separate statement and ran anyway.
+A success message for an action that did not happen, which is the same defect
+D96's patch script had and the same `&&` trap that silently skipped two
+check-runs earlier in this session. The checks were re-run one per statement;
+this entry exists because the file was read back rather than trusted.
