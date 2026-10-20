@@ -294,7 +294,7 @@ CostEstimate EstimateCost(const std::vector<CostStep> &steps, bool acyclic, cons
 	// A reducer reads the inputs and keeps a set of keys per relation; it
 	// never forms a record of the join, so the per-output term is zero and so
 	// is the representation it would otherwise be charged for.
-	estimate.ours_ms = thresholds.reduce_extremes ? thresholds.ours.Estimate(input_rows, 0)
+	estimate.ours_ms = thresholds.reduce_extremes ? thresholds.reduce.Estimate(input_rows, 0)
 	                                              : thresholds.ours.Estimate(input_rows, estimate.factorized_records);
 	estimate.duckdb_ms = thresholds.duckdb.Estimate(input_rows, estimate.flat_tuples);
 

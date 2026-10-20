@@ -163,6 +163,26 @@ struct FactorizedRegion {
 	idx_t limit = 0;
 };
 
+//! Whether an expression is DuckDB's compressed-materialization pass.
+//!
+//! It narrows an integer column before an operator and widens it again after,
+//! so the pair shows up as `__internal_compress_integral_*` and
+//! `__internal_decompress_integral_*`. Both prefixes, because the decompress
+//! half does not start with the compress half's name and checking only one
+//! catches only one end of the pair.
+static bool IsCompressedMaterialization(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	const auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+	return StringUtil::StartsWith(name, "__internal_compress") || StringUtil::StartsWith(name, "__internal_decompress");
+}
+
+//! The one decline both sites give for it, so they cannot drift apart.
+static const char *const kCompressedMaterializationDecline =
+    "compressed materialization is in the way; "
+    "SET disabled_optimizers='compressed_materialization' to factorize this";
+
 //! Records why a subtree was turned down and declines it. Always returns false,
 //! so every rejection site reads as `return Decline(region, "...")` where
 //! stopping is required, and as a bare `Decline(region, "...")` beside a
@@ -202,6 +222,33 @@ static bool MatchLeaf(LogicalOperator &op, FactorizedRegion &region) {
 		scan = *scan->children[0];
 	}
 	if (scan->type != LogicalOperatorType::LOGICAL_GET) {
+		// Naming the operator is not a reason anyone can act on, and for one
+		// cause there is something to do about it. DuckDB's compressed
+		// materialization puts a compress/decompress pair inside the join
+		// tree, which this walk stops at -- the query contains no projection
+		// and the user has no way to guess that from "not a scan:
+		// PROJECTION". Measured over the excluded corpus it is 9 of 120
+		// declines here and 0 of 119 on the runnable one, and three of the
+		// four queries neither engine could answer at all come back in about
+		// a second with the optimizer turned off (D110).
+		if (scan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			for (const auto &expr : scan->Cast<LogicalProjection>().expressions) {
+				if (IsCompressedMaterialization(*expr)) {
+					return Decline(region, kCompressedMaterializationDecline);
+				}
+			}
+			// Naming the function is not always possible: compressed
+			// materialization also leaves projections of plain column
+			// references beside the ones that carry its functions, and
+			// stopping at one of those looks like an ordinary projection.
+			// `dblp_acyclic_210_13` is such a case -- nothing here says
+			// compress, and disabling that one optimizer takes the query from
+			// no answer at all to under a second. So the hint is offered as a
+			// likely cause rather than asserted as the cause.
+			return Decline(region, "not a scan: PROJECTION. DuckDB's compressed materialization is the usual "
+			                       "reason one appears mid-join; SET disabled_optimizers="
+			                       "'compressed_materialization' to find out whether that is this one");
+		}
 		return Decline(region, "not a scan: " + LogicalOperatorToString(scan->type));
 	}
 	auto &get = scan->Cast<LogicalGet>();
@@ -361,14 +408,12 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 			// EXISTS into.
 			continue;
 		}
-		if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-		    StringUtil::StartsWith(expr->Cast<BoundFunctionExpression>().function.name, "__internal_compress")) {
+		if (IsCompressedMaterialization(*expr)) {
 			// DuckDB's compressed-materialization pass narrows the group key
 			// before an aggregate and widens it again afterwards. Reproducing
 			// that transformation here would tie this rule to the semantics of
 			// an internal function; declining says so, and names the way out.
-			Decline(region, "compressed materialization is in the way; "
-			                "SET disabled_optimizers='compressed_materialization' to factorize this");
+			Decline(region, kCompressedMaterializationDecline);
 			ok = false;
 			continue;
 		}

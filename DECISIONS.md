@@ -7422,3 +7422,79 @@ original query whatever parameters it used.
 Not attempted here. The mapping is the part that would be wrong, it lives in
 the same binding code that produced the `sum(x*y)` defect, and a wrong
 mapping there is a silently wrong answer rather than a crash.
+
+## D110 — A cost fitted for the reducer, and a decline that says what to do about it
+
+Two of D109's three residuals, taken as far as they go.
+
+### The reducer's cost, fitted instead of borrowed
+
+D108 charged the reducer `ours.per_input_row_ms`, fitted for building an
+f-representation, because nothing better existed. Timed over 76 excluded
+queries from 150K to 26M input rows:
+
+    least squares        ms = 15.6 + 3.99e-05 * rows
+    charged              2.445e-05 per row  ->  the fit is 1.63x that
+    median error         54% charged, 15% refitted
+    direction            under-predicts on 76 of 76
+
+Sixty-two of seventy-six would be noise. Seventy-six of seventy-six is a
+bias, and it is the direction that makes the gate fire a reducer it has
+under-priced.
+
+**Only the slope is taken.** These are whole-process wall clocks, so the
+15.6ms intercept carries DuckDB's process start, catalog open and planning
+beside anything this engine does, and is not the quantity `startup_ms` names.
+The slope is marginal per row and does not have that problem, so
+`reduce` keeps `ours`' startup and takes the fitted slope.
+`per_output_ms` is zero because a reducer produces no representation.
+
+    runnable corpus   min  fires 57 -> 51, 3.42x -> 3.39x, loss to stock 1.06s -> 0.75s
+                      max  fires 57 -> 51, 3.37x -> 3.53x, loss to stock 1.11s -> 0.65s
+    excluded corpus   114 of 120 answered, 28 of 34 previously unanswerable,
+                      85 of 85 answers agree with the fold
+
+Six fewer fires, the ratio unmoved, and 29% to 41% less time lost to queries
+that should not have fired. That is what pricing a plan honestly is supposed
+to do, and it is a smaller effect than the pricing error was -- 1.63x on the
+input term moves six decisions out of 119, which is its own comment on how
+little of the gate's behaviour the coefficients control next to the result
+size D107 could not predict at all.
+
+**A measurement was lost to carelessness.** The excluded-corpus effect of the
+coefficient cannot be separated from the key set's here, because both runs
+wrote `reducer_min.csv` and the intermediate was overwritten rather than
+copied aside. What survives is the pair together against the pre-key-set run,
+drift-corrected with the fold as a same-run control: 0.95x on the unchanged
+fold path against 0.91x on `auto`, so 0.96x after correction. The runnable
+corpus does isolate the coefficient, which is the only reason the paragraph
+above can say anything.
+
+### A decline nobody could act on
+
+`MatchLeaf` turned projections down with "not a scan: PROJECTION". The query
+contains no projection: it is DuckDB's compressed materialization narrowing
+an integer column mid-join-tree and widening it afterwards.
+
+    excluded min corpus   101 fired, 10 gate declines, 9 stopped here
+    runnable corpus       36 fired, 83 gate declines, 0 stopped here
+
+Three of the four excluded queries *neither engine could answer at all* come
+back in about a second with `SET
+disabled_optimizers='compressed_materialization'` -- 0.98s, 1.02s and 1.43s
+against no answer in sixty. The fourth reaches the gate once compression is
+out of the way and is declined on the margin at 328ms against 335ms, which is
+D104's estimator collapse again and not the matcher's doing.
+
+So the decline now names the cause where it can prove it, by looking for
+`__internal_compress*` and `__internal_decompress*` in the projection, and
+offers it as the usual cause where it cannot. It cannot always: compressed
+materialization leaves projections of plain column references beside the ones
+carrying its functions, and `dblp_acyclic_210_13` stops at one of those --
+nothing in it says compress, and disabling that single optimizer still takes
+the query from no answer to under a second. Both sites now share one string
+and one predicate so they cannot drift apart.
+
+Seeing through those projections properly is still not attempted, for D109's
+reason: the mapping is the part that would be wrong, and a wrong mapping
+there returns a silently wrong answer.

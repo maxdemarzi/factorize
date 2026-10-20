@@ -200,6 +200,22 @@ struct CostThresholds {
 	//! predicts 1.63x of actual at the median (pessimistic, as it must be) with
 	//! a worst case of 7.5x on a chain whose records the model over-charges.
 	EngineCost ours {0.108542, 2.445e-5, 3.961e-5};
+	//! What a reducer costs, which is not what a fold costs.
+	//!
+	//! `ours` was fitted on the f-representation path, and D108 charged the
+	//! reducer with it for want of anything better. Measured over 76 excluded
+	//! queries from 150K to 26M input rows, that under-predicts on 76 of 76 --
+	//! a bias, not noise -- by a least-squares slope of 3.99e-5 ms/row against
+	//! the 2.445e-5 it charges, and a median relative error of 54%. Refitting
+	//! the slope takes that to 15%.
+	//!
+	//! Only the slope is taken from the fit. The measurements are whole-process
+	//! wall clock, so the fitted intercept of 15.6ms carries DuckDB's process
+	//! start, catalog open and planning alongside anything this engine does,
+	//! and is not the same quantity as `startup_ms`; the slope is marginal per
+	//! row and does not have that problem. `per_output_ms` stays zero because a
+	//! reducer produces no representation -- that is the whole point of it.
+	EngineCost reduce {0.108542, 3.9887e-5, 0.0};
 	//! DuckDB's cost, fitted to sit below 25% of observed runs.
 	//!
 	//! Re-fitted twice, and it has now been wrong in both directions. The
