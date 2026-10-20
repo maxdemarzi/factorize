@@ -7325,3 +7325,100 @@ on the excluded corpus with zero wrong answers, and was a 3x regression for
 every `min` an ordinary user runs. One corpus endorsed it, the other
 condemned it, and the only reason the right one won is that both were
 measured before anything was committed.
+
+## D109 — Three residuals pulled on: one fixed, one closed, one sized
+
+D108 left three things named and unexamined. Taking them in the order the
+evidence ended up mattering.
+
+### The reducer was spending half its time in malloc
+
+`ExecuteExtremeReduced` kept its surviving keys in
+`std::unordered_set<int64_t>`, which was the obvious first choice and never
+questioned. Callgrind on `job_acyclic_109_08`:
+
+    43.2%  the allocator       _int_malloc 14.6, _int_free 9.6, malloc 7.3,
+                               malloc_consolidate 5.5, free 3.0,
+                               unlink_chunk 2.0, operator new 1.3
+     3.8%  rehash bookkeeping  _M_rehash and its prime-size arithmetic
+    17.3%  the reduction itself
+    ~24%   reading the relations out of DuckDB
+
+A node-based set allocates once per distinct key, and this reads millions of
+them. Replaced with open addressing: linear probing, power-of-two capacity,
+doubling growth, two allocations however many keys arrive. The hash is
+splitmix64's finaliser rather than libstdc++'s identity hash for `long`,
+because join keys here are dense consecutive integers and the identity hash
+clusters them into exactly the runs linear probing is worst at.
+
+    job_acyclic_109_08   force   3.47s -> 1.069s     answer unchanged
+    runnable corpus      min     2.85x -> 3.42x, max 2.84x -> 3.37x
+    excluded corpus      auto    276.9s -> 212.1s total
+
+The machine drifted 1.22x between those runs (stock 20.48s to 25.05s), which
+is why the ratios are quoted: both modes are timed in one run, so uniform
+drift cancels in `stock/auto` and does not cancel in either alone. Unadjusted
+`auto` looks 2% *slower* (7.19s to 7.32s); against the 8.77s that 1.22x drift
+predicts, it is 17% faster. The excluded total is ~37% faster read the same
+way.
+
+Correctness unchanged: 121 core checks including the 300-tree oracle, 1032
+SQL assertions, 85 of 85 corpus answers still agreeing with the fold, 0
+disagreements.
+
+113 of 120 answered rather than 114. The one that moved is
+`dblp_acyclic_211_07`, which the gate declines -- stock takes 50.28s against
+a 60s cap, so it crosses on a slow run and not on a fast one. D103's
+cap-boundary flip, with nothing of ours in it.
+
+**What is left is structural.** 24% of instructions are `AppendChunk` and
+`AppendTyped`, materialising whole relations into `int64` vectors because
+that is `RelationSource`'s contract. D106's hand-written SQL does the same
+query in 0.457s against this reducer's 1.069s, and closing that 2.3x means
+streaming rather than materialising, which is an interface change.
+
+### A bounded-downside gate rule cannot work, and "our cost is certain" was wrong
+
+D108 left open the idea that the reducer could fire on an absolute bound over
+*our* predicted cost, since our cost is one pass over the inputs while
+DuckDB's estimate is the unreliable one. Both halves of that are wrong.
+
+    query                 pred ours   actual ours   pred duckdb   actual duckdb
+    yago_Tree_6_09          362.8ms        2535ms       346.9ms            49ms
+    yago_Tree_6_49          364.7ms        1273ms       348.0ms            21ms
+    yago_Star_6_70          263.9ms        1152ms       250.7ms            51ms
+    job_109_08              429.0ms        3470ms       439.7ms         45000ms
+    job_109_91              348.5ms        3700ms       354.7ms         22000ms
+
+Every prediction on both sides lands in a 250-440ms band, for queries whose
+real DuckDB times run from 21ms to 45 seconds. **No threshold separates
+them**, because the estimate carries no information at this boundary -- which
+is D107's conclusion seen one query at a time rather than in aggregate.
+
+And our own prediction is 3 to 10x low, because the reducer is charged
+`ours.per_input_row_ms`, a coefficient fitted for building an
+f-representation. Certain and lower are different claims and only the first
+was ever argued. Making the reducer 3.2x faster narrows the gap by accident;
+a coefficient fitted for this path would close it on purpose, and has not
+been done.
+
+### The matcher's declines are one optimizer, and not the gate's fault
+
+    excluded min corpus   101 fired, 10 gate declines, 9 "not a scan"
+    runnable corpus       36 fired, 83 gate declines, 0 "not a scan"
+
+All 9 are DuckDB's own compressed materialization putting
+`__internal_compress_integral_*` and its decompress partner into the middle
+of the join tree, where `MatchLeaf` -- which sees through a FILTER and
+nothing else -- stops. Nothing in the query says projection.
+
+Four of the nine are among the six the excluded corpus still cannot answer,
+so seeing through them is worth roughly 118 of 120 rather than 114. The
+soundness argument is favourable: this engine rebuilds the query from base
+tables, so whatever compression DuckDB chose is an artefact of a plan we are
+replacing, and mapping each column back to its base column computes the
+original query whatever parameters it used.
+
+Not attempted here. The mapping is the part that would be wrong, it lives in
+the same binding code that produced the `sum(x*y)` defect, and a wrong
+mapping there is a silently wrong answer rather than a crash.

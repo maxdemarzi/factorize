@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <map>
 #include <set>
-#include <unordered_set>
 #include <stdexcept>
 
 namespace factorize {
@@ -212,6 +211,94 @@ bool IsAcyclic(const QueryGraph &graph) {
 
 namespace {
 
+//! A set of int64 keys that allocates in blocks rather than per key.
+//!
+//! `std::unordered_set<int64_t>` was the obvious first choice and callgrind
+//! priced it: on `job_acyclic_109_08`, 43.2% of the whole process's
+//! instructions were in the allocator -- `_int_malloc`, `_int_free`,
+//! `malloc_consolidate`, `unlink_chunk` -- against 17.3% in the reduction
+//! itself, plus 3.8% more in `_M_rehash` and its prime-policy arithmetic. A
+//! node-based set allocates once per distinct key and this reads millions of
+//! them.
+//!
+//! Open addressing with linear probing, power-of-two capacity, and growth by
+//! doubling: the table is two allocations however many keys arrive, and
+//! rehashing is a linear scan rather than a walk of a chain of nodes. It is
+//! also smaller -- a libstdc++ node is the key, a next pointer and the
+//! allocator's header, against nine bytes a slot here.
+class KeySet {
+public:
+	void Insert(int64_t key) {
+		if ((count_ + 1) * 10 >= capacity_ * 7) {
+			Grow();
+		}
+		size_t slot = Mix(key) & (capacity_ - 1);
+		while (used_[slot]) {
+			if (keys_[slot] == key) {
+				return;
+			}
+			slot = (slot + 1) & (capacity_ - 1);
+		}
+		used_[slot] = 1;
+		keys_[slot] = key;
+		count_++;
+	}
+
+	bool Contains(int64_t key) const {
+		if (count_ == 0) {
+			return false;
+		}
+		size_t slot = Mix(key) & (capacity_ - 1);
+		while (used_[slot]) {
+			if (keys_[slot] == key) {
+				return true;
+			}
+			slot = (slot + 1) & (capacity_ - 1);
+		}
+		return false;
+	}
+
+	bool Empty() const {
+		return count_ == 0;
+	}
+
+private:
+	//! splitmix64's finaliser. The keys are join keys: dense integers, often
+	//! consecutive, and the identity hash libstdc++ uses for `long` leaves
+	//! linear probing to deal with that clustering.
+	static uint64_t Mix(int64_t key) {
+		uint64_t x = static_cast<uint64_t>(key) + 0x9E3779B97F4A7C15ull;
+		x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+		x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+		return x ^ (x >> 31);
+	}
+
+	void Grow() {
+		const size_t wanted = capacity_ ? capacity_ * 2 : 1024;
+		std::vector<int64_t> keys(wanted);
+		std::vector<uint8_t> used(wanted, 0);
+		for (size_t i = 0; i < capacity_; i++) {
+			if (!used_[i]) {
+				continue;
+			}
+			size_t slot = Mix(keys_[i]) & (wanted - 1);
+			while (used[slot]) {
+				slot = (slot + 1) & (wanted - 1);
+			}
+			used[slot] = 1;
+			keys[slot] = keys_[i];
+		}
+		keys_.swap(keys);
+		used_.swap(used);
+		capacity_ = wanted;
+	}
+
+	std::vector<int64_t> keys_;
+	std::vector<uint8_t> used_;
+	size_t capacity_ = 0;
+	size_t count_ = 0;
+};
+
 //! One non-root node of the reduction tree: who it hangs from, and on which
 //! columns. `own_column` is the key its parent probes it by.
 struct ReductionNode {
@@ -287,19 +374,19 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 	// below it has been. One relation is read at a time, because
 	// RelationSource only guarantees its columns until the next one is asked
 	// for -- the surviving keys are copied out before moving on.
-	std::vector<std::unordered_set<int64_t>> surviving(relations);
+	std::vector<KeySet> surviving(relations);
 	bool extreme_set = false;
 	for (size_t i = order.size(); i-- > 0;) {
 		const size_t current = order[i];
 		const auto &columns = source.Columns(current);
 		const size_t rows = columns.empty() ? 0 : columns[0].size();
 		result.rows_scanned += rows;
-		std::unordered_set<int64_t> keys;
+		KeySet keys;
 		for (size_t row = 0; row < rows; row++) {
 			bool survives = true;
 			for (const size_t child : children[current]) {
 				const size_t probe = node[child].parent_column;
-				if (surviving[child].find(columns[probe][row]) == surviving[child].end()) {
+				if (!surviving[child].Contains(columns[probe][row])) {
 					survives = false;
 					break;
 				}
@@ -314,13 +401,13 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 					extreme_set = true;
 				}
 			} else {
-				keys.insert(columns[node[current].own_column][row]);
+				keys.Insert(columns[node[current].own_column][row]);
 			}
 		}
 		if (current != relation) {
 			// An empty relation empties the whole join, and continuing would
 			// read every remaining input to discover it.
-			if (keys.empty()) {
+			if (keys.Empty()) {
 				result.ok = true;
 				return result;
 			}
