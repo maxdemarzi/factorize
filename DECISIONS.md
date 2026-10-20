@@ -6858,7 +6858,11 @@ Bucketing the 86 excluded queries that finish, by how long `auto` takes:
 Ninety-four percent of our time on this corpus (342s of 365s) is in the 24
 queries where we are 1.02x -- that is, where we are not winning at all and
 both plans are doing the same dominant work. The run cleaned up 43GB of spill
-files; that work is disk, not folding. Where the fold *does* dominate, the
+files; that work is disk, not folding. *Both sentences are wrong, and D106
+measures why: the gate declined on 23 of the 24, so only one plan ran, and
+the work is not disk either -- scanning every input of the slowest of them
+and counting its distinct values takes 0.5s against the query's 45s. The time
+goes into materialising a join that a MIN does not need.* Where the fold *does* dominate, the
 whole query costs 0.03-2s and 30% of it is noise.
 
 So the saving had nothing to grip. It is not that the walk was cheaper here
@@ -7053,3 +7057,85 @@ query and cannot produce half a second across 119 of them.
 Validated: 113 core checks and 999 SQL assertions over 7 cases, 0 failures,
 asan+ubsan clean; 200 fuzzer queries, 0 disagreements, 56 taken over; the
 cyclic corpus re-measured end to end at 0 fires and 0 disagreements.
+
+## D106 — The 340s was never irreducible: a MIN over an acyclic join does not need the join
+
+D104 closed the excluded corpus's slowest queries with "the gate is right to
+decline": forcing all 23 is 355.13s against 354.28s, a wash. That conclusion
+is correct and the inference drawn from it was not. "Neither plan wins" was
+read as "the time is irreducible", and the two plans on offer were taken for
+the plans that exist.
+
+The diagnostic that broke it open costs nothing. `job_acyclic_109_08` runs
+for 45s; scanning all five of its inputs and counting their distinct values
+takes **0.5s**. Whatever the 45s is, it is not reading the data, which is
+what D103 asserted when it saw 43GB of spill and called this disk.
+
+### What the query actually asks
+
+    SELECT min(imdb2.d) FROM imdb2, imdb119, imdb100, imdb13, imdb5
+    WHERE imdb2.d = imdb119.d AND imdb119.d = imdb100.d
+      AND imdb100.d = imdb13.s AND imdb13.s = imdb5.s
+
+`imdb100.d` bridges both halves, so all five columns are one equivalence
+class and the answer is the smallest value present in all five. As a set
+intersection that is **0.457s against 44.674s, and both return 95.**
+
+That is the degenerate case. The general one is Yannakakis: a full reducer
+leaves exactly the tuples that take part in some complete join result, and
+the extreme over the reduced relation is the extreme over the join. Rooting
+the join tree at the relation holding the aggregated column, a nest of
+EXISTS is that reducer. It is O(input) where the join is O(output), and the
+whole point of this corpus is that its output exceeds 1e9.
+
+### Measured, on the corpus this engine exists for
+
+The 23 D104 declined, both forms timed adjacent, answers compared:
+
+      join 357.4s  ->  reduced 15.4s        23.2x
+      speedups 1.8x to 872.7x, median 17.6x
+      slowest reduced query 1.37s
+      23 of 23 answers agree with stock
+
+Widened to the whole 120-query excluded `min` sample:
+
+      every one answered, zero timeouts
+      median 0.069s, max 1.66s, 42.2s for all 120
+      80 queries where stock times out at 60s
+         of those, 46 this engine already rescues
+         and 34 had no answer from either engine
+      where both finish (40): median 53.2x, max 1242x
+
+**Thirty-four queries this project has recorded as unanswerable are answered
+in a median of 0.064 seconds by an algorithm from 1981.**
+
+### Checked three ways, because "fast" without "right" is worthless
+
+1. Against stock DuckDB on the 23 where stock finishes: 23 of 23 agree.
+2. Against *this engine* on 25 queries stock cannot finish but `force`
+   rescues -- an f-representation and a semijoin reducer are independent
+   implementations, and they agree 25 of 25. The reducer is 3.9x faster
+   than the engine on them (7.56s against 1.95s).
+3. All 120 produce an answer; none times out, so none of the above is
+   survivorship.
+
+### What this does not say
+
+It is not free. Two of the 120 are slower reduced than joined --
+`yago_acyclic_Chain_12_41` at 0.2x and `Chain_12_63` at 0.4x -- both joins
+under 0.1s, losing 0.3s and 0.09s to the EXISTS nest. The same fixed-overhead
+shape as every other regression in this project, and it means a reducer
+needs the gate in front of it exactly as the f-representation does.
+
+It does not apply to `count`. A count needs the size of the join, which the
+reducer does not produce, and computing it without materialising is this
+engine's actual contribution. The division is clean: **count is the
+f-representation's problem and MIN/MAX is the reducer's**, and the excluded
+corpus looked bad for `min` because the engine was answering it with the
+count machinery. The same argument covers `max`, `EXISTS`, `bool_and` and
+`bool_or`; `sum`, `avg` and `sum(x*y)` are the f-representation's.
+
+Nothing is implemented here. This entry is the measurement that says a
+reducer is worth building, and `scripts/semijoin-rewrite.py` is the rewrite
+it was measured with. Yannakakis is 1981 textbook material, so building it
+raises no question under D1.
