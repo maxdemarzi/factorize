@@ -6792,3 +6792,83 @@ So E's case is void, not merely reduced. Its four queries (D97) have moved by
 factors of 1.6 to 33, the regression it was sized against has largely gone,
 and whether a packed layout is worth anything now has to be re-derived from
 the new baseline rather than inherited from the old one.
+
+## D103 — The same change is worth 30% on one corpus and nothing on the other, and the control is what says so
+
+D102 removed a per-join traversal nothing read and took 30% off the runnable
+corpus. The premise for re-measuring the excluded corpus was that the saving
+should be *larger* there: the discarded walk is proportional to the
+representation, those representations are orders of magnitude bigger, and
+that is the corpus this extension exists for. The premise was wrong, and the
+way it was shown wrong is the part worth recording.
+
+### The runnable corpus, against the new binary
+
+    119 queries    stock 21.75s   auto 9.10s   2.39x
+    36 fired, 10 of them slower
+    gained 13.31s, lost 0.69s, net +12.62s
+
+Avoidable loss is now 0.69s, spread over ten queries that stock answers in
+0.010-0.062s and we answer in 0.021-0.144s. Every one of them loses between
+8ms and 111ms. That is fixed overhead, not throughput, and no size cutoff
+separates them: the ten losers span 0.010-0.062s and six winners sit inside
+that same range. **E is dead by measurement, not by argument** -- a packed
+layout speeds up per-tuple work, and there is no per-tuple work left to
+speed up in a 20ms query.
+
+### The excluded corpus, min fold, 120 sampled, 60s cap
+
+The raw comparison against D87 looked alarming: fourteen of the first
+thirty-four queries slower than baseline, `dblp_acyclic_218_17` at 2.19s ->
+4.86s, 0.45x. A change that only removes work cannot do that.
+
+The script times stock mode alongside ours, and stock executes none of the
+code D102 touched. It moved in lockstep:
+
+                 n    off (stock)              auto (ours)
+      dblp      14    138.1s -> 156.2s (0.88x) 131.5s -> 156.5s (0.84x)
+      hetio      4     76.8s -> 120.2s (0.64x)   0.16s ->   0.22s (0.74x)
+
+The machine is 12-36% slower than when D87 was taken. Absolute times across
+the two runs are not comparable; only ratios measured inside a single run
+are. **The control was already in the data and the first reading ignored
+it.** Drift also grew through the run -- 0.88x early, 0.64x late -- which
+matters because the 60s cap tightens with it, and two queries flipped
+category at the boundary in opposite directions (one `both -> lost` at
+off=57.8s, one `both -> rescue`). Neither is a real change.
+
+Drift-immune, comparing off/auto within each run on the 39 queries where
+both modes finished in both runs:
+
+      median speedup   1.07x -> 1.05x
+      geomean speedup  5.66x -> 5.64x
+      outcomes         45/34/0 -> 46/34/1 rescue/neither/lost
+
+No measurable effect.
+
+### Why the same change is worth 30% and 0%
+
+Bucketing the 86 excluded queries that finish, by how long `auto` takes:
+
+      auto < 0.25s     39 queries    4.10s total    median 298x faster than stock
+      0.25-2s          22            19.52s                  38x
+      2-10s            12            67.15s                 1.02x
+      > 10s            12           274.69s                 1.02x
+
+Ninety-four percent of our time on this corpus (342s of 365s) is in the 24
+queries where we are 1.02x -- that is, where we are not winning at all and
+both plans are doing the same dominant work. The run cleaned up 43GB of spill
+files; that work is disk, not folding. Where the fold *does* dominate, the
+whole query costs 0.03-2s and 30% of it is noise.
+
+So the saving had nothing to grip. It is not that the walk was cheaper here
+-- it is that on this corpus the engine's time is either negligible in
+absolute terms or not the engine's at all. The runnable corpus, dismissed in
+D86's header as "the regime where the extension is least useful", is the only
+one of the two where engine throughput is on the critical path and therefore
+the only one where engine optimisation registers.
+
+**This also relocates the next question.** The 24 queries at 1.02x and 342s
+are where this corpus spends its time, and we neither help nor hurt them. Any
+future performance work on the excluded corpus has to start there, and it is
+an I/O and spill question rather than a representation-layout one.
