@@ -283,8 +283,81 @@ static bool MatchLeaf(LogicalOperator &op, FactorizedRegion &region) {
 
 //! Accepts a tree of INNER comparison joins whose every condition equates two
 //! bare columns, bottoming out in scans.
+//! The binding a pass-through expression really names, if it is one.
+//!
+//! A bare column reference is one. So is compressed materialization's
+//! compress or decompress of a column reference: those narrow an integer and
+//! widen it back, and this engine does not consume either -- it re-reads the
+//! base column from storage, so what the plan did to the value in flight is
+//! not something it has to reproduce. Mapping through to the base column
+//! computes the query as written, whatever width DuckDB chose in between.
+//!
+//! The argument holds for a join key because compression is injective on the
+//! values it covers and DuckDB applies one scheme to both sides of a
+//! condition -- it could not generate the comparison otherwise. Where this
+//! returns false the caller declines, so anything not understood is refused
+//! rather than guessed at.
+static bool TryPassThroughBinding(const Expression &expr, ColumnBinding &binding) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		binding = expr.Cast<BoundColumnRefExpression>().binding;
+		return true;
+	}
+	if (!IsCompressedMaterialization(expr)) {
+		return false;
+	}
+	// `__internal_compress_integral_*(col, constant)`: one column reference
+	// among the arguments and constants elsewhere. More than one would mean a
+	// function this does not understand.
+	const auto &function = expr.Cast<BoundFunctionExpression>();
+	const Expression *column = nullptr;
+	for (const auto &child : function.children) {
+		if (child->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			if (column) {
+				return false;
+			}
+			column = child.get();
+		} else if (child->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return false;
+		}
+	}
+	if (!column) {
+		return false;
+	}
+	binding = column->Cast<BoundColumnRefExpression>().binding;
+	return true;
+}
+
+//! A projection inside the join tree that only renames, narrows or widens.
+//!
+//! Checked whole before anything is recorded: a half-mapped projection would
+//! leave the resolver chasing some bindings and not others, which is a wrong
+//! answer rather than a decline.
+static bool TryPassThroughProjection(LogicalOperator &op, FactorizedRegion &region) {
+	if (op.type != LogicalOperatorType::LOGICAL_PROJECTION || op.children.size() != 1) {
+		return false;
+	}
+	auto &proj = op.Cast<LogicalProjection>();
+	std::vector<ColumnBinding> resolved(proj.expressions.size());
+	for (idx_t position = 0; position < proj.expressions.size(); position++) {
+		if (!TryPassThroughBinding(*proj.expressions[position], resolved[position])) {
+			return false;
+		}
+	}
+	for (idx_t position = 0; position < proj.expressions.size(); position++) {
+		region.projection_passthrough[{proj.table_index, position}] = resolved[position];
+	}
+	return true;
+}
+
 static bool MatchJoinGraph(LogicalOperator &op, FactorizedRegion &region) {
 	if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		// Compressed materialization puts a projection in the middle of the
+		// join tree. It is not the query's projection and it is not something
+		// this engine has to perform, so where every output maps back to a
+		// column it is walked through rather than refused (D111).
+		if (TryPassThroughProjection(op, region)) {
+			return MatchJoinGraph(*op.children[0], region);
+		}
 		return MatchLeaf(op, region);
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
@@ -891,10 +964,23 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 
 	vector<factorize::Predicate> predicates;
 	for (auto &edge : region.edges) {
-		const ColumnBinding *sides[2] = {&edge.first, &edge.second};
+		const ColumnBinding *sides[2] = {nullptr, nullptr};
 		size_t edge_relation[2] = {0, 0};
 		int edge_column[2] = {0, 0};
+		ColumnBinding chased[2] = {edge.first, edge.second};
 		for (int side = 0; side < 2; side++) {
+			// Through any pass-through projection the join tree carried, the
+			// way the aggregate's own binding is chased below. Bounded by the
+			// map's size so a cycle cannot spin.
+			for (size_t hop = 0; hop <= region.projection_passthrough.size(); hop++) {
+				auto through =
+				    region.projection_passthrough.find({chased[side].table_index, chased[side].column_index});
+				if (through == region.projection_passthrough.end()) {
+					break;
+				}
+				chased[side] = through->second;
+			}
+			sides[side] = &chased[side];
 			auto found = relation_of_table_index.find(sides[side]->table_index);
 			if (found == relation_of_table_index.end()) {
 				// A binding from outside the region.

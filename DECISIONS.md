@@ -7498,3 +7498,72 @@ and one predicate so they cannot drift apart.
 Seeing through those projections properly is still not attempted, for D109's
 reason: the mapping is the part that would be wrong, and a wrong mapping
 there returns a silently wrong answer.
+
+## D111 — Seeing through compressed materialization, which was the last thing between this corpus and an answer
+
+D109 sized it and declined to do it; D110 made the decline message say so.
+This does it.
+
+DuckDB's compressed-materialization pass narrows an integer column before an
+operator and widens it after, leaving `__internal_compress_integral_*` and
+its decompress partner in projections inside the join tree. `MatchJoinGraph`
+walks joins and `MatchLeaf` accepts a scan under an optional filter, so a
+projection anywhere in that tree stopped the walk -- 9 of 120 excluded
+queries and 0 of 119 runnable, on queries containing no projection at all.
+
+**Why walking through is sound.** This engine does not consume the plan's
+values: it re-reads the base columns from storage. What DuckDB did to a value
+in flight is not something it has to reproduce, so mapping each projection
+output back to its base column computes the query as written whatever width
+was chosen in between. For a join key specifically, compression is injective
+over the values it covers and one scheme is applied to both sides of a
+condition -- DuckDB could not have generated the comparison otherwise.
+
+**Why it is the risky kind of change anyway.** The mapping is the part that
+can be wrong, it lives in the resolver that produced the `sum(x*y)` defect,
+and a wrong mapping returns a silently wrong answer rather than failing. Two
+things follow from that. `TryPassThroughProjection` validates every
+expression before recording any, because a half-mapped projection leaves the
+resolver chasing some bindings and not others. And edge resolution now chases
+the pass-through map, which only the aggregate path did before -- half the
+resolver knew about projections and half did not, which is the shape of the
+original defect.
+
+### Measured
+
+    decline census, excluded min corpus
+      before   101 fired, 10 gate declines, 9 stopped at the matcher
+      after    104 fired, 16 gate declines, 0 stopped at the matcher
+
+    excluded corpus
+      before   114 of 120 answered, 28 of the 34 unanswerable, 0 disagreements
+      after    117 of 120 answered, 31 of the 34 unanswerable, 0 disagreements
+
+      dblp_acyclic_210_13   0.835s   1247904
+      dblp_acyclic_210_18   0.764s   1246499
+      dblp_acyclic_216_02   1.017s   1247098
+
+Three queries that neither engine could answer in sixty seconds, answered in
+about one.
+
+**The check that matters is not those three.** Each returns exactly what the
+same query returns with `disabled_optimizers='compressed_materialization'` --
+the path where none of this code runs. Same engine, different binding
+resolution, identical answers, which is an independent oracle rather than a
+restatement.
+
+The runnable corpus is the negative control: it has zero compressed
+materialization, so this should change nothing there, and it does not -- 51
+fires before and after, 3.39x to 3.41x on `min` and 3.53x to 3.47x on `max`,
+which is noise. Had it moved, the fault would have been in bindings
+generally rather than in compression.
+
+**What is still not covered.** The fuzzer almost certainly never produces a
+compressed-materialization plan, because the pass triggers off real tables'
+statistics, so the corpus is the only place this code is exercised at all.
+200 fuzzer queries agreeing says nothing about it.
+
+Six of the nine did not become fires: they reach the gate now and are
+declined on cost, which is the gate's business and D104's problem, not the
+matcher's. `dblp_acyclic_211_14` is one of them -- 328ms predicted against
+335ms, then 64s of stock.
