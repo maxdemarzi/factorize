@@ -382,11 +382,26 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 		const size_t rows = columns.empty() ? 0 : columns[0].size();
 		result.rows_scanned += rows;
 		KeySet keys;
+		// Resolved once, not per row. `columns[probe][row]` walks a vector of
+		// vectors on every probe of every row, and the child loop between the
+		// two indexings stops the compiler hoisting it. The profile put 79
+		// instructions on a row that needs a hash and a lookup; this is where
+		// a good part of the difference was (D113).
+		struct Probe {
+			const int64_t *column;
+			const KeySet *keys;
+		};
+		std::vector<Probe> probes;
+		probes.reserve(children[current].size());
+		for (const size_t child : children[current]) {
+			probes.push_back(Probe {columns[node[child].parent_column].data(), &surviving[child]});
+		}
+		const int64_t *extreme_column = current == relation ? columns[column].data() : nullptr;
+		const int64_t *key_column = current == relation ? nullptr : columns[node[current].own_column].data();
 		for (size_t row = 0; row < rows; row++) {
 			bool survives = true;
-			for (const size_t child : children[current]) {
-				const size_t probe = node[child].parent_column;
-				if (!surviving[child].Contains(columns[probe][row])) {
+			for (const auto &probe : probes) {
+				if (!probe.keys->Contains(probe.column[row])) {
 					survives = false;
 					break;
 				}
@@ -394,14 +409,14 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 			if (!survives) {
 				continue;
 			}
-			if (current == relation) {
-				const int64_t value = columns[column][row];
+			if (extreme_column) {
+				const int64_t value = extreme_column[row];
 				if (!extreme_set || (want_min ? value < result.value : value > result.value)) {
 					result.value = value;
 					extreme_set = true;
 				}
 			} else {
-				keys.Insert(columns[node[current].own_column][row]);
+				keys.Insert(key_column[row]);
 			}
 		}
 		if (current != relation) {

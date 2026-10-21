@@ -7625,3 +7625,56 @@ A success message for an action that did not happen, which is the same defect
 D96's patch script had and the same `&&` trap that silently skipped two
 check-runs earlier in this session. The checks were re-run one per statement;
 this entry exists because the file was read back rather than trusted.
+
+## D113 — E for the reducer: the prefetch did nothing, the indirection was the cost
+
+D112 found the reducer 1.5x to 3x slower than DuckDB's own EXISTS plan and
+put the remainder on a scalar probe loop against vectorised execution -- E
+again, the idea D96 ranked first and D102 killed for the f-representation
+path. Two forms of it were tried.
+
+### Measuring it properly first, because the machine is drifting
+
+Across-run comparison said blocked prefetching was worth up to 26% on
+`dblp_acyclic_211_15`. It is worth nothing. The machine drifted monotonically
+slower through the session, and a control in the same script does not fix
+that when the thing being compared is in a different run.
+
+So both binaries were built and run **alternately, query by query, four
+rounds each**, so a drifting machine hits both equally:
+
+    blocked prefetching    +1.4%   -2.7%   +8.7%   -0.8%
+
+Noise, and reverted. A probe is a hash and one random load, and issuing the
+loads a block early should have hidden the misses; it does not, which says
+the misses were not what the loop was waiting on.
+
+### What the profile actually said
+
+`ExecuteExtremeReduced` was spending about **79 instructions per row** where a
+hash and a lookup want 20 to 30. The inner loop reads `columns[probe][row]`
+-- a vector of vectors, two dependent loads -- on every probe of every row,
+and the child loop sitting between the two indexings stops the compiler
+hoisting any of it. Resolving each child's column pointer and key set once
+per relation, before the row loop:
+
+    run 1   +10.9%  +10.8%  +14.7%   +3.1%
+    run 2   +12.7%  +14.1%   +8.5%   +9.2%
+
+Eight measurements, all positive, median about 11%.
+
+**The distinction is the point.** E as a hypothesis -- that the cost is
+memory layout and access patterns -- predicted the prefetch would win, and it
+did not. What won was reading the profile literally and deleting redundant
+indirection. D102 closed E for the f-representation path by finding 30% of
+the time in statistics nothing read; this is the same lesson from the other
+side, and the third time in this project that a layout argument has lost to
+a profile.
+
+`hetio_acyclic_204_01` moves 3.1% and 9.2% across the two runs because it is
+a 46ms query where fixed costs dominate and per-row work barely registers --
+the same shape as every other small-query result here.
+
+The gap to the hand-written SQL closes from roughly 2.0x to 1.8x. Real, and
+not the kind of change that alters what the extension can answer, unlike the
+reducer it is tuning.
