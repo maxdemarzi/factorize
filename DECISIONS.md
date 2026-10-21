@@ -7720,3 +7720,73 @@ A performance claim in a README is a measurement with no owner and no test
 holding it true. This one drifted three improvements out of date in the
 project's own favour -- understating it -- which is the harmless direction
 and still wrong.
+
+## D115 — D81's knob works now, because the corpus it was measured on changed
+
+D114 located the largest avoidable loss left: `avg`, `sum` and `sum(x*y)`
+dropping 3.65s to 4.37s each on a corpus whose whole win is 8 to 9s.
+
+### Why the gate fires there
+
+Predictions against outcomes on the 36 `sum` queries it fires on:
+
+                 median actual / predicted
+      ours       0.66x on the ones that lose, 2.46x on the ones that win
+      duckdb     0.03x on both
+
+**DuckDB's time is over-predicted thirtyfold, equally on the queries we win
+and the ones we lose.** It is not what separates them, so no correction to it
+can be the fix -- it only means the margin is cleared wherever the predicted
+result is large. What differs is our own side, and in the inconvenient
+direction: we over-charge ourselves on the losers and under-charge on the
+winners, so making our own cost model *more* accurate would fire more often
+on exactly the queries that lose.
+
+### The knob that already existed
+
+`factorize_fold_cost` multiplies our predicted per-record cost for an
+aggregate that reads a column. D81 built it for this, measured it changing
+nothing, and shipped it at 1.0.
+
+That measurement has expired. It was taken over a corpus where `min` and
+`max` were fold-path queries -- they dominated the sample, and D108's reducer
+has since taken both off the fold entirely. What is left on the fold is
+exactly the three aggregates carrying the loss. Swept per query, interleaved,
+because the machine drifts by more than the effect (D113):
+
+      fold_cost   fires   ratio    gained    lost
+      1              36   1.47x   11.52s   3.99s      (sum)
+      2              33   1.49x   11.25s   3.67s
+      4              28   1.52x   10.90s   2.54s
+      8              27   1.55x   10.86s   2.67s
+
+      at 4, against 1:   avg 1.41x -> 1.50x, lost 3.86s -> 2.18s
+                     sumprod 1.26x -> 1.25x, lost 4.69s -> 3.21s
+                      countc 1.77x -> 1.76x, lost 1.33s -> 1.43s
+
+Loss over the four falls 13.87s to 9.36s, a third, for eight fires given up
+that were mostly losing. The default moves to 4.
+
+**4 is not the cost of folding.** D81 measured that at about 1.7x. Charging 4
+deliberately over-prices our side to offset the thirtyfold over-estimate
+above, which is a tuned compensation for a known bias and not a physical
+constant. The principled alternative -- correcting DuckDB's coefficient --
+reaches `count(*)`, which is healthy at 2.17x, and D107 already established
+that the result-size error dominates anything the coefficients can reach.
+
+`min` and `max` are structurally immune: the reducer costs
+`reduce.Estimate(input_rows, 0)`, so a multiplier on `per_output_ms` cannot
+touch them. Measured: 51 fires before and after.
+
+**What did not reproduce.** The sweep's ratio gains did not survive a normal
+end-to-end run -- `avg` measured 1.45x either way there. The loss reduction
+did (3.74s to 2.74s on `sum`, 4.37s to 2.83s on `avg`), and that is the claim
+this entry makes. A ratio moving 0.05x between runs is inside this machine's
+noise and the sweep should not have been read as showing otherwise.
+
+**And a metric of mine was wrong.** The first comparison said `min` lost
+0.42s before and 1.11s after, which cannot be true when the gate's decisions
+are identical. It summed `max(0, auto - off)` over *every* query rather than
+the ones that fired -- on a declined query `auto` is the stock plan, so the
+difference is noise being counted as regression. Fired-only, `min` loses
+0.40s.

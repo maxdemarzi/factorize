@@ -1633,7 +1633,7 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 	// so it keeps firing and this knob stays an instrument (D81).
 	for (const auto &aggregate : region.aggregates) {
 		if (aggregate.reads_column) {
-			thresholds.ours.per_output_ms *= DoubleSetting(context, "factorize_fold_cost", 1.0);
+			thresholds.ours.per_output_ms *= DoubleSetting(context, "factorize_fold_cost", 4.0);
 			break;
 		}
 	}
@@ -1985,7 +1985,7 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	config.AddExtensionOption("factorize_fold_cost",
 	                          "Multiplier on this engine's predicted per-record cost for an aggregate that "
 	                          "reads a column",
-	                          LogicalType::DOUBLE, Value::DOUBLE(1.0));
+	                          LogicalType::DOUBLE, Value::DOUBLE(4.0));
 	config.AddExtensionOption("factorize_learn_cardinality",
 	                          "Correct the predicted flat result by what earlier queries over the same tables "
 	                          "turned out to be",
