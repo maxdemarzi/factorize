@@ -7678,3 +7678,45 @@ the same shape as every other small-query result here.
 The gap to the hand-written SQL closes from roughly 2.0x to 1.8x. Real, and
 not the kind of change that alters what the extension can answer, unlike the
 reducer it is tuning.
+
+## D114 — Every fold measured, and the README was three improvements out of date
+
+The reducer was claimed for MIN and MAX on the strength of one code path and
+measured only on `min`. Both corpora, every fold:
+
+    runnable corpus      fires   stock      auto     ratio    lost
+      min                   51   21.59s    6.17s     3.50x   0.42s
+      max                   51   22.06s    6.29s     3.51x   0.55s
+      countc                36   22.88s   10.95s     2.09x   1.15s
+      avg                   36   25.71s   17.75s     1.45x   4.37s
+      sum                   36   25.20s   17.48s     1.44x   3.74s
+      sumprod               36   26.61s   17.95s     1.48x   3.65s
+
+    excluded corpus, max   117 of 120 answered, 31 of the 33 that had no
+                           answer from either engine, 0 disagreements
+
+`max` matches `min` exactly, so the pair is measured rather than inferred.
+The reducer is worth about double what the fold is on these two aggregates,
+and wastes an order of magnitude less: 0.42s and 0.55s lost against 3.65s to
+4.37s for the three that still fold.
+
+**That is also where the largest avoidable loss in the project now is.**
+`avg`, `sum` and `sum(x*y)` lose 3.65s to 4.37s each on a corpus where the
+whole win is 8 to 9s. None of this sequence touched them -- a reducer cannot,
+since those need the join's size -- and nothing has looked at why the gate
+fires where it does on them.
+
+### The README
+
+It led with **1.71×** for `count(*)`, "faster on 23 and the gate fires on
+35". That number predates D102's 30%, the reducer, the refitted coefficient
+and the compressed-materialization work. Re-measured: **2.17×**, 24.18s
+against 11.14s, firing on 36 and faster on 25 of them; firing on every match
+is 0.093x rather than 0.04x. It also said nothing at all about `min` and
+`max`, which is now the engine's strongest result and the only part that
+answers queries nothing else can.
+
+A performance claim in a README is a measurement with no owner and no test
+holding it true. This one drifted three improvements out of date in the
+project's own favour -- understating it -- which is the harmless direction
+and still wrong.

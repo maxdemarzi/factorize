@@ -28,14 +28,14 @@ off:  no answer in 180 seconds
 ```
 
 And what it is not worth: across the 119 CE queries whose results DuckDB *can*
-materialise, the engine is faster on 23 and the gate fires on 35, for **1.71×**
-on the corpus. Firing on every match instead would be **0.04×** — 524s against
-22s — because for a `count(*)` DuckDB carries no payload columns through a join
-and counts empty tuples faster than this engine can build a representation. The
-gate exists to tell those two regimes apart, and the coefficients it uses were
-fitted on one machine — `scripts/calibrate-synthetic.py` re-fits them on yours,
-with the caveat in its docstring that it generates uniform data and the gate's
-real difficulty is skew.
+materialise, the gate fires on 36 and the engine is faster on 25 of those, for
+**2.17×** on the corpus. Firing on every match instead would be **0.09×** —
+261s against 24s — because for a `count(*)` DuckDB carries no payload columns
+through a join and counts empty tuples faster than this engine can build a
+representation. The gate exists to tell those two regimes apart, and the
+coefficients it uses were fitted on one machine — `scripts/calibrate-synthetic.py`
+re-fits them on yours, with the caveat in its docstring that it generates
+uniform data and the gate's real difficulty is skew.
 
 | | state |
 |---|---|
@@ -46,6 +46,7 @@ real difficulty is skew.
 | optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
+| `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.50×** and **3.51×** on the runnable corpus against 1.44–2.09× for the folded aggregates, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **117**, including 31 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113) |
 | parallelism | working — one thread per bucket of the join key, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried: **3.00x** over the runnable corpus, faster on all 18 known-outcome queries, `hetio_acyclic_205_09` 172.9s → 51.2s (D54–D54d) |
 
 CI builds the extension on Linux, macOS and Windows against DuckDB v1.5.5.
