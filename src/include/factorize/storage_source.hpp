@@ -19,8 +19,11 @@
 #include "../../core/plan.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/table_filter.hpp"
+// TableFilterSet moved out of table_filter.hpp in DuckDB 2.0.
+#include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
 

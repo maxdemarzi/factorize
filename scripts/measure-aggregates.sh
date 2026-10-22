@@ -38,7 +38,7 @@ for kind in $KINDS; do
     auto=$(printf '%s\n' ".timer on" "SET factorize_mode=${Q}auto${Q};" "$q;" "$q;" "$q;" |
            timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | best)
     f=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" |
-        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
     [ "$f" -gt 0 ] && fires=$((fires+1))
     n=$((n+1))
     echo "${kind},${name},${off:-to},${auto:-to},${f}" >> "$OUT"

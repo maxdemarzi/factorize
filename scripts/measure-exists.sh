@@ -39,7 +39,7 @@ while IFS='|' read -r name expected q; do
   offa=$(echo "$outoff" | answer)
   fa=$(echo "$outf" | answer)
   fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $e;" |
-          timeout 60 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+          timeout 60 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
   echo "${name},${offa:-?},${off:-to},${fa:-?},${force:-to},${fired}" >> "$OUT"
   printf '%-28s off %-7s %-8s force %-7s %-8s fired=%s%s\n' "$name" "${offa:-?}" "${off:-to}" \
       "${fa:-?}" "${force:-to}" "$fired" \

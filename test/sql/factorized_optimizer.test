@@ -33,7 +33,7 @@ SELECT count(*) FROM r, s WHERE r.x = s.x;
 query II
 EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # EXPLAIN has to say what was taken over, or a silent rewrite is undebuggable.
 query II
@@ -154,7 +154,7 @@ SELECT count(*) FROM edge a, edge b, edge c WHERE a.dst = b.src AND b.dst = c.sr
 query II
 EXPLAIN SELECT count(*) FROM edge a, edge b, edge c WHERE a.dst = b.src AND b.dst = c.src AND c.dst = a.src;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 #-----------------------------------------------------------------------------
 # NULLs and widths, the two places the table function had live bugs.
@@ -489,7 +489,7 @@ SET factorize_mode = 'auto';
 query II
 EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM r, s WHERE r.x = s.x;
@@ -502,7 +502,7 @@ SET factorize_mode = 'off';
 query II
 EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM r, s WHERE r.x = s.x;
@@ -580,7 +580,7 @@ SET factorize_mode = 'auto';
 query II
 EXPLAIN SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
@@ -594,7 +594,7 @@ SET factorize_min_gain = 1000000;
 query II
 EXPLAIN SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
@@ -612,7 +612,7 @@ SET factorize_mode = 'force';
 query II
 EXPLAIN SELECT count(*) FROM r, s WHERE r.x = s.x;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_mode = 'off';
@@ -745,7 +745,7 @@ SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP 
 query II
 EXPLAIN SELECT g_left.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k GROUP BY g_left.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # The groups have to sum to the ungrouped count, or one of the two is wrong.
 query I
@@ -777,7 +777,7 @@ SELECT g_wide.other, count(*) FROM g_wide, g_right WHERE g_wide.k = g_right.k GR
 query II
 EXPLAIN SELECT g_wide.other, count(*) FROM g_wide, g_right WHERE g_wide.k = g_right.k GROUP BY g_wide.other;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Two grouping keys. Here they are the two sides of one equality, so they are
 # the same equivalence class and name the same groups twice over.
@@ -792,7 +792,7 @@ query II
 EXPLAIN SELECT g_left.k, g_right.k, count(*) FROM g_left, g_right WHERE g_left.k = g_right.k
  GROUP BY g_left.k, g_right.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 #-----------------------------------------------------------------------------
 # Grouping keys scattered across independent sibling branches. Plan §10.1
@@ -846,7 +846,7 @@ query II
 EXPLAIN SELECT x_arm1.p, x_arm2.q, count(*) FROM x_hub, x_arm1, x_arm2
  WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1, 2;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Three keys, one of them the join key the two branches hang from -- so the
 # groups split by a value at the root and by a value in each branch at once.
@@ -895,7 +895,7 @@ query II
 EXPLAIN SELECT x_arm2.q, sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
  WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Two keys from one relation, one of them a join column and one not.
 query III
@@ -956,7 +956,7 @@ SELECT sum(n_p.v) FROM n_p, n_q WHERE n_p.k = n_q.k AND n_p.w > 5;
 query II
 EXPLAIN SELECT sum(n_p.v) FROM n_p, n_q WHERE n_p.k = n_q.k AND n_p.w > 5;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # The twin with no appended column, which never had the bug. Its job is to say
 # that the append is what breaks it, not the filter.
@@ -1165,7 +1165,7 @@ query II
 EXPLAIN SELECT sum(s_arm.v) FROM s_hub, s_arm, s_other
  WHERE s_hub.k = s_arm.k AND s_hub.k = s_other.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Summing a join key works too, and is the case where the value sits at the top
 # of the tree rather than in a branch.
@@ -1353,7 +1353,7 @@ query II
 EXPLAIN SELECT count(*), sum(x_arm1.p) FROM x_hub, x_arm1, x_arm2
  WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Two sums over columns in *different* branches, which is where sharing the walk
 # would break if it were wrong: each is weighted by how many tuples the other
@@ -1401,7 +1401,7 @@ query II
 EXPLAIN SELECT x_hub.k, count(*), sum(x_arm1.p), sum(x_arm2.q) FROM x_hub, x_arm1, x_arm2
  WHERE x_hub.k = x_arm1.k AND x_hub.k = x_arm2.k GROUP BY 1;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Each aggregate asked for on its own has to agree with it asked for in company,
 # or sharing the walk changed an answer.
@@ -1444,7 +1444,7 @@ EXPLAIN SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4),
                sum(w_wide.c5), sum(w_wide.c6), sum(w_wide.c7), sum(w_wide.c8)
           FROM x_hub, w_wide WHERE x_hub.k = w_wide.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query IIIIIIII
 SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4),
@@ -1462,7 +1462,7 @@ EXPLAIN SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4), s
                sum(w_wide.c6), sum(w_wide.c7), sum(w_wide.c8), sum(w_wide.c9)
           FROM x_hub, w_wide WHERE x_hub.k = w_wide.k;
 ----
-physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+physical_plan	<REGEX>:.*Ungrouped Aggregate.*
 
 query IIIIIIIII
 SELECT sum(w_wide.c1), sum(w_wide.c2), sum(w_wide.c3), sum(w_wide.c4), sum(w_wide.c5),
@@ -1505,7 +1505,7 @@ SET factorize_mode = 'auto';
 query II
 EXPLAIN SELECT count(*) FROM nofan_a, nofan_b WHERE nofan_a.k = nofan_b.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM nofan_a, nofan_b WHERE nofan_a.k = nofan_b.k;
@@ -1541,7 +1541,7 @@ query II
 EXPLAIN SELECT count(*) FROM tiny_h, tiny_a, tiny_b
  WHERE tiny_h.k = tiny_a.k AND tiny_h.k = tiny_b.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM tiny_h, tiny_a, tiny_b WHERE tiny_h.k = tiny_a.k AND tiny_h.k = tiny_b.k;
@@ -1565,7 +1565,7 @@ CREATE TABLE ch_r AS SELECT i % 50 AS s, (i * 7) % 50 AS d FROM range(5000) t(i)
 query II
 EXPLAIN SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # This chain used to be the held example for factorize_fallback_max_loss: its
 # estimate collapsed to zero flat tuples, so it reached the gate's second
@@ -1580,7 +1580,7 @@ physical_plan	<REGEX>:.*FACTORIZED.*
 query II
 EXPLAIN SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Zero restores D41's unconditional or-rule rather than meaning "no second
 # opinion at all", which is the reading the name invites. This query no longer
@@ -1591,7 +1591,7 @@ SET factorize_fallback_max_loss = 0;
 query II
 EXPLAIN SELECT count(*) FROM ch_p, ch_q, ch_r WHERE ch_p.d = ch_q.s AND ch_q.d = ch_r.s;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_fallback_max_loss = 150;
@@ -1671,21 +1671,21 @@ SELECT fb_h.k, count(*), sum(fb_a.v) FROM fb_h, fb_a, fb_b
 1	100	90100
 2	100	90200
 
-# The plan still says FACTORIZED: the operator is there, it tried, and it fell
+# The plan still says Factorized: the operator is there, it tried, and it fell
 # back at run time. A fallback that changed the plan would be a different
 # feature -- this one cannot, because the failure is only discoverable by
 # running.
 query II
 EXPLAIN SELECT count(*) FROM fb_h, fb_a, fb_b WHERE fb_h.k = fb_a.k AND fb_h.k = fb_b.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_debug_fail = false;
 
 # And with the injection off the same query still answers. What rules out the
 # tests above having exercised a disabled rule is the EXPLAIN above this one,
-# not this count: the plan says FACTORIZED while the injection is on, so the
+# not this count: the plan says Factorized while the injection is on, so the
 # operator was in the plan and fell back while running. This count is 20000
 # either way and can only ever agree.
 query I
@@ -1734,7 +1734,7 @@ SET factorize_mode = 'force';
 query II
 EXPLAIN SELECT count(*) FROM ck_a, ck_b WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM ck_a, ck_b WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2;
@@ -1760,7 +1760,7 @@ query II
 EXPLAIN SELECT count(*) FROM ck_a, ck_b, ck_c
  WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2 AND ck_a.k1 = ck_c.k1;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM ck_a, ck_b, ck_c WHERE ck_a.k1 = ck_b.k1 AND ck_a.k2 = ck_b.k2 AND ck_a.k1 = ck_c.k1;
@@ -1782,7 +1782,7 @@ query II
 EXPLAIN SELECT count(*) FROM ck_wide_a, ck_wide_b
  WHERE ck_wide_a.k1 = ck_wide_b.k1 AND ck_wide_a.k2 = ck_wide_b.k2;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k1 = ck_wide_b.k1 AND ck_wide_a.k2 = ck_wide_b.k2;
@@ -1800,7 +1800,7 @@ SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k1 = ck_wide_b.k1 AND 
 query II
 EXPLAIN SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k2 = ck_wide_b.k2;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM ck_wide_a, ck_wide_b WHERE ck_wide_a.k2 = ck_wide_b.k2;
@@ -1819,7 +1819,7 @@ query II
 EXPLAIN SELECT count(*) FROM ck_two_a, ck_two_b
  WHERE ck_two_a.k1 = ck_two_b.k1 AND ck_two_a.k2 = ck_two_b.k2;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM ck_two_a, ck_two_b
@@ -1858,7 +1858,7 @@ SELECT count(*), sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1;
 query II
 EXPLAIN SELECT count(*), sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 # A lone sum over the same nullable column is still taken over. Dropping those
 # rows cannot change a sum that is the whole answer -- and it is what makes an
@@ -1867,7 +1867,7 @@ physical_plan	<!REGEX>:.*FACTORIZED.*
 query II
 EXPLAIN SELECT sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT sum(a.c0) FROM d31 a, d31 b WHERE a.c1 = b.c1 AND a.c0 IS NULL;
@@ -1883,7 +1883,7 @@ CREATE TABLE d31_clean AS SELECT * FROM (VALUES (2::INTEGER, 0::INTEGER), (3::IN
 query II
 EXPLAIN SELECT count(*), sum(a.c0) FROM d31_clean a, d31_clean b WHERE a.c1 = b.c1;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query II
 SELECT count(*), sum(a.c0) FROM d31_clean a, d31_clean b WHERE a.c1 = b.c1;
@@ -1930,7 +1930,7 @@ query II
 EXPLAIN SELECT t2.c0, sum(t0.c0) FROM d30_f1 t0, d30_f3 t1, d30_f0 t2
  WHERE t0.c1 = t1.c0 AND t0.c0 = t2.c0 GROUP BY t2.c0;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query II
 SELECT t2.c0, sum(t0.c0) FROM d30_f1 t0, d30_f3 t1, d30_f0 t2
@@ -1967,7 +1967,7 @@ SET factorize_mode = 'force';
 query II
 EXPLAIN SELECT sum(a.x) FROM neg_a a, neg_b b WHERE a.k = b.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT sum(a.x) FROM neg_a a, neg_b b WHERE a.k = b.k;
@@ -2031,7 +2031,7 @@ query II
 EXPLAIN SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
  WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
@@ -2065,7 +2065,7 @@ query II
 EXPLAIN SELECT count(*) FROM cmp_a, cmp_b, cmp_c, cmp_d
  WHERE cmp_a.j = cmp_b.k AND cmp_b.j = cmp_c.k AND cmp_c.j = cmp_d.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # What rules out the two counts above having simply agreed because nothing
 # fired: with the fallback off there is nothing to catch the abandonment, so
@@ -2228,7 +2228,7 @@ SET factorize_mode = 'auto';
 query II
 EXPLAIN SELECT min(mm_s.s) FROM mm_r0, mm_s WHERE mm_r0.k = mm_s.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_mode = 'force';
@@ -2310,7 +2310,7 @@ SET factorize_mode = 'auto';
 query II
 EXPLAIN SELECT count(*), count(av_n.v) FROM av_r0, av_n WHERE av_r0.k = av_n.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_mode = 'force';
@@ -2381,7 +2381,7 @@ INSERT INTO bl_k2 VALUES (true,1);
 query II
 EXPLAIN SELECT count(*) FROM bl_k1, bl_k2 WHERE bl_k1.b = bl_k2.b;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_mode = 'force';
@@ -2491,7 +2491,7 @@ query II
 EXPLAIN SELECT sum(ov_r1.x * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
  WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 # 100000 * 100000 overflows INT32, so both modes must raise. This is the case
 # that shipped answering in one mode and erroring in the other.
@@ -2553,7 +2553,7 @@ query II
 EXPLAIN SELECT sum(ov_r1.x::BIGINT * ov_r2.y) FROM ov_r0, ov_r1, ov_r2
  WHERE ov_r0.k = ov_r1.k AND ov_r0.k = ov_r2.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_mode = 'auto';
@@ -2568,13 +2568,13 @@ query II
 EXPLAIN SELECT count(*), sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
  WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query II
 EXPLAIN SELECT ps_r0.k, sum(ps_r1.x * ps_r2.y) FROM ps_r0, ps_r1, ps_r2
  WHERE ps_r0.k = ps_r1.k AND ps_r0.k = ps_r2.k GROUP BY ps_r0.k;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 statement ok
 SET factorize_mode = 'force';

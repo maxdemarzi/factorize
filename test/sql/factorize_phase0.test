@@ -37,7 +37,7 @@ SELECT count(*) FROM a, b WHERE a.x = b.x;
 query II
 EXPLAIN SELECT count(*) FROM a, b WHERE a.x = b.x;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Shapes outside the allowlist must be declined even under 'force'.
 

@@ -55,7 +55,7 @@ PY
 
     fired=no
     if timeout "$TIMEOUT" "$DUCKDB" "$DB" -noheader -list \
-        -c "SET factorize_mode='auto';" -c "EXPLAIN $plain" 2>/dev/null | grep -q FACTORIZED; then
+        -c "SET factorize_mode='auto';" -c "EXPLAIN $plain" 2>/dev/null | grep -qi Factorized; then
         fired=yes
     fi
 

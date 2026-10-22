@@ -105,7 +105,7 @@ public:
 	void ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
-	vector<idx_t> GetTableIndex() const override;
+	vector<TableIndex> GetTableIndex() const override;
 
 	//! Plan §3.2: v1 does not serialize the factorized region. Reporting this
 	//! honestly makes DuckDB skip serialization instead of failing inside it.

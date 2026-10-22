@@ -29,7 +29,7 @@ while IFS='|' read -r name expected q; do
     q=$(printf '%s' "$q" | tr -d '\r')
     out=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "SET factorize_explain=true;" "EXPLAIN ${q};" |
         timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1)
-    if printf '%s' "$out" | grep -q FACTORIZED; then
+    if printf '%s' "$out" | grep -qi Factorized; then
         echo "FIRED"
     else
         # The first clause of the reason is the category; the numbers after it

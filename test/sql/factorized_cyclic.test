@@ -68,7 +68,7 @@ SELECT count(*) FROM a, b, c, d WHERE a.s = b.s AND a.d = c.s AND b.d = d.s AND 
 query II
 EXPLAIN SELECT count(*) FROM a, b, c, d WHERE a.s = b.s AND a.d = c.s AND b.d = d.s AND c.d = d.d;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 # An acyclic query over the same tables must still be taken over, or the
 # refusal is just the rule switching itself off.
@@ -80,7 +80,7 @@ SELECT count(*) FROM a, b, c WHERE a.s = b.s AND a.d = c.s;
 query II
 EXPLAIN SELECT count(*) FROM a, b, c WHERE a.s = b.s AND a.d = c.s;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # Two relations joined on two columns have as many predicates as relations and
 # are acyclic. Counting edges calls that a cycle; D28 found the planner doing
@@ -95,7 +95,7 @@ SELECT count(*) FROM a, e WHERE a.s = e.s AND a.d = e.d;
 query II
 EXPLAIN SELECT count(*) FROM a, e WHERE a.s = e.s AND a.d = e.d;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # force means force: it bypasses the gate, so it still factorizes the cycle,
 # and must still produce the right answer while doing so.

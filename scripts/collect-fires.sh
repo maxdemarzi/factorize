@@ -17,7 +17,7 @@ while IFS='|' read -r name expected q; do
   [ -n "$name" ] || continue
   q=$(echo "$q" | tr -d '\r')
   n=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" |
-      timeout 300 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+      timeout 300 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
   echo "${name},${n}" >> "$OUT"
 done < "$LIST"
 echo "=== $(($(wc -l < "$OUT") - 1)) queries, $(awk -F, 'NR>1 && $2>0' "$OUT" | wc -l) fire -> $OUT"

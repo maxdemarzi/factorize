@@ -187,7 +187,7 @@ static void AppendChunk(const BoundRelation &bound, DataChunk &chunk, vector<idx
 	// once per row, across all columns, or not at all.
 	std::vector<UnifiedVectorFormat> formats(bound.columns.size());
 	for (idx_t c = 0; c < bound.columns.size(); c++) {
-		chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
+		chunk.data[c].ToUnifiedFormat(formats[c]);
 	}
 	// Which rows survive is decided first, for the whole chunk, so that the
 	// per-column work below can be a tight typed loop instead of a switch
@@ -203,7 +203,7 @@ static void AppendChunk(const BoundRelation &bound, DataChunk &chunk, vector<idx
 	// Throwing there is the point. A silently missing row would break the
 	// one contract this rule has, that turning it off changes only speed.
 	for (auto column : bound.no_null_columns) {
-		if (formats[column].validity.AllValid()) {
+		if (formats[column].validity.CannotHaveNull()) {
 			continue;
 		}
 		for (idx_t row = 0; row < chunk.size(); row++) {
@@ -351,7 +351,7 @@ void StorageSource::Load(size_t relation) {
 	state.Initialize(column_ids, context, bound.filters.get());
 	ParallelTableScanState parallel;
 	storage.InitializeParallelScan(context, parallel, column_indexes);
-	if (storage.NextParallelScan(context, parallel, state) == 0) {
+	if (!storage.NextParallelScan(context, parallel, state).IsValid()) {
 		return;
 	}
 
@@ -370,13 +370,13 @@ void StorageSource::Load(size_t relation) {
 			sampled_rows += static_cast<double>(chunk.size());
 			AppendChunk(bound, chunk, kept, held);
 			if (sampled_rows >= static_cast<double>(sample_limit) ||
-			    storage.NextParallelScan(context, parallel, state) == 0) {
+			    !storage.NextParallelScan(context, parallel, state).IsValid()) {
 				break;
 			}
 			continue;
 		}
 		if (chunk.size() == 0) {
-			if (storage.NextParallelScan(context, parallel, state) == 0) {
+			if (!storage.NextParallelScan(context, parallel, state).IsValid()) {
 				break;
 			}
 			continue;

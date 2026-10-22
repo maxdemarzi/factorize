@@ -54,7 +54,7 @@ PY
     explain=$(timeout "$TIMEOUT" "$DUCKDB" "$DB" -noheader -list \
         -c "SET factorize_mode='force';" -c "EXPLAIN $plain" 2>/dev/null) || explain=""
 
-    if grep -q FACTORIZED <<<"$explain"; then
+    if grep -qi Factorized <<<"$explain"; then
         took_over=yes
         fired=$((fired + 1))
     else

@@ -296,7 +296,7 @@ def main():
             print(script)
             continue
         off, force, auto, plan = blocks
-        if any("FACTORIZED" in line for line in plan):
+        if any("Factorized" in line for line in plan):
             fired += 1
         if off != force or off != auto:
             failures += 1

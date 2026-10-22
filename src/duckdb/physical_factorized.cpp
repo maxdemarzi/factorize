@@ -372,10 +372,10 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			// count(*) of nothing is 0; every other aggregate of nothing is
 			// NULL, which a typed Value() with no value is. min and max join
 			// sum here rather than count: SQL has no least element to return.
-			chunk.SetValue(
-			    i, 0, aggregates[i].kind == factorize::Aggregate::COUNT ? Value::BIGINT(0) : Value(aggregate_types[i]));
+			chunk.data[i].SetValue(0, aggregates[i].kind == factorize::Aggregate::COUNT ? Value::BIGINT(0)
+			                                                                            : Value(aggregate_types[i]));
 		}
-		chunk.SetCardinality(1);
+		chunk.SetChildCardinality(1);
 		gstate.handed_out = 1;
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
@@ -384,7 +384,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 		// Each key goes back out in the type the aggregate gave it, not the
 		// int64 the engine counted in, and in the aggregate's own order.
 		for (idx_t key = 0; key < group_types.size(); key++) {
-			chunk.SetValue(key, produced, Value::Numeric(group_types[key], group.first[key]));
+			chunk.data[key].SetValue(produced, Value::Numeric(group_types[key], group.first[key]));
 		}
 		for (idx_t i = 0; i < aggregates.size(); i++) {
 			Value out;
@@ -401,12 +401,12 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 			} else {
 				out = FoldedValue(group.second[i], aggregate_types[i]);
 			}
-			chunk.SetValue(group_types.size() + i, produced, out);
+			chunk.data[group_types.size() + i].SetValue(produced, out);
 		}
 		gstate.handed_out++;
 		produced++;
 	}
-	chunk.SetCardinality(produced);
+	chunk.SetChildCardinality(produced);
 	return produced == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
@@ -638,16 +638,15 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 		if (!result.ok) {
 			throw InvalidInputException("factorize: %s", result.error);
 		}
-		chunk.SetCardinality(1);
+		chunk.SetChildCardinality(1);
 		// No tuples means nothing was summed, and SQL answers NULL rather than
 		// zero -- the same rule every aggregate but count(*) follows here.
 		// The 128-bit field, not `count`: the product-sum is the one fold whose
 		// answer routinely exceeds int64, which is what D87 measured and D88
 		// widened. hugeint_t is {upper, lower} in the same order and signedness
 		// as Int128 is {high, low}, so the handover is a field copy.
-		chunk.SetValue(0, 0,
-		               result.tuples > 0 ? FoldedWideValue(result.product_sum, aggregate_types[0])
-		                                 : Value(aggregate_types[0]));
+		chunk.data[0].SetValue(0, result.tuples > 0 ? FoldedWideValue(result.product_sum, aggregate_types[0])
+		                                            : Value(aggregate_types[0]));
 		gstate.handed_out = 1;
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
@@ -707,13 +706,15 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 			std::vector<std::string> tables;
 			for (const auto &bound : relations) {
 				if (bound.entry) {
-					tables.push_back(bound.entry->name);
+					// 2.0 made catalog names Identifiers, which carry case-insensitive
+					// semantics; the calibration store keys on the raw text as before.
+					tables.push_back(bound.entry->name.GetIdentifierName());
 				}
 			}
 			factorize::Calibration::Get().Observe(tables, predicted_flat, static_cast<double>(result.count));
 		}
-		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(result.count));
+		chunk.SetChildCardinality(1);
+		chunk.data[0].SetValue(0, Value::BIGINT(result.count));
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
 	// Bottom-insert is the mode that carries the benefit (FINDINGS F4:
@@ -767,8 +768,8 @@ SourceResultType PhysicalFactorized::Factorized(ExecutionContext &context, DataC
 			// setting factorize_mode='off'; a query that answers wrongly is not.
 			throw InvalidInputException("factorize: %s", gstate.error);
 		}
-		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(gstate.total));
+		chunk.SetChildCardinality(1);
+		chunk.data[0].SetValue(0, Value::BIGINT(gstate.total));
 	}
 	// Not FINISHED: that would tell DuckDB this thread is done with the operator
 	// entirely, and with fewer threads scheduled than there are buckets the rest

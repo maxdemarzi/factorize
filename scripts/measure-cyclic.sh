@@ -74,7 +74,7 @@ while IFS='|' read -r name expected q; do
     q=$(printf '%s' "$q" | tr -d '\r')
     n=$((n + 1))
     f=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN ${q};" |
-        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED || true)
+        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized || true)
     [ "$f" -gt 0 ] && fired_n=$((fired_n + 1))
     IFS='|' read -r off_s off_v <<<"$(run_mode off "$q")"
     IFS='|' read -r aut_s aut_v <<<"$(run_mode auto "$q")"

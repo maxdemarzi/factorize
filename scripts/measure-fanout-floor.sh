@@ -53,7 +53,7 @@ while IFS='|' read -r name expected q; do
         "SET factorize_min_fanout=${FLOOR};" "SET factorize_fanout_max_compression=${CEIL};" \
         "$q;" "$q;" "$q;" | timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | best)
     f=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" |
-        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED || true)
+        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized || true)
     echo "${name},${off:-to},${auto:-to},${floor:-to},${f}" >> "$OUT"
     echo "  $name off=${off:-to} auto=${auto:-to} floor=${floor:-to}" >&2
 done < "$LIST"

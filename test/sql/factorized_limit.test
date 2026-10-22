@@ -39,7 +39,7 @@ true
 query II
 EXPLAIN SELECT EXISTS (SELECT * FROM r, s WHERE r.s = s.s);
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # The operator says what it was asked for, or a plan that stops early is
 # indistinguishable from one that did the whole job.
@@ -123,27 +123,27 @@ SELECT count(*) FROM (SELECT * FROM r, s WHERE r.s = s.s LIMIT 3 OFFSET 998) q;
 query II
 EXPLAIN SELECT count(*) FROM (SELECT * FROM r, s WHERE r.s = s.s LIMIT 3 OFFSET 998) q;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 # Which k tuples a limit keeps is undefined, so a fold that reads their values
 # has no single right answer to agree with. sum() over a limit is declined.
 query II
 EXPLAIN SELECT sum(q.d) FROM (SELECT * FROM r, s WHERE r.s = s.s LIMIT 3) q;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 # Same reason, one aggregate along: a count per group counts a set nobody
 # specified.
 query II
 EXPLAIN SELECT q.s, count(*) FROM (SELECT * FROM r, s WHERE r.s = s.s LIMIT 3) q GROUP BY q.s;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 # A percentage needs the join's size, which is the same objection as OFFSET.
 query II
 EXPLAIN SELECT count(*) FROM (SELECT * FROM r, s WHERE r.s = s.s LIMIT 10%) q;
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT count(*) FROM (SELECT * FROM r, s WHERE r.s = s.s LIMIT 10%) q;
@@ -178,13 +178,13 @@ SET factorize_mode = 'auto';
 query II
 EXPLAIN SELECT count(*) FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # The same join, asked for a witness instead of a count: declined.
 query II
 EXPLAIN SELECT EXISTS (SELECT * FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k);
 ----
-physical_plan	<!REGEX>:.*FACTORIZED.*
+physical_plan	<!REGEX>:.*Factorized.*
 
 query I
 SELECT EXISTS (SELECT * FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k);
@@ -198,7 +198,7 @@ SET factorize_limit = true;
 query II
 EXPLAIN SELECT EXISTS (SELECT * FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k);
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 query I
 SELECT EXISTS (SELECT * FROM big_a, big_b, big_c WHERE big_a.k = big_b.k AND big_b.k = big_c.k);

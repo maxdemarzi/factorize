@@ -41,7 +41,7 @@ while IFS='|' read -r name expected q; do
     # Only the queries the gate fires on: where it declines there is nothing
     # for a race to change.
     fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN ${q};" |
-        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED || true)
+        timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized || true)
     [ "$fired" -gt 0 ] || continue
     key=$(printf '%s' "$q" | sed -E "s/.* [Ww][Hh][Ee][Rr][Ee] ([A-Za-z0-9_]+\.[A-Za-z0-9_]+) =.*/\1/")
     case "$key" in *.*) ;; *) continue ;; esac

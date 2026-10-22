@@ -1,0 +1,88 @@
+# name: test/sql/factorized_on_clause.test
+# description: a join carrying a non-equality restriction is declined, and still answered correctly
+# group: [sql]
+
+require factorize
+
+# DuckDB 1.x put an ON-clause restriction that references only one side on
+# LogicalComparisonJoin::predicate, and the matcher declined any join that had
+# one: the region would not have applied it, which is a wrong count rather
+# than a slow query. DuckDB 2.0 removed that member -- such a restriction now
+# arrives as a JoinCondition whose comparison type is INVALID, in the same
+# `conditions` vector the matcher already walks, where the equality test
+# rejects it (D116).
+#
+# That reasoning is from reading a header. This file is the experiment: the
+# only thing that matters is that `auto` still equals `off`, whichever way
+# the plan represents the restriction.
+
+statement ok
+CREATE TABLE l AS SELECT * FROM (VALUES (1,10),(2,20),(3,30),(4,40)) t(k, v);
+
+statement ok
+CREATE TABLE r AS SELECT * FROM (VALUES (1,100),(2,5),(3,300),(5,500)) t(k, v);
+
+statement ok
+SET factorize_min_work_ms = 0;
+
+statement ok
+SET factorize_min_gain = 0;
+
+# An ON clause with an equality and an inequality over both sides.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM l JOIN r ON l.k = r.k AND l.v < r.v;
+----
+2
+
+statement ok
+SET factorize_mode = 'auto';
+
+query I
+SELECT count(*) FROM l JOIN r ON l.k = r.k AND l.v < r.v;
+----
+2
+
+# A restriction on one side only, inside the ON clause rather than WHERE.
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT count(*) FROM l JOIN r ON l.k = r.k AND l.v > 15;
+----
+2
+
+statement ok
+SET factorize_mode = 'auto';
+
+query I
+SELECT count(*) FROM l JOIN r ON l.k = r.k AND l.v > 15;
+----
+2
+
+# And the same shape with an aggregate that reads a column, since that takes a
+# different path through the matcher.
+query I
+SELECT sum(l.v) FROM l JOIN r ON l.k = r.k AND l.v > 15;
+----
+50
+
+statement ok
+SET factorize_mode = 'off';
+
+query I
+SELECT sum(l.v) FROM l JOIN r ON l.k = r.k AND l.v > 15;
+----
+50
+
+# The plain equi-join over the same tables must still be taken over, or these
+# assertions would pass with the rule switched off entirely.
+statement ok
+SET factorize_mode = 'auto';
+
+query II
+EXPLAIN SELECT count(*) FROM l JOIN r ON l.k = r.k;
+----
+physical_plan	<REGEX>:.*Factorized.*

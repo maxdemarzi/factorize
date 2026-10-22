@@ -64,7 +64,7 @@ for kind in $KINDS; do
         q=$(printf '%s' "$q" | tr -d '\r')
         n=$((n + 1))
         f=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN ${q};" |
-            timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED || true)
+            timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized || true)
         [ "$f" -gt 0 ] && fired=$((fired + 1))
         off=$(run_mode off "$q")
         auto=$(run_mode auto "$q")

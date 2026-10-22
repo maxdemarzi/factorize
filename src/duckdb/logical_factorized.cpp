@@ -44,10 +44,10 @@ vector<ColumnBinding> LogicalFactorized::GetColumnBindings() {
 	// reference both. Groups come first, matching LogicalAggregate's own order.
 	vector<ColumnBinding> bindings;
 	for (idx_t i = 0; i < group_types.size(); i++) {
-		bindings.emplace_back(group_index, i);
+		bindings.emplace_back(TableIndex(group_index), ProjectionIndex(i));
 	}
 	for (idx_t i = 0; i < aggregate_types.size(); i++) {
-		bindings.emplace_back(table_index, i);
+		bindings.emplace_back(TableIndex(table_index), ProjectionIndex(i));
 	}
 	return bindings;
 }
@@ -58,16 +58,36 @@ void LogicalFactorized::ResolveColumnBindings(ColumnBindingResolver &res, vector
 	// else is working either. Its bindings are then discarded rather than
 	// returned: the factorized region exposes only its own.
 	if (fallback) {
-		res.VisitOperator(*fallback);
+		// A *fresh* resolver, not the one walking the plan this operator sits
+		// in. DuckDB 2.0's ColumnBindingResolver carries `types` beside
+		// `bindings` and verifies the two agree; handing it an unrelated plan
+		// mid-walk makes it check the fallback's expressions against whatever
+		// state the outer walk had reached. With compressed materialization
+		// disabled -- the workaround this rule's own decline message
+		// recommends -- a grouped aggregate over three relations then fails
+		// with "inequal types (AGGREGATE_STATE != BIGINT)" before the query
+		// runs at all (D116).
+		//
+		// The fallback is a whole plan of its own, as the comment here has
+		// always said, and resolving it as one is what that now requires. Its
+		// bindings are still discarded: the factorized region exposes only its
+		// own.
+		ColumnBindingResolver fallback_resolver;
+		fallback_resolver.VisitOperator(*fallback);
 	}
 	bindings = GetColumnBindings();
 }
 
-vector<idx_t> LogicalFactorized::GetTableIndex() const {
+vector<TableIndex> LogicalFactorized::GetTableIndex() const {
+	// DuckDB 2.0 made plan indexes strongly typed -- TableIndex and
+	// ProjectionIndex wrap idx_t and will not convert implicitly. The members
+	// stay idx_t and are wrapped at the API boundary: this operator's own
+	// bookkeeping does not benefit from the distinction, and the conversions
+	// are the places where mixing the two would actually be a bug.
 	if (grouped) {
-		return {group_index, table_index};
+		return {TableIndex(group_index), TableIndex(table_index)};
 	}
-	return {table_index};
+	return {TableIndex(table_index)};
 }
 
 string LogicalFactorized::GetExtensionName() const {

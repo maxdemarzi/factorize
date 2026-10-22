@@ -554,7 +554,7 @@ static RunResult RunFlat(const Query &query, const Plan &plan, TableCache &cache
 //===--------------------------------------------------------------------===//
 // Driver
 //===--------------------------------------------------------------------===//
-int main(int argc, char **argv) {
+static int RunBenchmark(int argc, char **argv) {
 	std::string data_dir;
 	std::vector<std::string> query_files;
 	size_t limit = 0;
@@ -798,4 +798,22 @@ int main(int argc, char **argv) {
 	std::fprintf(stderr, "\nexecuted %zu, correct %zu, unsupported %zu, table cache %.1f MB\n", executed, correct,
 	             unsupported, static_cast<double>(cache.Bytes()) / (1024.0 * 1024.0));
 	return 0;
+}
+
+//! The real entry point, so a throw becomes a message rather than a
+//! std::terminate.
+//!
+//! The parser raises on an unrecognised column rather than defaulting one --
+//! defaulting is how a stray ';' once turned `.s` into `.d` and produced a
+//! silently wrong query -- and a harness that reports which file it choked on
+//! is worth more than a core dump. DuckDB 2.0's clang-tidy config enables
+//! bugprone-exception-escape, which is what noticed that `main` had no
+//! handler at all.
+int main(int argc, char **argv) {
+	try {
+		return RunBenchmark(argc, argv);
+	} catch (const std::exception &error) {
+		std::fprintf(stderr, "standalone: %s\n", error.what());
+		return 1;
+	}
 }

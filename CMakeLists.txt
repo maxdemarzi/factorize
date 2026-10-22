@@ -9,10 +9,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 # This is a no-op for the factorize targets specifically -- see the comment
-# below at the CXX_STANDARD 14 override for why, and why 14 is correct. Left
-# at 14 (not 17) so this line does not contradict that override even though it
-# currently does not take effect.
-set(CMAKE_CXX_STANDARD "14" CACHE STRING "C++ standard to enforce")
+# below at the CXX_STANDARD override for why. Kept in step with it so the two
+# cannot contradict each other even though this line does not take effect.
+set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
@@ -44,20 +43,24 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# The extension builds at C++14, which is the only standard that works here.
+# The extension builds at C++17, which DuckDB 2.0 requires: its CMakeLists
+# refuses anything lower outright.
 #
-# DuckDB compiles at C++11, and C++17 is not an option: it makes `static
-# constexpr` members implicitly inline, so a translation unit including DuckDB
-# headers emits its own definitions of things like duckdb::LogicalType::BIGINT
-# and they collide at link time with the out-of-line ones DuckDB's own build
-# emits. C++11 is not an option either: src/core/ needs std::make_unique and
-# generic lambdas, both C++14. C++14 has neither problem.
+# This used to be 14, and the reason it could not be 17 has been removed
+# rather than worked around. DuckDB 1.x compiled at C++11, so `static
+# constexpr` members were not implicitly inline on its side; a C++17
+# translation unit including its headers emitted its own definitions of things
+# like duckdb::LogicalType::BIGINT and they collided at link time with the
+# out-of-line ones DuckDB's build emitted. Both sides are C++17 now, so both
+# treat those members the same way and there is nothing to collide.
 #
-# src/core/ is kept free of C++17 (see the Byte alias in core/arena.hpp, which
-# exists in place of std::byte for exactly this reason).
+# src/core/ stays conservative anyway -- see the Byte alias in core/arena.hpp,
+# which stands in for std::byte -- because it is built standalone by
+# scripts/core-test.sh and that is the property the alias protects, not the
+# link-time one that has gone away.
 foreach(factorize_target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
     set_target_properties(${factorize_target} PROPERTIES
-        CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 endforeach()
 
 

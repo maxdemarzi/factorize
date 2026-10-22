@@ -33,7 +33,7 @@ while IFS='|' read -r name expected q; do
   ours=$(echo "$line" | grep -o 'ours [0-9.]*ms' | tr -dc '0-9.')
   ddb=$(echo "$line" | grep -o 'duckdb [0-9.]*ms' | tr -dc '0-9.')
   fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" |
-          timeout 300 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+          timeout 300 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
   echo "${name},${recs:-},${flat:-},${ours:-},${ddb:-},${fired}" >> "$OUT"
   printf '%-26s recs %-11s flat %-11s ours %-9s duckdb %-9s fired=%s\n' \
          "$name" "${recs:-?}" "${flat:-?}" "${ours:-?}" "${ddb:-?}" "$fired"

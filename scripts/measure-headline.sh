@@ -44,7 +44,7 @@ while IFS='|' read -r name expected q; do
   auto=$(run "$q" auto)
   force=$(run "$q" force)
   fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" |
-          timeout 120 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+          timeout 120 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
   echo "${name},${off:-to},${auto:-to},${force:-to},${fired}" >> "$OUT"
   printf '%-28s off %-9s auto %-9s force %-9s fired=%s\n' "$name" "${off:-to}" "${auto:-to}" "${force:-to}" "$fired"
 done < "$LIST"

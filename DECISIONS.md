@@ -7790,3 +7790,163 @@ are identical. It summed `max(0, auto - off)` over *every* query rather than
 the ones that fired -- on a declined query `auto` is the stock plan, so the
 difference is noise being counted as regression. Fired-only, `min` loses
 0.40s.
+
+## D116 — DuckDB 2.0, and the seven breakages that did not fail
+
+The extension targets DuckDB 2.0 (`v2.0.0`, `d54cbbe3`). There is no 1.6, so
+this is a direct jump from `v1.5.5`, and `extension-ci-tools` moves with it to
+`78bd1e4` on its `v2.0-cyanoptera` branch -- the exact commit, per the
+convention the workflow already documents, so CI cannot drift from the
+vendored engine.
+
+Thirteen distinct things broke. Six failed at compile time and are not
+interesting beyond the diff. **Seven did not fail at all**, and those are the
+reason this entry is long.
+
+### The two prerequisites
+
+**C++14 to C++17.** 2.0's CMakeLists refuses anything lower. This project
+pinned 14 deliberately and the reason is now void rather than worked around:
+DuckDB 1.x compiled at C++11, so `static constexpr` members were not
+implicitly inline on its side and a C++17 translation unit emitted its own
+definitions of things like `duckdb::LogicalType::BIGINT`, which collided at
+link time. Both sides are C++17 now and there is nothing to collide. The
+comment that explained the old pin was rewritten rather than left
+contradicting the code.
+
+**CMake 3.18 to 3.31.** 2.0 calls `file(CHMOD)`, which needs 3.19. Its own
+`cmake_minimum_required(3.14...3.29)` understates that, and the failure
+surfaces as two unexplained `file does not recognize sub-command CHMOD`
+errors during configure.
+
+### The six that failed loudly
+
+Strong plan indexes (`TableIndex`, `ProjectionIndex` wrapping `idx_t`),
+`Identifier` for catalog and function names, public fields becoming
+accessors, `TableFilterSet` hiding its map, `GetTableIndex` returning the
+strong type, and three expression classes -- cast, comparison, BETWEEN --
+collapsing into function expressions (`__cast`, `__comparison`, `__between`)
+with their old classes surviving as namespaces of static helpers.
+
+Mechanical, and safe precisely because the compiler enumerates them.
+
+### The seven that did not
+
+**1. The extension was built but never linked.** `duckdb_extension_load` only
+builds in 2.0; reaching the shipped binary needs
+`duckdb_extension_statically_link()`, and the old `DONT_LINK` flag was
+removed. The build exits 0, the artifacts exist, and the only evidence is one
+line of configure output: "Extensions built but not linked: [factorize]".
+Downstream, every measurement script would have compared stock DuckDB against
+itself and every SQL test would have *skipped* on `require factorize` rather
+than failing.
+
+**2. `NextParallelScan` returns `optional_idx`.** Exhaustion is now an
+invalid index rather than zero, and `== 0` still compiles. A nine-row query
+spun at 100% CPU for two and a half minutes. This is in the scan path every
+query takes.
+
+**3. The plan renderer title-cases operator names.**
+`StringUtil::Title(Replace(name, "_", " "))`, so `FACTORIZED` prints as
+`Factorized`. That is 22 files: every EXPLAIN assertion and every
+fire-counting script in this repo. Each would have reported zero fires.
+
+**4. The legacy table filters are rejected at runtime.** `ConstantFilter` is
+`LegacyConstantFilter`, kept "only for backwards-compatible deserialization",
+and `TableFilterSet::PushFilter` throws "expected ExpressionFilter" on one.
+It compiles. Caught by a test, which is exactly why the shortcut was recorded
+as debt rather than as a fix when it was taken.
+
+**5. The filter set is keyed by projection position, not table column.** 1.x
+keyed it by the table's own column index; 2.0 keys it by position in the
+scan's projection. Our code passed the key straight into `LogicalIndex`. The
+two agree only for the first column, so every pushed-down filter after the
+first restricted *the wrong column*: on `n_p.w > 5`, `force` returned 700
+where `off` returned 500, because the filter landed on `v`. `ProjectionIndex`
+converts to `idx_t` implicitly, so it compiled in silence. Found by a test
+asserting a value; diagnosed by instrumenting the scan after reasoning from
+headers went in a circle.
+
+**6. A partial aggregate is not an aggregate.** 2.0 can split a grouped
+aggregate into a partial pass whose outputs are `AGGREGATE_STATE`, a
+`combine_aggr` pass, and a `finalize` projection. The matcher matched the
+partial pass and replaced it with an operator promising `BIGINT`, so the plan
+failed to bind. Reachable under the shipped defaults -- not only under
+`force` -- whenever `disabled_optimizers='compressed_materialization'` is
+set, which is the workaround this rule's own decline message recommends. The
+guard tests `GetReturnType().IsAggregateState()` rather than function names,
+so it holds for both phases.
+
+**7. sum(x * y) went from 28 fires to 2, with every test green.** Casts are
+function expressions now, and `MatchProjections` was taught to see through
+one while `TryPassThroughBinding` -- the join-tree walk added the same day
+for compressed materialization -- was not. `sum(a::BIGINT * b)` is the only
+form the aggregate matcher accepts (D86), so its cast sits in a projection
+inside the join tree, and that walk declined the region. **Declining is a
+correct answer**, so 1050 SQL assertions, 200 fuzzer queries and the core
+suite all passed while a quarter of the matcher's coverage was gone.
+
+### What caught what
+
+    1050 SQL assertions      found 4, 5, 6
+    the fuzzer, 200 queries  found nothing the suite had not
+    fire counts vs baseline  found 7, and nothing else could have
+    a nine-row smoke test    found 1 and 2
+    clang-tidy               found a literal newline in a string the
+                             release build never compiles
+
+Number 7 is the one to remember. It is D96's defect wearing a different
+decade's API: the same aggregate, the same silence, the same cause -- a
+matcher path updated in one place and not the other. The only instrument that
+sees it is a recorded count of what the gate used to fire on.
+
+**And the warning was written before the bug was.** Hours earlier, on
+noticing casts had become function expressions: "A projection containing a
+widening cast used to be handled by the now-deleted BOUND_CAST branch. That
+path needs the same IsCast treatment or it will decline regions it used to
+accept." That note was correct, inert, and followed by moving on to the next
+compile error. An observation that predicts a silent failure has to become a
+change or a check in the same breath, because the thing it predicts will not
+announce itself.
+
+### Measured on 2.0
+
+    runnable corpus      fires 1.5.5 -> 2.0     ratio 1.5.5 -> 2.0
+      min                      51 -> 51            3.17x -> 2.98x
+      max                      51 -> 51            3.38x -> 2.91x
+      avg                      28 -> 29            1.45x -> 1.32x
+      sum                      28 -> 29            1.47x -> 1.31x
+      sum(x*y)                 28 -> 29            1.46x -> 1.34x
+      count(c)                 36 -> 36            2.24x -> 1.46x
+
+    excluded corpus      118 of 120 answered (117 on 1.5.5), 32 of the 34
+                         with no answer from either engine (31), and 0
+                         answer disagreements with the fold
+
+    correctness          1050 SQL assertions, 200 fuzzer queries with 0
+                         disagreements, core suite clean under asan+ubsan,
+                         format and tidy clean
+
+Every fold keeps its fire count, which is the claim that matters: the matcher
+still matches what it matched.
+
+**The ratios are mostly stock getting faster, not this engine getting
+slower.** Absolute `auto` time moved between 0.88x and 1.06x for five of the
+six folds while stock fell as much as 17%, which compresses a ratio without
+anything regressing.
+
+**`count(c)` is the exception and is reported as measured rather than
+inherited.** 2.24x to 1.46x, reproduced across two runs. Stock got 5% faster
+there while `auto` went 10.11s to 14.60s, and 4.24s of the 4.49s is two
+queries whose gate decision flipped across the margin -- the fire count is
+unchanged at 36 but the *set* differs by one swap. `watdiv_acyclic_208_00`
+now fires: predicted DuckDB at 26,593ms for a query stock answers in 0.157s,
+a 170x over-prediction off a predicted flat of 6.6e9, and it loses 2.9s.
+`watdiv_acyclic_212_05` stopped firing and lost a win worth 1.5s.
+
+That is D98's winner's curse -- the gate fires where the alternative's cost
+was most over-estimated -- reached because 2.0's parallel scan yields a
+different statistical sample and the estimate crossed a 1.5x boundary. D107
+measured that error at a median factor of 79 and found no key that corrects
+it, so this is documented rather than chased. Nothing in the port caused it
+and nothing in the port can fix it.

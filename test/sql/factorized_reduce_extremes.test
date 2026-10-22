@@ -51,7 +51,7 @@ SELECT max(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
 query II
 EXPLAIN SELECT min(a.s) FROM a, b, c WHERE a.d = b.s AND b.d = c.s;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # The extreme may sit on a column that is not a join key, and on a relation
 # that is not the one the tree would naturally root at.

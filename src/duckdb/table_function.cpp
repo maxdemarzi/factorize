@@ -96,7 +96,7 @@ factorize::ValueType RequireIntegerKey(const LogicalType &type, const string &al
 }
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names, bool allow_not_equal = false) {
+                              vector<Identifier> &names, bool allow_not_equal = false) {
 	auto result = make_uniq<FactorizedCountBindData>();
 
 	// Two lists, and whatever the caller adds after them: factorized_tuples
@@ -126,7 +126,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		relation.alias = words.size() > 1 && !StringUtil::CIEquals(words[1], "as")
 		                     ? words[1]
 		                     : (words.size() > 2 ? words[2] : words[0]);
-		auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, INVALID_SCHEMA, words[0]);
+		// 2.0 folds catalog and schema into a QualifiedName; the
+		// catalog/schema/name overload is deprecated. An unqualified name
+		// still searches the default path, which is what this wants.
+		auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, QualifiedName(Identifier(words[0])));
 		relation.entry = catalog_entry;
 		if (relation_of_alias.count(relation.alias)) {
 			throw BinderException("factorized_count: duplicate relation name '%s'; use an alias", relation.alias);
@@ -190,10 +193,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			}
 			const idx_t relation = found->second;
 			auto &table_entry = entries[relation].get();
-			if (!table_entry.ColumnExists(column)) {
+			if (!table_entry.ColumnExists(Identifier(column))) {
 				throw BinderException("factorized_count: %s has no column '%s'", alias, column);
 			}
-			auto &definition = table_entry.GetColumn(column);
+			auto &definition = table_entry.GetColumn(Identifier(column));
 			const auto value_type = RequireIntegerKey(definition.Type(), alias, column);
 			const auto physical = static_cast<idx_t>(definition.Physical().index);
 
@@ -263,7 +266,7 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 	const char *name = EXISTS ? "factorized_exists" : "factorized_count";
 	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -295,11 +298,11 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 		if (!neq.ok) {
 			throw InvalidInputException("%s: %s", name, neq.error);
 		}
-		output.SetCardinality(1);
+		output.SetChildCardinality(1);
 		if (EXISTS) {
-			output.SetValue(0, 0, Value::BOOLEAN(neq.count > 0));
+			output.data[0].SetValue(0, Value::BOOLEAN(neq.count > 0));
 		} else {
-			output.SetValue(0, 0, Value::BIGINT(neq.count));
+			output.data[0].SetValue(0, Value::BIGINT(neq.count));
 		}
 		return;
 	}
@@ -324,11 +327,11 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 		throw InvalidInputException("%s: %s", name, result.error);
 	}
 
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	if (EXISTS) {
-		output.SetValue(0, 0, Value::BOOLEAN(result.count > 0));
+		output.data[0].SetValue(0, Value::BOOLEAN(result.count > 0));
 	} else {
-		output.SetValue(0, 0, Value::BIGINT(result.count));
+		output.data[0].SetValue(0, Value::BIGINT(result.count));
 	}
 }
 
@@ -346,7 +349,7 @@ void ExecuteQuestion(ClientContext &context, TableFunctionInput &data, DataChunk
 void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -370,11 +373,11 @@ void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	if (!result.ok) {
 		throw InvalidInputException("factorized_stats: %s", result.error);
 	}
-	output.SetCardinality(1);
-	output.SetValue(0, 0, Value::BIGINT(result.count));
-	output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(result.records)));
-	output.SetValue(2, 0, Value::BIGINT(static_cast<int64_t>(result.bytes)));
-	output.SetValue(3, 0, Value::BIGINT(static_cast<int64_t>(result.slices)));
+	output.SetChildCardinality(1);
+	output.data[0].SetValue(0, Value::BIGINT(result.count));
+	output.data[1].SetValue(0, Value::BIGINT(static_cast<int64_t>(result.records)));
+	output.data[2].SetValue(0, Value::BIGINT(static_cast<int64_t>(result.bytes)));
+	output.data[3].SetValue(0, Value::BIGINT(static_cast<int64_t>(result.slices)));
 }
 
 //! `factorized_steps(tables, joins)`: one row per materialized join, saying
@@ -390,7 +393,7 @@ void ExecuteStats(ClientContext &context, TableFunctionInput &data, DataChunk &o
 void ExecuteSteps(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -418,29 +421,29 @@ void ExecuteSteps(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	}
 	idx_t row = 0;
 	for (const auto &step : result.steps) {
-		output.SetValue(0, row, Value::BIGINT(static_cast<int64_t>(row + 1)));
-		output.SetValue(1, row, Value::BIGINT(static_cast<int64_t>(step.relation)));
-		output.SetValue(2, row, Value::BIGINT(static_cast<int64_t>(step.records)));
-		output.SetValue(3, row, Value::BIGINT(static_cast<int64_t>(step.live)));
-		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(step.bytes)));
-		output.SetValue(5, row, Value::BIGINT(step.tuples));
-		output.SetValue(6, row, Value::DOUBLE(step.Compression()));
-		output.SetValue(7, row, Value::DOUBLE(step.fanout_mean));
-		output.SetValue(8, row, Value::DOUBLE(step.fanout_max));
+		output.data[0].SetValue(row, Value::BIGINT(static_cast<int64_t>(row + 1)));
+		output.data[1].SetValue(row, Value::BIGINT(static_cast<int64_t>(step.relation)));
+		output.data[2].SetValue(row, Value::BIGINT(static_cast<int64_t>(step.records)));
+		output.data[3].SetValue(row, Value::BIGINT(static_cast<int64_t>(step.live)));
+		output.data[4].SetValue(row, Value::BIGINT(static_cast<int64_t>(step.bytes)));
+		output.data[5].SetValue(row, Value::BIGINT(step.tuples));
+		output.data[6].SetValue(row, Value::DOUBLE(step.Compression()));
+		output.data[7].SetValue(row, Value::DOUBLE(step.fanout_mean));
+		output.data[8].SetValue(row, Value::DOUBLE(step.fanout_max));
 		row++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //! The one entry point that accepts a `<>`, which is why it has a bind of its
 //! own rather than sharing the default.
 unique_ptr<FunctionData> BindCount(ClientContext &context, TableFunctionBindInput &input,
-                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return Bind(context, input, return_types, names, /* allow_not_equal */ true);
 }
 
 unique_ptr<FunctionData> BindStats(ClientContext &context, TableFunctionBindInput &input,
-                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = Bind(context, input, return_types, names);
 	return_types.clear();
 	names.clear();
@@ -452,7 +455,7 @@ unique_ptr<FunctionData> BindStats(ClientContext &context, TableFunctionBindInpu
 }
 
 unique_ptr<FunctionData> BindSteps(ClientContext &context, TableFunctionBindInput &input,
-                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = Bind(context, input, return_types, names);
 	return_types.clear();
 	names.clear();
@@ -471,7 +474,7 @@ unique_ptr<FunctionData> BindSteps(ClientContext &context, TableFunctionBindInpu
 }
 
 unique_ptr<FunctionData> BindExists(ClientContext &context, TableFunctionBindInput &input,
-                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = Bind(context, input, return_types, names);
 	return_types.clear();
 	names.clear();
@@ -483,7 +486,7 @@ unique_ptr<FunctionData> BindExists(ClientContext &context, TableFunctionBindInp
 //! `factorized_tuples(tables, joins[, limit])`: the join itself, not an
 //! aggregate of it. One column per join column, named `<relation>_<column>`.
 unique_ptr<FunctionData> BindTuples(ClientContext &context, TableFunctionBindInput &input,
-                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = Bind(context, input, return_types, names);
 	auto &bind_data = result->Cast<FactorizedCountBindData>();
 	if (input.inputs.size() > 2 && !input.inputs[2].IsNull()) {
@@ -515,7 +518,7 @@ unique_ptr<FunctionData> BindTuples(ClientContext &context, TableFunctionBindInp
 //! f-tree that carries one and combining the branches, so they need not sit
 //! together or near the root.
 unique_ptr<FunctionData> BindGroupCount(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = Bind(context, input, return_types, names);
 	auto &bind_data = result->Cast<FactorizedCountBindData>();
 	if (input.inputs.size() < 3 || input.inputs[2].IsNull()) {
@@ -601,19 +604,19 @@ void ExecuteGroupCount(ClientContext &context, TableFunctionInput &data, DataChu
 	while (state.offset < groups.size() && produced < STANDARD_VECTOR_SIZE) {
 		const auto &group = groups[state.offset];
 		for (idx_t key = 0; key < group.first.size(); key++) {
-			output.SetValue(key, produced, Value::BIGINT(group.first[key]));
+			output.data[key].SetValue(produced, Value::BIGINT(group.first[key]));
 		}
-		output.SetValue(group.first.size(), produced, Value::BIGINT(group.second[0]));
+		output.data[group.first.size()].SetValue(produced, Value::BIGINT(group.second[0]));
 		state.offset++;
 		produced++;
 	}
-	output.SetCardinality(produced);
+	output.SetChildCardinality(produced);
 }
 
 void ExecuteTuples(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<FactorizedCountGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -648,11 +651,11 @@ void ExecuteTuples(ClientContext &context, TableFunctionInput &data, DataChunk &
 		                            static_cast<uint64_t>(STANDARD_VECTOR_SIZE));
 	}
 
-	output.SetCardinality(result.tuples.size());
+	output.SetChildCardinality(result.tuples.size());
 	for (idx_t row = 0; row < result.tuples.size(); row++) {
 		const auto &tuple = result.tuples[row];
 		for (idx_t column = 0; column < tuple.size(); column++) {
-			output.SetValue(column, row, Value::BIGINT(tuple[column]));
+			output.data[column].SetValue(row, Value::BIGINT(tuple[column]));
 		}
 	}
 }

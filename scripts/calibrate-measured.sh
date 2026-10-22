@@ -33,7 +33,7 @@ while IFS='|' read -r name expected q; do
   force=$(echo "$outf" | best '5,6')
   # Records the operator actually built, summed over its materialised steps.
   recs=$(echo "$outf" | grep -o '\[[0-9]*: [0-9]* recs' | grep -o '[0-9]* recs' | awk '{s+=$1} END {print s+0}')
-  fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" | timeout 60 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+  fired=$(printf '%s\n' "SET factorize_mode=${Q}auto${Q};" "EXPLAIN $q;" | timeout 60 "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
   echo "${name},${rows:-0},${recs:-0},${expected},${off},${force},${fired}" >> "$OUT"
   printf '%-28s rows %-9s recs %-11s off %-8s force %-8s fired=%s\n' "$name" "${rows:-?}" "${recs:-?}" "${off:-to}" "${force:-to}" "$fired"
 done < tmp/ce_runnable_sql.psv

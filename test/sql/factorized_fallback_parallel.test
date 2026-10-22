@@ -187,7 +187,7 @@ SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
 query II
 EXPLAIN SELECT count(*) FROM pf_h, pf_a, pf_b WHERE pf_h.k = pf_a.k AND pf_h.k = pf_b.k;
 ----
-physical_plan	<REGEX>:.*FACTORIZED.*
+physical_plan	<REGEX>:.*Factorized.*
 
 # The count does not depend on how many buckets the partition was dealt into,
 # which is what makes the parallel source safe to be parallel.

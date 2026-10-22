@@ -38,7 +38,7 @@ for kind in $KINDS; do
         off=$(echo "$(date +%s.%N) - ${s}" | bc)
         for v in $VALUES; do
             fired=$(printf '%s\n' "SET factorize_fold_cost=${v};" "SET factorize_mode=${Q}auto${Q};" "EXPLAIN ${q};" |
-                timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -c FACTORIZED)
+                timeout "$CAP" "$D" -readonly "$DB" -noheader -list 2>&1 | grep -ci Factorized)
             s=$(date +%s.%N)
             printf '%s\n' "SET factorize_fold_cost=${v};" "SET factorize_mode=${Q}auto${Q};" "${q};" |
                 timeout "$CAP" "$D" -readonly "$DB" -noheader -list >/dev/null 2>&1

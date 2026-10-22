@@ -4,6 +4,7 @@
 #include "factorize/calibration.hpp"
 #include "factorize/stats_cache.hpp"
 #include "factorize/storage_source.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -19,6 +20,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -125,7 +127,7 @@ struct FactorizedRegion {
 	//! rebind the aggregate onto its output. Without the map the aggregate's
 	//! column "belongs to no relation of the region" and the fold is declined
 	//! (D86).
-	std::map<std::pair<idx_t, idx_t>, ColumnBinding> projection_passthrough;
+	std::map<std::pair<TableIndex, ProjectionIndex>, ColumnBinding> projection_passthrough;
 	vector<reference<LogicalGet>> relations;
 	//! The filter sitting above each relation's scan, if any. Parallel to
 	//! `relations`.
@@ -174,7 +176,7 @@ static bool IsCompressedMaterialization(const Expression &expr) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
-	const auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+	const auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
 	return StringUtil::StartsWith(name, "__internal_compress") || StringUtil::StartsWith(name, "__internal_decompress");
 }
 
@@ -299,7 +301,30 @@ static bool MatchLeaf(LogicalOperator &op, FactorizedRegion &region) {
 //! rather than guessed at.
 static bool TryPassThroughBinding(const Expression &expr, ColumnBinding &binding) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		binding = expr.Cast<BoundColumnRefExpression>().binding;
+		binding = expr.Cast<BoundColumnRefExpression>().Binding();
+		return true;
+	}
+	// A widening integer cast, which 2.0 also represents as a function
+	// expression. MatchProjections has always seen through one above the join
+	// -- `sum(a::BIGINT * b)` is the only form of sum(x * y) the aggregate
+	// matcher accepts (D86) -- and this walk has to see through one *inside*
+	// the join tree for the same reason. It did not, and sum(x * y) went from
+	// 28 fires to 2 on the runnable corpus with every test still green: the
+	// region was declined with "not a scan: PROJECTION", which is a decline
+	// and therefore a correct answer, which is why nothing failed (D116).
+	//
+	// Only widening, and only between integers: the join compares the cast
+	// values and this engine would compare the base ones, which agree exactly
+	// when the cast cannot lose or reorder a value.
+	if (BoundCastExpression::IsCast(expr)) {
+		const auto &cast = expr.Cast<BoundFunctionExpression>();
+		const auto &child = BoundCastExpression::Child(cast);
+		const auto from = BoundCastExpression::SourceType(cast);
+		if (child.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF || !from.IsIntegral() ||
+		    GetTypeIdSize(from.InternalType()) > GetTypeIdSize(BoundCastExpression::TargetType(cast).InternalType())) {
+			return false;
+		}
+		binding = child.Cast<BoundColumnRefExpression>().Binding();
 		return true;
 	}
 	if (!IsCompressedMaterialization(expr)) {
@@ -310,7 +335,7 @@ static bool TryPassThroughBinding(const Expression &expr, ColumnBinding &binding
 	// function this does not understand.
 	const auto &function = expr.Cast<BoundFunctionExpression>();
 	const Expression *column = nullptr;
-	for (const auto &child : function.children) {
+	for (const auto &child : function.GetChildren()) {
 		if (child->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			if (column) {
 				return false;
@@ -323,7 +348,7 @@ static bool TryPassThroughBinding(const Expression &expr, ColumnBinding &binding
 	if (!column) {
 		return false;
 	}
-	binding = column->Cast<BoundColumnRefExpression>().binding;
+	binding = column->Cast<BoundColumnRefExpression>().Binding();
 	return true;
 }
 
@@ -344,7 +369,7 @@ static bool TryPassThroughProjection(LogicalOperator &op, FactorizedRegion &regi
 		}
 	}
 	for (idx_t position = 0; position < proj.expressions.size(); position++) {
-		region.projection_passthrough[{proj.table_index, position}] = resolved[position];
+		region.projection_passthrough[std::make_pair(proj.table_index, ProjectionIndex(position))] = resolved[position];
 	}
 	return true;
 }
@@ -376,12 +401,14 @@ static bool MatchJoinGraph(LogicalOperator &op, FactorizedRegion &region) {
 		Decline(region, "join is duplicate-eliminated");
 		ok = false;
 	}
-	if (join.predicate) {
-		// An ON-clause restriction that references only one side. It filters the
-		// join's output and nothing outside the region would apply it.
-		Decline(region, "join carries an ON-clause filter");
-		ok = false;
-	}
+	// DuckDB 1.x carried an ON-clause restriction that references only one
+	// side on LogicalComparisonJoin::predicate, and this declined it: the
+	// region would not have applied it, which is a wrong count rather than a
+	// slow query. 2.0 removed the member -- such a restriction is no longer
+	// represented on the join -- so there is nothing to test here. The shape
+	// is pinned by test/sql/factorized_on_clause.test instead, which asserts
+	// `auto` still equals `off` on it, because "the field went away" is not
+	// by itself evidence that the query is now handled correctly (D116).
 	if (join.conditions.empty()) {
 		Decline(region, "join has no conditions");
 		ok = false;
@@ -394,7 +421,20 @@ static bool MatchJoinGraph(LogicalOperator &op, FactorizedRegion &region) {
 		return false;
 	}
 	for (auto &cond : join.conditions) {
-		if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+		// 2.0 lets a JoinCondition hold an arbitrary expression instead of a
+		// left/right comparison -- `comparison` is INVALID then, and
+		// GetComparisonType, GetLHS and GetRHS all throw. That is where 1.x's
+		// LogicalComparisonJoin::predicate went, which this rule declined as a
+		// restriction the region would not apply. It is declined here instead,
+		// by the same equality test; asking IsComparison first is what keeps
+		// the getters legal, and swapping the field accesses for the getters
+		// without it would turn a decline into an exception (D116).
+		if (!cond.IsComparison()) {
+			Decline(region, "join carries a condition that is not a left/right comparison");
+			ok = false;
+			continue;
+		}
+		if (cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 			Decline(region, "join condition is not an equality");
 			ok = false;
 			continue;
@@ -402,14 +442,14 @@ static bool MatchJoinGraph(LogicalOperator &op, FactorizedRegion &region) {
 		// A cast, or any other computed expression, would have to be evaluated
 		// on values the f-representation holds in packed integer slots. Only a
 		// bare column reference maps onto one.
-		if (cond.left->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-		    cond.right->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		if (cond.GetLHS().GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+		    cond.GetRHS().GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			Decline(region, "join key is computed, not a plain column");
 			ok = false;
 			continue;
 		}
-		region.edges.emplace_back(cond.left->Cast<BoundColumnRefExpression>().binding,
-		                          cond.right->Cast<BoundColumnRefExpression>().binding);
+		region.edges.emplace_back(cond.GetLHS().Cast<BoundColumnRefExpression>().Binding(),
+		                          cond.GetRHS().Cast<BoundColumnRefExpression>().Binding());
 	}
 	// Both sides, always: `&&` would have skipped the second subtree whenever
 	// the first declined, hiding every blocker on the right of a bad left.
@@ -490,7 +530,12 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 			ok = false;
 			continue;
 		}
-		if (expr->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+		// A cast is a `BoundFunctionExpression` in DuckDB 2.0 -- the class
+		// ExpressionClass::BOUND_CAST is gone and BoundCastExpression is now a
+		// set of static helpers over the `__cast` scalar function. Asking
+		// IsCast is the supported test; matching the function's name would
+		// work today and break on the next rename.
+		if (BoundCastExpression::IsCast(*expr)) {
 			// A widening integer cast is not a computation the island has to
 			// perform: the fold reads the column and accumulates in int64
 			// regardless, so casting INTEGER to BIGINT changes nothing it does.
@@ -500,23 +545,25 @@ static bool MatchProjections(LogicalOperator &op, FactorizedRegion &region) {
 			// (D86) -- and without this the cast lands in a projection and is
 			// refused one rule earlier, which took the whole aggregate from 36
 			// fires to 0.
-			auto &cast = expr->Cast<BoundCastExpression>();
-			const auto &from = cast.child->return_type;
-			if (cast.child->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF && from.IsIntegral() &&
-			    GetTypeIdSize(from.InternalType()) <= GetTypeIdSize(cast.return_type.InternalType())) {
+			auto &cast = expr->Cast<BoundFunctionExpression>();
+			const auto &child = BoundCastExpression::Child(cast);
+			const auto from = BoundCastExpression::SourceType(cast);
+			if (child.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF && from.IsIntegral() &&
+			    GetTypeIdSize(from.InternalType()) <=
+			        GetTypeIdSize(BoundCastExpression::TargetType(cast).InternalType())) {
 				// Record what this output column really is, because the
 				// aggregate above now names the projection rather than the
 				// table and the resolver works in table terms.
-				region.projection_passthrough[{proj.table_index, position}] =
-				    cast.child->Cast<BoundColumnRefExpression>().binding;
+				region.projection_passthrough[std::make_pair(proj.table_index, ProjectionIndex(position))] =
+				    child.Cast<BoundColumnRefExpression>().Binding();
 				continue;
 			}
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			// Mapped too, so a cast in one projection still resolves when a
 			// second pass-through projection sits above it.
-			region.projection_passthrough[{proj.table_index, position}] =
-			    expr->Cast<BoundColumnRefExpression>().binding;
+			region.projection_passthrough[std::make_pair(proj.table_index, ProjectionIndex(position))] =
+			    expr->Cast<BoundColumnRefExpression>().Binding();
 		}
 		if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			// Any other computed expression would have to be evaluated on
@@ -564,15 +611,16 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		// It is also, measured against TPC-DS, the single restriction that
 		// mattered most: 47 of 99 queries were declined for this reason alone.
 		region.grouped = true;
-		region.group_index = aggr.group_index;
+		// 2.0's plan indexes are strong types; this region keeps idx_t.
+		region.group_index = aggr.group_index.index;
 		for (auto &group : aggr.groups) {
 			if (group->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 				Decline(region, "aggregate groups on a computed expression");
 				ok = false;
 				continue;
 			}
-			region.group_bindings.push_back(group->Cast<BoundColumnRefExpression>().binding);
-			region.group_types.push_back(group->return_type);
+			region.group_bindings.push_back(group->Cast<BoundColumnRefExpression>().Binding());
+			region.group_types.push_back(group->GetReturnType());
 		}
 	}
 	if (aggr.expressions.empty()) {
@@ -583,7 +631,7 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 		Decline(region, "aggregate computes more than " + std::to_string(factorize::kMaxAggregates) + " values");
 		ok = false;
 	}
-	region.aggregate_index = aggr.aggregate_index;
+	region.aggregate_index = aggr.aggregate_index.index;
 	// Several aggregates are folded side by side in one walk of the
 	// representation, because they are folds over the same tuples and differ
 	// only in what each carries. This used to stop at one, and measured against
@@ -599,14 +647,33 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			continue;
 		}
 		auto &bound = expression->Cast<BoundAggregateExpression>();
-		if (bound.IsDistinct() || bound.filter || bound.order_bys) {
+		// A half-finished aggregate, not a value.
+		//
+		// DuckDB 2.0 can split a grouped aggregate into a partial pass whose
+		// outputs are AGGREGATE_STATE, a `combine_aggr` pass, and a `finalize`
+		// projection. Matching the partial pass and replacing it with an
+		// operator that promises BIGINT is a plan that fails to bind --
+		// "inequal types (AGGREGATE_STATE != BIGINT)" -- before the query runs.
+		//
+		// This engine folds values, and a serialized accumulator is not one, so
+		// the shape is declined wherever it appears. Reached on a three-relation
+		// grouped aggregate with `disabled_optimizers='compressed_materialization'`,
+		// which is the workaround this rule's own decline message recommends,
+		// and reached under the shipped defaults rather than only under
+		// `force` (D116).
+		if (expression->GetReturnType().IsAggregateState()) {
+			Decline(region, "aggregate is a partial aggregate over serialized state");
+			ok = false;
+			continue;
+		}
+		if (bound.IsDistinct() || bound.GetFilter() || bound.GetOrderBys()) {
 			Decline(region, "aggregate is DISTINCT, FILTERed or ORDERed");
 			ok = false;
 			continue;
 		}
 		RegionAggregate entry;
-		entry.type = expression->return_type;
-		auto name = StringUtil::Lower(bound.function.name);
+		entry.type = expression->GetReturnType();
+		auto name = StringUtil::Lower(bound.Function().GetName().GetIdentifierName());
 		if (name == "sum") {
 			// Summing is the semiring generalisation the plan always had as the
 			// widening step (§4.5), and on TPC-DS it is the aggregate that
@@ -614,15 +681,15 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			// against 24 for count(*). The column has to be a plain column of
 			// the region, since it is folded through the representation rather
 			// than evaluated.
-			if (bound.children.size() == 1 &&
-			    bound.children[0]->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			if (bound.GetChildren().size() == 1 &&
+			    bound.GetChildren()[0]->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 				// sum(x * y) is the aggregate factorisation is *for*: over
 				// independent branches it decomposes into a product of
 				// one-column sums, so the pairings of x and y are never
 				// enumerated even though they are the join result (D80).
-				auto &function = bound.children[0]->Cast<BoundFunctionExpression>();
-				const auto function_name = StringUtil::Lower(function.function.name);
-				if ((function_name != "*" && function_name != "multiply") || function.children.size() != 2) {
+				auto &function = bound.GetChildren()[0]->Cast<BoundFunctionExpression>();
+				const auto function_name = StringUtil::Lower(function.Function().GetName().GetIdentifierName());
+				if ((function_name != "*" && function_name != "multiply") || function.GetChildren().size() != 2) {
 					Decline(region, "sum() of a computed expression");
 					ok = false;
 					continue;
@@ -644,9 +711,9 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				// and wider the two agree: DuckDB computes in int64 too, and
 				// where that overflows CheckedCardinalityMul throws, the
 				// operator falls back, and the stock plan raises the same error.
-				const auto width = function.return_type.InternalType();
+				const auto width = function.GetReturnType().InternalType();
 				if (width != PhysicalType::INT64 && width != PhysicalType::INT128) {
-					Decline(region, "sum() of a " + function.return_type.ToString() +
+					Decline(region, "sum() of a " + function.GetReturnType().ToString() +
 					                    " product, which overflows at a width this engine would not");
 					ok = false;
 					continue;
@@ -656,19 +723,24 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				// column underneath, so the cast must only widen -- reading an
 				// int64 column through a narrowing cast would fold values the
 				// query never asked for.
-				reference<Expression> operands[2] = {*function.children[0], *function.children[1]};
+				reference<Expression> operands[2] = {*function.GetChildren()[0], *function.GetChildren()[1]};
 				bool operands_ok = true;
 				for (auto &operand : operands) {
 					auto *expression = &operand.get();
-					if (expression->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-						auto &cast = expression->Cast<BoundCastExpression>();
-						const auto from = cast.child->return_type;
+					if (BoundCastExpression::IsCast(*expression)) {
+						// 2.0 represents a cast as the `__cast` scalar
+						// function rather than its own expression class, so
+						// the operand is reached through the helpers rather
+						// than through a member.
+						auto &cast = expression->Cast<BoundFunctionExpression>();
+						const auto from = BoundCastExpression::SourceType(cast);
 						if (!from.IsIntegral() ||
-						    GetTypeIdSize(from.InternalType()) > GetTypeIdSize(cast.return_type.InternalType())) {
+						    GetTypeIdSize(from.InternalType()) >
+						        GetTypeIdSize(BoundCastExpression::TargetType(cast).InternalType())) {
 							operands_ok = false;
 							break;
 						}
-						expression = cast.child.get();
+						expression = BoundCastExpression::ChildMutable(cast).get();
 					}
 					if (expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 						operands_ok = false;
@@ -693,35 +765,35 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 				}
 				entry.kind = factorize::Aggregate::SUM_PRODUCT;
 				entry.reads_column = true;
-				entry.sum_binding = operands[0].get().Cast<BoundColumnRefExpression>().binding;
-				entry.second_binding = operands[1].get().Cast<BoundColumnRefExpression>().binding;
+				entry.sum_binding = operands[0].get().Cast<BoundColumnRefExpression>().Binding();
+				entry.second_binding = operands[1].get().Cast<BoundColumnRefExpression>().Binding();
 				region.aggregates.push_back(std::move(entry));
 				continue;
 			}
-			if (bound.children.size() != 1 ||
-			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			if (bound.GetChildren().size() != 1 ||
+			    bound.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 				Decline(region, "sum() of a computed expression");
 				ok = false;
 				continue;
 			}
 			entry.kind = factorize::Aggregate::SUM;
 			entry.reads_column = true;
-			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+			entry.sum_binding = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
 		} else if (name == "avg") {
 			// sum / count, and the walk already has both: the sum is the same
 			// fold, the count is the tuple count every group carries anyway. So
 			// a mean costs a division and no extra pass (D78).
-			if (bound.children.size() != 1 ||
-			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			if (bound.GetChildren().size() != 1 ||
+			    bound.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 				Decline(region, "avg() of a computed expression");
 				ok = false;
 				continue;
 			}
 			entry.kind = factorize::Aggregate::AVG;
 			entry.reads_column = true;
-			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
-		} else if (name == "count" && bound.children.size() == 1 &&
-		           bound.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			entry.sum_binding = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
+		} else if (name == "count" && bound.GetChildren().size() == 1 &&
+		           bound.GetChildren()[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			// `count(c)` counts the rows where `c` is not NULL. The fold counts
 			// tuples and knows nothing of NULLs, so this is `count(*)` exactly
 			// when `c` cannot be NULL -- and that is the same condition the
@@ -729,33 +801,33 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			// reason, so it is checked in the same place.
 			entry.kind = factorize::Aggregate::COUNT;
 			entry.reads_column = true;
-			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+			entry.sum_binding = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
 		} else if (name == "bool_and" || name == "bool_or") {
 			// The same idempotent semiring as min and max, over {false, true}:
 			// bool_and is the minimum and bool_or the maximum once false is 0
 			// and true is 1, which is how a BOOLEAN reaches the representation
 			// (D79). So no new fold -- only a different name for an existing
 			// one, and a BOOLEAN result rather than an integer one.
-			if (bound.children.size() != 1 ||
-			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			if (bound.GetChildren().size() != 1 ||
+			    bound.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 				Decline(region, name + "() of a computed expression");
 				ok = false;
 				continue;
 			}
-			if (bound.children[0]->return_type.id() != LogicalTypeId::BOOLEAN) {
-				Decline(region, name + "() of a " + bound.children[0]->return_type.ToString() + " column");
+			if (bound.GetChildren()[0]->GetReturnType().id() != LogicalTypeId::BOOLEAN) {
+				Decline(region, name + "() of a " + bound.GetChildren()[0]->GetReturnType().ToString() + " column");
 				ok = false;
 				continue;
 			}
 			entry.kind = name == "bool_and" ? factorize::Aggregate::MIN : factorize::Aggregate::MAX;
 			entry.reads_column = true;
-			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
+			entry.sum_binding = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
 		} else if (name == "min" || name == "max") {
 			// The same fold again, with the idempotent semiring (D77). Same
 			// requirement on the argument and for the same reason: it is folded
 			// through the representation, not evaluated per tuple.
-			if (bound.children.size() != 1 ||
-			    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			if (bound.GetChildren().size() != 1 ||
+			    bound.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 				Decline(region, name + "() of a computed expression");
 				ok = false;
 				continue;
@@ -765,7 +837,7 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			// reassociate freely, unlike sum -- is still declined here because
 			// there is nowhere to put it (D10's restriction, for a different
 			// reason than D10's).
-			const auto &value_type = bound.children[0]->return_type;
+			const auto &value_type = bound.GetChildren()[0]->GetReturnType();
 			if (!value_type.IsIntegral() && value_type.id() != LogicalTypeId::DECIMAL) {
 				Decline(region, name + "() of a " + value_type.ToString() + " column");
 				ok = false;
@@ -773,8 +845,8 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 			}
 			entry.kind = name == "min" ? factorize::Aggregate::MIN : factorize::Aggregate::MAX;
 			entry.reads_column = true;
-			entry.sum_binding = bound.children[0]->Cast<BoundColumnRefExpression>().binding;
-		} else if (name != "count_star" && !(name == "count" && bound.children.empty())) {
+			entry.sum_binding = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
+		} else if (name != "count_star" && !(name == "count" && bound.GetChildren().empty())) {
 			Decline(region, "aggregate is " + name + "(), not count, sum, min, max or avg");
 			ok = false;
 			continue;
@@ -819,6 +891,21 @@ static bool MatchAggregate(LogicalOperator &op, FactorizedRegion &region) {
 //! One predicate, translated: which column it reads and the filter to apply.
 using TranslatedFilter = std::pair<ColumnBinding, unique_ptr<TableFilter>>;
 
+//! A single-column table filter in the form DuckDB 2.0's scan accepts.
+//!
+//! 2.0 replaced the constant and null table filters with ExpressionFilter and
+//! kept the old classes only for deserialization: TableFilterSet::PushFilter
+//! throws "expected ExpressionFilter" on anything else. It compiles either
+//! way, which is why this was found by a test rather than the compiler.
+//!
+//! The legacy object is still the clearest way to say what the filter means,
+//! so it is built and then converted -- FromTableFilter is DuckDB's own
+//! bridge, and it supplies the BoundReferenceExpression(0) placeholder that
+//! a single-column filter is evaluated against.
+static unique_ptr<TableFilter> ScanFilter(unique_ptr<TableFilter> legacy, const LogicalType &column_type) {
+	return ExpressionFilter::FromTableFilter(*legacy, column_type);
+}
+
 //! `5 < x` says the same thing as `x > 5`, and only the second form is a
 //! TableFilter.
 static ExpressionType MirrorComparison(ExpressionType type) {
@@ -845,12 +932,28 @@ static ExpressionType MirrorComparison(ExpressionType type) {
 //! alternative -- evaluating arbitrary expressions here -- would be a second
 //! implementation of DuckDB's own expression semantics, judged against a count
 //! that has to match it exactly.
+//! Whether an expression is 2.0's `__between` function.
+//!
+//! BoundBetweenExpression offers no predicate of its own, unlike casts and
+//! comparisons, so this asks the question its accessors require to be true:
+//! a bound function whose expression type is COMPARE_BETWEEN.
+static bool IsBetween(const Expression &expr) {
+	return expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	       expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN;
+}
+
 static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> &out) {
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
-		auto &comparison = expr.Cast<BoundComparisonExpression>();
+	// Comparisons and BETWEEN are function expressions in DuckDB 2.0, the
+	// same move it made for casts: the classes survive only as static helpers
+	// over `__comparison` and `__between`. The helper predicate is the
+	// supported test -- ExpressionClass::BOUND_COMPARISON is now
+	// LEGACY_BOUND_COMPARISON and matches nothing a current plan produces,
+	// which would make this translator silently decline every filter.
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto &comparison = expr.Cast<BoundFunctionExpression>();
 		auto type = comparison.GetExpressionType();
-		const Expression *column_side = comparison.left.get();
-		const Expression *constant_side = comparison.right.get();
+		const Expression *column_side = &BoundComparisonExpression::Left(comparison);
+		const Expression *constant_side = &BoundComparisonExpression::Right(comparison);
 		if (column_side->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 			std::swap(column_side, constant_side);
 			type = MirrorComparison(type);
@@ -873,34 +976,44 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 			return false;
 		}
 		auto &constant = constant_side->Cast<BoundConstantExpression>();
-		if (constant.value.IsNull() || constant.value.type() != column_side->return_type) {
+		if (constant.GetValue().IsNull() || constant.GetValue().type() != column_side->GetReturnType()) {
 			// A comparison across types is decided by rules a ConstantFilter on
 			// the column's own type would not reproduce.
 			return false;
 		}
-		out.emplace_back(column_side->Cast<BoundColumnRefExpression>().binding,
-		                 make_uniq<ConstantFilter>(type, constant.value));
+		out.emplace_back(
+		    column_side->Cast<BoundColumnRefExpression>().Binding(),
+		    ScanFilter(make_uniq<LegacyConstantFilter>(type, constant.GetValue()), column_side->GetReturnType()));
 		return true;
 	}
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_BETWEEN) {
+	if (IsBetween(expr)) {
 		// What a two-sided range from statistics propagation arrives as, and the
 		// most common thing left above a scan on this corpus. It is two constant
 		// comparisons wearing one hat.
-		auto &between = expr.Cast<BoundBetweenExpression>();
-		if (between.input->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-		    between.lower->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
-		    between.upper->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		auto &between = expr.Cast<BoundFunctionExpression>();
+		const auto &input = BoundBetweenExpression::Input(between);
+		const auto &lower_bound = BoundBetweenExpression::LowerBound(between);
+		const auto &upper_bound = BoundBetweenExpression::UpperBound(between);
+		if (input.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+		    lower_bound.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
+		    upper_bound.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 			return false;
 		}
-		auto &lower = between.lower->Cast<BoundConstantExpression>();
-		auto &upper = between.upper->Cast<BoundConstantExpression>();
-		if (lower.value.IsNull() || upper.value.IsNull() || lower.value.type() != between.input->return_type ||
-		    upper.value.type() != between.input->return_type) {
+		auto &lower = lower_bound.Cast<BoundConstantExpression>();
+		auto &upper = upper_bound.Cast<BoundConstantExpression>();
+		if (lower.GetValue().IsNull() || upper.GetValue().IsNull() ||
+		    lower.GetValue().type() != input.GetReturnType() || upper.GetValue().type() != input.GetReturnType()) {
 			return false;
 		}
-		const auto binding = between.input->Cast<BoundColumnRefExpression>().binding;
-		out.emplace_back(binding, make_uniq<ConstantFilter>(between.LowerComparisonType(), lower.value));
-		out.emplace_back(binding, make_uniq<ConstantFilter>(between.UpperComparisonType(), upper.value));
+		const auto binding = input.Cast<BoundColumnRefExpression>().Binding();
+		out.emplace_back(
+		    binding, ScanFilter(make_uniq<LegacyConstantFilter>(BoundBetweenExpression::LowerComparisonType(between),
+		                                                        lower.GetValue()),
+		                        input.GetReturnType()));
+		out.emplace_back(
+		    binding, ScanFilter(make_uniq<LegacyConstantFilter>(BoundBetweenExpression::UpperComparisonType(between),
+		                                                        upper.GetValue()),
+		                        input.GetReturnType()));
 		return true;
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
@@ -910,7 +1023,7 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 			// themselves ANDed together.
 			return false;
 		}
-		for (auto &child : conjunction.children) {
+		for (auto &child : conjunction.GetChildren()) {
 			if (!TryTranslateFilter(*child, out)) {
 				return false;
 			}
@@ -919,16 +1032,19 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 		auto &op = expr.Cast<BoundOperatorExpression>();
-		if (op.children.size() != 1 || op.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		if (op.GetChildren().size() != 1 ||
+		    op.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return false;
 		}
-		const auto binding = op.children[0]->Cast<BoundColumnRefExpression>().binding;
+		const auto binding = op.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
 		if (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
-			out.emplace_back(binding, make_uniq<IsNullFilter>());
+			out.emplace_back(binding,
+			                 ScanFilter(make_uniq<LegacyIsNullFilter>(), op.GetChildren()[0]->GetReturnType()));
 			return true;
 		}
 		if (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
-			out.emplace_back(binding, make_uniq<IsNotNullFilter>());
+			out.emplace_back(binding,
+			                 ScanFilter(make_uniq<LegacyIsNotNullFilter>(), op.GetChildren()[0]->GetReturnType()));
 			return true;
 		}
 		return false;
@@ -940,7 +1056,7 @@ static bool TryTranslateFilter(const Expression &expr, vector<TranslatedFilter> 
 static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<BoundRelation> &relations,
                        factorize::QueryGraph &graph, vector<factorize::GroupKey> &group_keys,
                        vector<factorize::GroupAggregate> &aggregates) {
-	std::map<idx_t, size_t> relation_of_table_index;
+	std::map<TableIndex, size_t> relation_of_table_index;
 	for (size_t i = 0; i < region.relations.size(); i++) {
 		auto &get = region.relations[i].get();
 		if (!relation_of_table_index.emplace(get.table_index, i).second) {
@@ -952,7 +1068,7 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 		relation.entry = get.GetTable();
 		// A self-join is two relations over one table, and an EXPLAIN reading
 		// "yago2.s = yago2.o" would say nothing about which scan is which.
-		relation.alias = get.GetTable()->name;
+		relation.alias = get.GetTable()->name.GetIdentifierName();
 		for (auto &earlier : relations) {
 			if (earlier.alias == relation.alias) {
 				relation.alias += "#" + to_string(i);
@@ -1013,7 +1129,7 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			auto &bound = relations[relation];
 			if (bound.LocalIndex(physical) < 0) {
 				bound.columns.push_back(physical);
-				bound.column_names.push_back(definition.Name());
+				bound.column_names.push_back(definition.Name().GetIdentifierName());
 				bound.column_types.push_back(value_type);
 			}
 			edge_relation[side] = relation;
@@ -1111,7 +1227,7 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			const auto physical = static_cast<idx_t>(definition.Physical().index);
 			if (bound.LocalIndex(physical) < 0) {
 				bound.columns.push_back(physical);
-				bound.column_names.push_back(definition.Name());
+				bound.column_names.push_back(definition.Name().GetIdentifierName());
 				bound.column_types.push_back(value_type);
 			}
 			const auto local = static_cast<size_t>(bound.LocalIndex(physical));
@@ -1211,7 +1327,7 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 		}
 		if (existing < 0) {
 			bound.columns.push_back(physical);
-			bound.column_names.push_back(definition.Name());
+			bound.column_names.push_back(definition.Name().GetIdentifierName());
 			bound.column_types.push_back(value_type);
 		}
 		const auto local = static_cast<size_t>(bound.LocalIndex(physical));
@@ -1270,14 +1386,36 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 			return true;
 		};
 
-		for (auto &filter : get.table_filters.filters) {
-			// Pushed-down filters are keyed by the table's own column index, the
-			// same space LogicalGet's column ids live in.
+		// 2.0 made TableFilterSet's map private and dropped TableFilter::Copy;
+		// the set copies as a whole and is walked through its own iterator.
+		auto copied = get.table_filters.Copy();
+		for (auto &entry : *copied) {
+			// The filter's key is a ProjectionIndex -- a position in the scan's
+			// own projection list -- and has to be mapped through the scan's
+			// column ids to reach the table column it restricts.
+			//
+			// DuckDB 1.x keyed this set by the table's column index, so the key
+			// could be used directly. 2.0 keys it by projection position, and
+			// the two agree only for the first column. Using the key as a
+			// LogicalIndex therefore picked the wrong column for every filter
+			// after the first and pushed the restriction onto it: measured on
+			// `n_p.w > 5` over a three-column table, `force` returned 700 where
+			// `off` returned 500, because the filter landed on `v` and `w` was
+			// never restricted. It compiles because ProjectionIndex converts to
+			// idx_t implicitly (D116).
+			auto &scan_columns = get.GetColumnIds();
+			if (entry.GetIndex() >= scan_columns.size()) {
+				return Decline(region, "pushed-down filter is keyed outside the scan's projection");
+			}
+			auto &filter_column = scan_columns[entry.GetIndex()];
+			if (filter_column.IsRowIdColumn() || filter_column.IsVirtualColumn() || filter_column.HasChildren()) {
+				return Decline(region, "pushed-down filter reads a column that is not stored");
+			}
 			int position = 0;
-			if (!scan_position(get.GetTable()->GetColumn(LogicalIndex(filter.first)), position)) {
+			if (!scan_position(get.GetTable()->GetColumn(LogicalIndex(filter_column.GetPrimaryIndex())), position)) {
 				return Decline(region, "pushed-down filter reads a column the scan cannot produce");
 			}
-			remapped->PushFilter(ColumnIndex(static_cast<idx_t>(position)), filter.second->Copy());
+			remapped->PushFilter(ProjectionIndex(static_cast<idx_t>(position)), entry.TakeFilter());
 		}
 
 		if (region.leaf_filters[i]) {
@@ -1306,11 +1444,11 @@ static bool BindRegion(ClientContext &context, FactorizedRegion &region, vector<
 				if (!scan_position(get.GetTable()->GetColumn(LogicalIndex(column_index.GetPrimaryIndex())), position)) {
 					return Decline(region, "filter reads a column the scan cannot produce");
 				}
-				remapped->PushFilter(ColumnIndex(static_cast<idx_t>(position)), std::move(entry.second));
+				remapped->PushFilter(ProjectionIndex(static_cast<idx_t>(position)), std::move(entry.second));
 			}
 		}
 
-		if (!remapped->filters.empty()) {
+		if (remapped->HasFilters()) {
 			bound.filters = std::move(remapped);
 		}
 	}
@@ -1604,7 +1742,9 @@ static bool GateAgrees(ClientContext &context, const FactorizedRegion &region, c
 		std::vector<std::string> tables;
 		for (const auto &bound : relations) {
 			if (bound.entry) {
-				tables.push_back(bound.entry->name);
+				// Catalog names are case-insensitive Identifiers in 2.0; the gate's
+				// correction store keys on the raw text, as it did before.
+				tables.push_back(bound.entry->name.GetIdentifierName());
 			}
 		}
 		const double min_obs = DoubleSetting(context, "factorize_learn_min_queries", 3.0);
