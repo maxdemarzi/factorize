@@ -17,6 +17,7 @@
 #include "../../src/core/plan.hpp"
 
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -447,6 +448,50 @@ static void TestReducedExtremeAgreesWithANestedLoop() {
 }
 
 //! What it refuses, and why that is the conservative side.
+static void TestReducedExtremeHandlesTheSentinelKey() {
+	Group scope("a join key equal to the empty-slot sentinel is still a key");
+
+	// The reducer's key set marks an unoccupied slot with INT64_MIN, so that
+	// is the one value it cannot store the ordinary way. A relation is free
+	// to contain it, and the answer must not depend on which value the table
+	// happens to have reserved.
+	const int64_t sentinel = std::numeric_limits<int64_t>::min();
+
+	QueryGraph chain;
+	chain.column_counts.assign(2, 2);
+	chain.column_types.assign(2, {ValueType::INT64, ValueType::INT64});
+	chain.predicates = {Predicate {0, 1, 1, 0}};
+
+	// The only key the two relations share is the sentinel, so the join is
+	// non-empty and its single row carries the value 70.
+	MemorySource shared;
+	shared.Add({{70, 80}, {sentinel, 5}});
+	shared.Add({{sentinel, 9}, {0, 0}});
+	const auto low = ExecuteExtremeReduced(chain, shared, 0, 0, true);
+	Expect(low.ok, "a chain joined on the sentinel is accepted");
+	Expect(low.any, "the sentinel key matches rather than reading as an empty slot");
+	Expect(low.value == 70, "min over the sentinel match is 70, got " + std::to_string(low.value));
+
+	// The child holds the sentinel and the parent does not: nothing matches,
+	// and a table that confused the sentinel for an empty slot would say so
+	// for the wrong reason, so check the opposite direction too.
+	MemorySource unmatched;
+	unmatched.Add({{70, 80}, {1, 5}});
+	unmatched.Add({{sentinel, 9}, {0, 0}});
+	const auto none = ExecuteExtremeReduced(chain, unmatched, 0, 0, true);
+	Expect(none.ok, "the unmatched chain is accepted");
+	Expect(!none.any, "a sentinel in the child alone does not match");
+
+	// The sentinel in the parent, absent from the child, must not match the
+	// empty slots the child's table is full of.
+	MemorySource parent_only;
+	parent_only.Add({{70, 80}, {sentinel, 5}});
+	parent_only.Add({{1, 9}, {0, 0}});
+	const auto missing = ExecuteExtremeReduced(chain, parent_only, 0, 0, true);
+	Expect(missing.ok, "the parent-only chain is accepted");
+	Expect(!missing.any, "a sentinel probe against a table without it does not match");
+}
+
 static void TestReducedExtremeRefusesWhatItCannotPromise() {
 	Group scope("the reducer declines a cycle, a non-tree and a column it does not have");
 
@@ -1126,6 +1171,8 @@ int main() {
 	TestReducedExtremeAgreesWithANestedLoop();
 	std::printf("\n");
 	TestReducedExtremeRefusesWhatItCannotPromise();
+	std::printf("\n");
+	TestReducedExtremeHandlesTheSentinelKey();
 	std::printf("\n");
 	TestSlicingIsExact();
 	std::printf("\n");

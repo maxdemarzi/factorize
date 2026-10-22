@@ -7950,3 +7950,87 @@ different statistical sample and the estimate crossed a 1.5x boundary. D107
 measured that error at a median factor of 79 and found no key that corrects
 it, so this is documented rather than chased. Nothing in the port caused it
 and nothing in the port can fix it.
+
+## D117 — A sampling profiler on the reducer: one array instead of two is worth 4%, and six idle cores are worth the rest
+
+`stax` (a sampling profiler with off-CPU accounting and per-instruction
+annotation) was pointed at the engine for the first time. Previous profiles
+were callgrind, which counts instructions and cannot see stalls or idle
+threads; this one can see both, and the two findings are of very different
+sizes.
+
+### The workload had to be rebuilt before it said anything
+
+The first run profiled `job_acyclic_109_08`, the slowest query in
+`tmp/excluded_agg/reducer_min.csv` at 30.5s. Every frame in the profile was
+`duckdb::JoinHashTable` -- the gate declines that query, so 30.5s is
+DuckDB's time, not ours, and the three slowest rows of that file are all
+declines. A profile of the slowest measurement is not a profile of this
+engine.
+
+`EXPLAIN` over the whole excluded min corpus says 427 of 481 queries fire.
+Run as one process they take 47s, and that is the workload the rest of this
+entry uses (`/tmp/stax-work/reduce_all.sql`).
+
+### What the annotation said
+
+`factorize::ExecuteExtremeReduced` held 39.4s of it. Per-instruction
+annotation put about 34% of the function on four instructions, all of them
+the retirement stall of a load: `used_[slot]` and `keys_[slot]` in the probe
+loop, and the same pair in the insert loop. The key set kept an int64 array
+and a parallel occupancy byte array, which is two cache lines to answer one
+probe.
+
+So it is one array now: an unoccupied slot holds `INT64_MIN`, and the one
+join key that value cannot represent is held in a flag beside the table.
+The load factor goes 0.7 to 0.6 at the same time, because linear probing
+walks `(1 + 1/(1-load)^2)/2` slots to find a free one -- 6.0 against 3.6 --
+and the collision step was hot.
+
+    interleaved A/B, three rounds    1.024x  1.072x  1.028x
+    all 427 answers                  identical
+
+**Four percent, not the halving the miss count suggested.** The two loads
+were dependent in the source and independent to the processor, which
+speculates past the branch and issues both; merging them removes one of two
+misses that were already overlapping. This is D113's finding again from a
+third angle -- blocked prefetching did nothing there for the same reason --
+and it is kept because it is consistently positive and smaller, not because
+it is large.
+
+`std::numeric_limits<int64_t>::min()` as a join key is now a hazard where it
+was not before, so `TestReducedExtremeHandlesTheSentinelKey` covers all
+three directions: the sentinel matching, the sentinel in the child alone,
+and the sentinel probed against a table that does not hold it.
+
+### What the flamegraph said, which is the larger number
+
+Of 94.2s of CPU across the run, the worker running the reduction held 42.3s
+and **the main thread held 42.0s, all of it inside
+`duckdb::BufferedData::ReplenishBuffer`**. A consumer waiting on a streaming
+result participates in the task queue rather than blocking; with one task to
+run there is nothing to help with, so it spins through the scheduler --
+`pthread_mutex_lock` and `unlock` alone are 19.7s. Six more worker threads
+are idle throughout.
+
+`PhysicalFactorized` sets `slices = 1` for everything but a plain `count(*)`,
+so the reduction is single-threaded by construction.
+
+**And the workload scales with cores almost perfectly.** Six processes, one
+sixth of the corpus each, run concurrently: the slice that takes 35.8s alone
+takes 37.6s with five others beside it, a 5% penalty. It is neither memory
+bandwidth nor shared cache that limits the loop, which with D113's dead
+prefetch means it is issue-bound -- and an issue-bound loop is exactly what
+more cores fix.
+
+The count path does not have this problem: profiled over the runnable
+corpus it holds 342s of CPU in 62.8s of wall, about 5.5 threads busy.
+
+### Mechanics worth keeping
+
+`stax record` needs `kernel.perf_event_paranoid` below 2; it was set to -1 in
+the WSL VM at runtime, which reverts when the VM shuts down. Hardware
+counters and off-CPU wait reasons are unavailable there -- the WSL kernel has
+no `sched_switch` tracepoint -- but on-CPU sampling, `.eh_frame` unwinding and
+instruction annotation all work against the ordinary release build, which
+carries `.symtab` and is not stripped.

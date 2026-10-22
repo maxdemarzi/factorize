@@ -222,47 +222,65 @@ namespace {
 //! them.
 //!
 //! Open addressing with linear probing, power-of-two capacity, and growth by
-//! doubling: the table is two allocations however many keys arrive, and
-//! rehashing is a linear scan rather than a walk of a chain of nodes. It is
-//! also smaller -- a libstdc++ node is the key, a next pointer and the
-//! allocator's header, against nine bytes a slot here.
+//! doubling: the table is one allocation however many keys arrive, and
+//! rehashing is a linear scan rather than a walk of a chain of nodes.
+//!
+//! One array, not two. The first version kept the keys and an occupancy byte
+//! side by side, which costs two cache misses a probe instead of one, on two
+//! lines that are never near each other. A sampling profile of the reduction
+//! put 34% of the function on the two loads that miss (D117). An empty slot
+//! is a sentinel value instead, and the one key the sentinel cannot represent
+//! is held in a flag beside the table.
 class KeySet {
 public:
 	void Insert(int64_t key) {
-		if ((count_ + 1) * 10 >= capacity_ * 7) {
+		if (key == EMPTY) {
+			has_empty_key_ = true;
+			return;
+		}
+		if ((count_ + 1) * 5 >= capacity_ * 3) {
 			Grow();
 		}
 		size_t slot = Mix(key) & (capacity_ - 1);
-		while (used_[slot]) {
-			if (keys_[slot] == key) {
+		while (slots_[slot] != EMPTY) {
+			if (slots_[slot] == key) {
 				return;
 			}
 			slot = (slot + 1) & (capacity_ - 1);
 		}
-		used_[slot] = 1;
-		keys_[slot] = key;
+		slots_[slot] = key;
 		count_++;
 	}
 
 	bool Contains(int64_t key) const {
+		if (key == EMPTY) {
+			return has_empty_key_;
+		}
 		if (count_ == 0) {
 			return false;
 		}
 		size_t slot = Mix(key) & (capacity_ - 1);
-		while (used_[slot]) {
-			if (keys_[slot] == key) {
+		for (;;) {
+			const int64_t occupant = slots_[slot];
+			if (occupant == key) {
 				return true;
+			}
+			if (occupant == EMPTY) {
+				return false;
 			}
 			slot = (slot + 1) & (capacity_ - 1);
 		}
-		return false;
 	}
 
 	bool Empty() const {
-		return count_ == 0;
+		return count_ == 0 && !has_empty_key_;
 	}
 
 private:
+	//! The value an unoccupied slot holds. A join key equal to it is real and
+	//! must still be answered for, so it is kept out of the table entirely.
+	static constexpr int64_t EMPTY = std::numeric_limits<int64_t>::min();
+
 	//! splitmix64's finaliser. The keys are join keys: dense integers, often
 	//! consecutive, and the identity hash libstdc++ uses for `long` leaves
 	//! linear probing to deal with that clustering.
@@ -273,30 +291,37 @@ private:
 		return x ^ (x >> 31);
 	}
 
+	//! Three fifths, not seven tenths. Linear probing walks
+	//! `(1 + 1/(1-load)^2)/2` slots on average to find a free one, which is
+	//! 6.0 at 0.7 and 3.6 at 0.6; the profile found the collision step hot
+	//! enough to be worth the fifth of a byte a key this costs (D117).
 	void Grow() {
 		const size_t wanted = capacity_ ? capacity_ * 2 : 1024;
-		std::vector<int64_t> keys(wanted);
-		std::vector<uint8_t> used(wanted, 0);
+		// Read into a local first: passing the static constexpr member
+		// straight to the vector binds a reference to it, which odr-uses it,
+		// and the standalone core still builds at C++14 where that wants an
+		// out-of-line definition (scripts/core-test.sh).
+		const int64_t empty = EMPTY;
+		std::vector<int64_t> slots(wanted, empty);
 		for (size_t i = 0; i < capacity_; i++) {
-			if (!used_[i]) {
+			const int64_t key = slots_[i];
+			if (key == EMPTY) {
 				continue;
 			}
-			size_t slot = Mix(keys_[i]) & (wanted - 1);
-			while (used[slot]) {
+			size_t slot = Mix(key) & (wanted - 1);
+			while (slots[slot] != EMPTY) {
 				slot = (slot + 1) & (wanted - 1);
 			}
-			used[slot] = 1;
-			keys[slot] = keys_[i];
+			slots[slot] = key;
 		}
-		keys_.swap(keys);
-		used_.swap(used);
+		slots_.swap(slots);
 		capacity_ = wanted;
 	}
 
-	std::vector<int64_t> keys_;
-	std::vector<uint8_t> used_;
+	std::vector<int64_t> slots_;
 	size_t capacity_ = 0;
 	size_t count_ = 0;
+	bool has_empty_key_ = false;
 };
 
 //! One non-root node of the reduction tree: who it hangs from, and on which
