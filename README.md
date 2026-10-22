@@ -49,7 +49,7 @@ uniform data and the gate's real difficulty is skew.
 | `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.46×** and **3.35×** on the runnable corpus against 1.31–1.34× for the folded aggregates, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **118**, including 32 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113, D116–D118) |
 | parallelism | working — one thread per bucket of the join key, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried: **3.00x** over the runnable corpus, faster on all 18 known-outcome queries, `hetio_acyclic_205_09` 172.9s → 51.2s (D54–D54d) |
 
-CI builds the extension on Linux, macOS and Windows against DuckDB v1.5.5.
+CI builds the extension on Linux, macOS and Windows against DuckDB v2.0.0.
 Not Wasm, deliberately — see the caveat below.
 
 ```sql
@@ -168,7 +168,7 @@ SELECT * FROM factorized_group_count(['a', 'b'], ['a.x = b.x'], 'a.x');
   which needs the CE corpus. `factorized_stats(tables, joins)` reports the sizes
   the gate predicts, so a decline can be checked rather than guessed at.
 - **One DuckDB version.** The C++ extension API is version-locked; this builds
-  against v1.5.5 and no other.
+  against v2.0.0 and no other.
 - **Not built for WASM,** deliberately. The representation lives entirely in
   memory and sizes itself against `memory_limit`, which wasm32's address space
   makes meaningless, and the 3.00x comes from one thread per bucket, which
