@@ -2,6 +2,16 @@
 # Check C++ formatting the way CI does, from a checkout where `.clang-format`
 # is not a working symlink.
 #
+# WHAT THIS DOES NOT CHECK: CMakeLists.txt. CI's format-check also runs
+# cmake-format, and this script does not, because pip on this box cannot
+# install it (its OpenSSL bindings are broken). A green run here therefore
+# does not mean CI's Format Check will pass -- it went red on a reflowed
+# `set_target_properties` and one blank line while this script reported
+# "formatting OK (47 files)". That is the second time local and CI have
+# disagreed about formatting for a reason this script did not cover; the
+# first is the symlink story below. If you touch a CMake file, expect CI to
+# have an opinion this cannot show you (D116).
+#
 # Why this exists. The repo root `.clang-format` is a git symlink (mode 120000)
 # pointing at duckdb/.clang-format. Git for Windows materialises it as an
 # ordinary 23-byte text file containing the word "duckdb/.clang-format", so

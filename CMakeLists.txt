@@ -46,11 +46,11 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # The extension builds at C++17, which DuckDB 2.0 requires: its CMakeLists
 # refuses anything lower outright.
 #
-# This used to be 14, and the reason it could not be 17 has been removed
-# rather than worked around. DuckDB 1.x compiled at C++11, so `static
-# constexpr` members were not implicitly inline on its side; a C++17
-# translation unit including its headers emitted its own definitions of things
-# like duckdb::LogicalType::BIGINT and they collided at link time with the
+# This used to be 14, and the reason it could not be 17 has been removed rather
+# than worked around. DuckDB 1.x compiled at C++11, so `static constexpr`
+# members were not implicitly inline on its side; a C++17 translation unit
+# including its headers emitted its own definitions of things like
+# duckdb::LogicalType::BIGINT and they collided at link time with the
 # out-of-line ones DuckDB's build emitted. Both sides are C++17 now, so both
 # treat those members the same way and there is nothing to collide.
 #
@@ -59,10 +59,12 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # scripts/core-test.sh and that is the property the alias protects, not the
 # link-time one that has gone away.
 foreach(factorize_target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
-    set_target_properties(${factorize_target} PROPERTIES
-        CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  set_target_properties(
+    ${factorize_target}
+    PROPERTIES CXX_STANDARD 17
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
 endforeach()
-
 
 install(
   TARGETS ${EXTENSION_NAME}
