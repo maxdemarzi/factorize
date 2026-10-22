@@ -8125,6 +8125,11 @@ reader whose data does not fit in page cache.
 
 ## D119 — Making the reducer twice as fast made the gate wrong about it, and the refit is left on the table
 
+**Superseded by D120, which takes the refit.** What is wrong below is the
+fit, not the idea: whole-process timings, one corpus, and absolute rather
+than relative error. The reasoning about compensating estimate errors
+survives and is measured properly there.
+
 `thresholds.reduce.per_input_row_ms` was fitted when the reduction ran on one
 core. It does not any more, so the constant is stale by construction. Re-timing
 the same 76 queries `scripts/fit-reducer-cost.sh` fitted on:
@@ -8189,3 +8194,98 @@ are here so the decision can be made on them rather than made again.
 
 Nothing in D117 or D118 depends on this: both were measured with the shipped
 gate, firing on exactly the queries it fires on today.
+
+## D120 — The reducer's cost, refitted properly, and D119 reversed
+
+D119 measured the refit as +155s on the excluded corpus and -0.93s on the
+runnable one and left it undone, because a single slope over-fired on small
+queries and the floor-aware version barely helped. Both of those were true of
+the fit, not of the idea. Refitted properly the change is **positive on both
+corpora**, and D119's conclusion is withdrawn.
+
+Three things were wrong with the measurement, not with the model:
+
+**1. It was whole-process wall clock.** D109 fitted the slope that way and had
+to discard the intercept, because 15.6ms of it was DuckDB's process start,
+catalog open and planning. `startup_ms` was left at 0.108542, which is to say
+at nothing -- and a cost model with no fixed term prices a 5ms query at
+almost zero and fires on it. Timing per statement inside one process with
+`.timer on` makes the intercept mean what the field means. `EngineCost duckdb`
+has `startup_ms` 0 for the same reason, so both sides of the comparison are
+in-process costs and the two are commensurable.
+
+**2. It was fitted on one corpus.** The excluded sample is 98.5% rows above
+the reduction's parallel floor, so it cannot see a fixed cost; the runnable
+corpus is small queries, so it cannot see a slope. Fitted over both at once
+-- 600 reducible min queries -- the small ones pin the intercept and the
+large ones pin the rate.
+
+**3. It minimised the wrong error.** Least squares on absolute error is
+dominated by the twenty-second queries and lands at 96% median relative error
+on the five-millisecond ones. A gate compares one predicted time against
+another, so relative error is the whole of what it is deciding on. Weighting
+each residual by `1/t` takes median relative error from 121% to 20%.
+
+Then scaled by 1.381 to sit above 75% of observed runs, which is the quantile
+`CostThresholds::ours` documents and for the same reason: the gate must be
+pessimistic about the engine it is choosing. **That scaling is not a detail.**
+The median fit and the pessimistic fit differ by 38% and by 24 fires, and
+measured against the oracle the median fit is worse than what ships on the
+runnable corpus while the pessimistic one is better:
+
+    runnable, 119 queries, both arms measured in-process
+      always DuckDB 21.11s    always reduce 6.66s    oracle 4.44s
+      shipped                 6.59s   52 fires   1.49x of oracle
+      median fit              6.75s   90 fires   1.52x of oracle
+      pessimistic fit         5.58s   66 fires   1.26x of oracle
+
+    excluded, 111 of the 120-query sample with both arms measured
+      always DuckDB 5263.62s  always reduce 13.83s   oracle 13.72s
+      shipped               265.17s   98 fires  19.33x of oracle
+      pessimistic fit        13.72s  110 fires   1.00x of oracle
+
+`EngineCost reduce` goes `{0.108542, 3.9887e-5}` to `{5.52664, 1.52624e-5}`.
+
+### Which half of the gate was actually wrong
+
+Holding one side of the comparison at its measurement and leaving the other
+as the gate computes it, on the runnable corpus:
+
+    measured ours, predicted duckdb    6.94s   1.56x of oracle
+    predicted ours, measured duckdb    6.12s   1.38x of oracle
+    both measured (the margin alone)   4.72s   1.06x of oracle
+
+**A perfect estimate of our own cost, alone, is worse than the two wrong
+estimates together** -- 6.94s against the shipped 6.59s. The errors were
+compensating, which is why D119 found the refit costing time and read it as
+the refit being wrong. It was: a median fit of one side of a compensating
+pair. The pessimistic fit wins because being deliberately wrong in a known
+direction is not the same as being accidentally right.
+
+The margin itself costs 6%, so the remaining 1.26x is DuckDB's estimate --
+D98's winner's curse, which D107 measured and found no key for. That is still
+open and this does not touch it.
+
+### Measured end to end, binaries alternating
+
+    runnable min, auto, per query     6.85s -> 6.12s   1.12x, no answer changed
+    excluded sample, 120 queries    349.4s -> 27.2s   12.8x, 3 capped -> 0
+    min / max on the runnable corpus  3.57x and 3.59x, median of three runs,
+                                      firing on 65 of 119 rather than 51
+
+The three queries the committed gate ran out of time on now answer in under
+half a second, and all three were checked against two independent paths --
+the fold, which is a different implementation inside this engine, and stock
+DuckDB given fifteen minutes. `dblp_acyclic_211_14` 1210549,
+`job_acyclic_109_30` 135, `job_acyclic_109_49` 481, agreeing three ways.
+
+Validated: 1050 SQL assertions, core suite clean under asan+ubsan and -O2,
+format and tidy clean.
+
+### Recorded and not taken
+
+A third term of 1.19ms per relation above the parallel floor brings median
+relative error to 14% from 20%, and it is a real mechanism -- D118's thread
+creation, about 75us a thread on this machine, sixteen threads a relation. It
+changes no decision on either corpus, so it buys accuracy nobody spends.
+`scripts/fit-reducer-regimes.py` can fit it if that ever stops being true.

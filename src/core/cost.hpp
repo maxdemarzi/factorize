@@ -203,19 +203,36 @@ struct CostThresholds {
 	//! What a reducer costs, which is not what a fold costs.
 	//!
 	//! `ours` was fitted on the f-representation path, and D108 charged the
-	//! reducer with it for want of anything better. Measured over 76 excluded
-	//! queries from 150K to 26M input rows, that under-predicts on 76 of 76 --
-	//! a bias, not noise -- by a least-squares slope of 3.99e-5 ms/row against
-	//! the 2.445e-5 it charges, and a median relative error of 54%. Refitting
-	//! the slope takes that to 15%.
+	//! reducer with it for want of anything better. D109 refitted the slope
+	//! and had to throw the intercept away: the measurements were whole-process
+	//! wall clock, so the fitted 15.6ms carried DuckDB's process start,
+	//! catalog open and planning, and was not the same quantity as
+	//! `startup_ms`. An intercept of 0.108542ms was left in its place, which
+	//! is to say none.
 	//!
-	//! Only the slope is taken from the fit. The measurements are whole-process
-	//! wall clock, so the fitted intercept of 15.6ms carries DuckDB's process
-	//! start, catalog open and planning alongside anything this engine does,
-	//! and is not the same quantity as `startup_ms`; the slope is marginal per
-	//! row and does not have that problem. `per_output_ms` stays zero because a
+	//! Both numbers are refitted here, from per-statement timings inside one
+	//! process -- `.timer on` over 600 reducible min queries from both corpora
+	//! at once, so no measurement carries a process start and nothing has to be
+	//! discarded. The small queries pin the intercept and the large ones pin
+	//! the slope, which is why neither corpus could be fitted alone.
+	//!
+	//! Fitted by weighted least squares with weight `1/t`, which minimises
+	//! relative rather than absolute error. A gate compares one predicted time
+	//! against another, so being 20ms wrong about a 20s query decides nothing
+	//! and being 20ms wrong about a 5ms one decides everything; an unweighted
+	//! fit is dominated by the large queries and lands at 96% median error on
+	//! the small ones. Then scaled by 1.381 to sit above 75% of observed runs,
+	//! the quantile `ours` above documents and for the same reason: a median
+	//! fit fires too often, and measured, it does (D120).
+	//!
+	//! Median relative error 121% -> 20%. `per_output_ms` stays zero because a
 	//! reducer produces no representation -- that is the whole point of it.
-	EngineCost reduce {0.108542, 3.9887e-5, 0.0};
+	//!
+	//! A third term, 1.19ms per relation above the reduction's parallel floor,
+	//! brings the error to 14% and is a real mechanism -- it is the thread
+	//! creation D118 added. It changes no decision on either corpus, so it is
+	//! recorded and not taken.
+	EngineCost reduce {5.52664, 1.52624e-5, 0.0};
 	//! DuckDB's cost, fitted to sit below 25% of observed runs.
 	//!
 	//! Re-fitted twice, and it has now been wrong in both directions. The

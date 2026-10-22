@@ -46,7 +46,7 @@ uniform data and the gate's real difficulty is skew.
 | optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
-| `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.46×** and **3.35×** on the runnable corpus against 1.31–1.34× for the folded aggregates, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **118**, including 32 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113, D116–D118) |
+| `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.57×** and **3.59×** on the runnable corpus against 1.31–1.34× for the folded aggregates, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **118**, including 32 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113, D116–D120) |
 | parallelism | working — one thread per bucket of the join key, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried: **3.00x** over the runnable corpus, faster on all 18 known-outcome queries, `hetio_acyclic_205_09` 172.9s → 51.2s (D54–D54d) |
 
 CI builds the extension on Linux, macOS and Windows against DuckDB v2.0.0.
