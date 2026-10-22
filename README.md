@@ -46,7 +46,7 @@ uniform data and the gate's real difficulty is skew.
 | optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
-| `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.50×** and **3.51×** on the runnable corpus against 1.44–2.09× for the folded aggregates, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **117**, including 31 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113) |
+| `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.46×** and **3.35×** on the runnable corpus against 1.31–1.34× for the folded aggregates, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **118**, including 32 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113, D116–D118) |
 | parallelism | working — one thread per bucket of the join key, same answer at every thread count (DECISIONS D20), and no longer given up when the fallback is carried: **3.00x** over the runnable corpus, faster on all 18 known-outcome queries, `hetio_acyclic_205_09` 172.9s → 51.2s (D54–D54d) |
 
 CI builds the extension on Linux, macOS and Windows against DuckDB v1.5.5.
@@ -96,6 +96,8 @@ the same as a switch that does not exist, not because they are recommended.
 | `factorize_duckdb_per_tuple_ms` | `3.981e-6` | milliseconds the gate charges DuckDB per result tuple |
 | `factorize_fallback_max_loss` | `150` | how badly the sampled estimate may predict a loss before the catalog's second opinion stops being allowed to overrule it; `0` restores the unconditional rule |
 | `factorize_gate_sample_rows` | `16384` | rows sampled per join column for the MCV list; `factorize_gate_exact_stats` scans instead |
+| `factorize_reduce_extremes` | `true` | answer an ungrouped `min`/`max` over an acyclic join with a semijoin reducer instead of folding an f-representation (D106) |
+| `factorize_reduce_threads` | `0` (DuckDB's) | cores the reducer may use, rounded down to a power of two; `1` keeps it sequential, and relations under 65,536 rows are sequential regardless (D118) |
 
 ### Beyond counting
 
