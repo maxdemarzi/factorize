@@ -2250,6 +2250,10 @@ void FactorizeOptimizerExtension::Register(DBConfig &config) {
 	                          "Answer an ungrouped min or max over an acyclic join with a semijoin reducer "
 	                          "instead of folding an f-representation",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("factorize_reduce_threads",
+	                          "Cores the semijoin reducer may use, rounded down to a power of two; 0 follows "
+	                          "DuckDB's own thread count and 1 keeps the reduction sequential",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
 	config.AddExtensionOption("factorize_explain",
 	                          "Print, per aggregate, whether the factorize rule took the plan over and why not",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));

@@ -8034,3 +8034,91 @@ counters and off-CPU wait reasons are unavailable there -- the WSL kernel has
 no `sched_switch` tracepoint -- but on-CPU sampling, `.eh_frame` unwinding and
 instruction annotation all work against the ordinary release build, which
 carries `.symtab` and is not stripped.
+
+## D118 — The reduction on more than one core, which is what the profile was actually pointing at
+
+D117 found the reducer running on one thread while six workers idled and the
+consumer thread burned 42.0s spinning in `ReplenishBuffer`, and found the
+workload scaling with cores at a 5% penalty. This is that finding acted on:
+**2.15x, 2.04x, 2.00x** on the 427 excluded-corpus min queries that fire,
+interleaved against the binary from before D117, with all 427 answers
+identical. 47s to 23s.
+
+### Why sharding, and not a lock or a merge
+
+A reduction walks the relations leaf to root; within one relation the rows
+are independent, so the row loop is where the parallelism is. Two rounds:
+
+1. Every worker takes a span of rows, probes the children's tables -- which
+   it only reads -- and drops each surviving key into a bucket chosen by the
+   top byte of its hash.
+2. Every worker takes one shard of the key set and drains the buckets that
+   hold keys for it.
+
+A shard therefore has exactly one writer and no round needs a lock. Merging
+N finished sets at the end was the alternative and it costs what building
+them cost, which is the thing being parallelised. Buckets hold the key and
+not the row, so the second round reads what the first round wrote rather
+than walking the key column again at random.
+
+`factorize_reduce_threads` is the budget: 0 follows DuckDB's own thread
+count, 1 is sequential, and anything else is rounded down to a power of two
+and capped at 64. Relations under 65,536 rows stay sequential whatever is
+asked, because two rounds of thread creation cost more than they save on a
+small one, and the corpus is mostly small relations.
+
+### Two measured mistakes on the way, both the same mistake
+
+The first version wrapped the key set in a `ShardedKeySet` the row loop asked
+per probe. **0.85x** -- the sequential path paid 15% for a feature it does
+not use. The row loop now resolves the shard array and its mask once per
+relation, which is exactly what D113 did to `columns[probe][row]`.
+
+That recovered nothing. The profile said why: `KeySet::Insert` had acquired
+several callers and stopped being inlined, and **22.8s was sitting in it as a
+separate frame** against 38.2s for the whole function before. The call is not
+the cost; what the call destroys is the compiler's ability to keep
+`capacity_`, `count_` and the slot array in registers across the row loop. So
+the table takes a run of keys now, not one key:
+
+    serial path, against the same baseline     0.85x -> 0.94x
+
+The remaining 6% is the bucket round trip, which the sequential path pays for
+having one code path instead of two over a reduction that has to be exactly
+right.
+
+**Three times in this project a layout argument has lost to a profile, and
+this is the third: indirection inside the row loop, not memory, is what this
+loop cannot afford.**
+
+### What it cost elsewhere
+
+    runnable corpus         1.065x, 1.063x, 119 answers identical
+    peak RSS                within 0.3% on the three heaviest queries
+    core suite              asan+ubsan and -O2 clean
+    test_plan under tsan    0 races, 166 checks
+    SQL suite               1050 assertions
+
+A shard is padded to exactly 64 bytes. Not for alignment -- nothing promises
+the array starts on a line -- but for the stride: `count_` moves on every
+insert, and at any size under 64 two shards' counters share a line and the
+workers filling them fight over it. At exactly 64 the same field in two
+shards is 64 bytes apart wherever the array begins. A `static_assert` holds
+it there, because the padding is load-bearing and silent.
+
+`TestReducedExtremeIsTheSameOnManyThreads` runs a three-relation chain of
+150,000 rows -- above the floor, which is the only place the threaded path
+exists -- at 1, 2, 3, 8 and 64 workers and requires the same answer, the same
+emptiness and the same rows scanned from all of them, for both min and max,
+with the `INT64_MIN` sentinel planted in every relation so shard routing has
+to carry it too. The empty join, which exits the walk early from inside the
+same loop the workers run, gets its own case.
+
+### The honest limit
+
+The 2x is a warm-cache number. On the three heaviest queries read cold the
+threaded and sequential paths are within noise of each other, because the
+first scan of a relation is I/O and threads do not make a disk faster. The
+corpus runs warm, which is the right measurement for an engine being compared
+against another engine on the same data, and the wrong one to quote at a
+reader whose data does not fit in page cache.

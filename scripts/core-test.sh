@@ -13,7 +13,7 @@ CORE="src/core/ftree.cpp src/core/layout.cpp src/core/frep.cpp src/core/material
 # link time, while C++11 lacks make_unique and generic lambdas. Building the
 # core standalone at 17 would let a C++17 feature in that only fails much
 # later, inside a 13-minute DuckDB build.
-FLAGS="-std=c++14 -g -Wall -Wextra -Wno-unused-parameter"
+FLAGS="-std=c++14 -g -Wall -Wextra -Wno-unused-parameter -pthread"
 # Correctness runs use the sanitizers; the stability test is large, so it gets
 # an optimized build too.
 MODE="${1:-both}"

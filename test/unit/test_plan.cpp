@@ -492,6 +492,78 @@ static void TestReducedExtremeHandlesTheSentinelKey() {
 	Expect(!missing.any, "a sentinel probe against a table without it does not match");
 }
 
+static void TestReducedExtremeIsTheSameOnManyThreads() {
+	Group scope("the reduction gives one answer however many threads it is given");
+
+	// Above PARALLEL_ROW_FLOOR, which is where the threaded path turns on.
+	// Below it the two paths are literally the same code and a test of them
+	// would prove nothing.
+	const size_t rows = 150000;
+	const int64_t domain = 40000;
+	const int64_t sentinel = std::numeric_limits<int64_t>::min();
+
+	uint64_t seed = 0xD1B54A32D192ED03ull;
+	auto next = [&seed](int64_t bound) {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		return static_cast<int64_t>(seed % static_cast<uint64_t>(bound));
+	};
+
+	QueryGraph chain;
+	chain.column_counts.assign(3, 2);
+	chain.column_types.assign(3, {ValueType::INT64, ValueType::INT64});
+	chain.predicates = {Predicate {0, 1, 1, 0}, Predicate {1, 1, 2, 0}};
+
+	MemorySource source;
+	for (size_t r = 0; r < 3; r++) {
+		std::vector<int64_t> first(rows), second(rows);
+		for (size_t i = 0; i < rows; i++) {
+			first[i] = next(domain) - domain / 2;
+			second[i] = next(domain);
+		}
+		// One sentinel key in each relation, so the value the table reserves
+		// for an empty slot also has to survive being routed to a shard.
+		second[rows / 3] = sentinel;
+		first[rows / 2] = sentinel;
+		source.Add({first, second});
+	}
+
+	for (const bool want_min : {true, false}) {
+		const auto one = ExecuteExtremeReduced(chain, source, 0, 0, want_min, 1);
+		Expect(one.ok, "the sequential reduction is accepted");
+		for (const size_t threads : {size_t(2), size_t(3), size_t(8), size_t(64)}) {
+			const auto many = ExecuteExtremeReduced(chain, source, 0, 0, want_min, threads);
+			Expect(many.ok, "the threaded reduction is accepted at " + std::to_string(threads));
+			Expect(many.any == one.any, "agrees about emptiness at " + std::to_string(threads));
+			Expect(many.value == one.value, "agrees about the extreme at " + std::to_string(threads) + ": " +
+			                                    std::to_string(many.value) + " vs " + std::to_string(one.value));
+			Expect(many.rows_scanned == one.rows_scanned, "reads the same rows at " + std::to_string(threads));
+		}
+	}
+
+	// An empty join ends the walk early, and the early exit is taken inside
+	// the same loop the threads run, so it gets its own case.
+	QueryGraph pair;
+	pair.column_counts.assign(2, 2);
+	pair.column_types.assign(2, {ValueType::INT64, ValueType::INT64});
+	pair.predicates = {Predicate {0, 1, 1, 0}};
+	MemorySource disjoint;
+	std::vector<int64_t> value(rows), low(rows), high(rows), ignored(rows, 0);
+	for (size_t i = 0; i < rows; i++) {
+		value[i] = static_cast<int64_t>(i);
+		low[i] = next(1000);
+		high[i] = 1000000 + next(1000);
+	}
+	disjoint.Add({value, low});
+	disjoint.Add({high, ignored});
+	for (const size_t threads : {size_t(1), size_t(8)}) {
+		const auto none = ExecuteExtremeReduced(pair, disjoint, 0, 0, true, threads);
+		Expect(none.ok, "the disjoint pair is accepted at " + std::to_string(threads));
+		Expect(!none.any, "the disjoint pair is empty at " + std::to_string(threads));
+	}
+}
+
 static void TestReducedExtremeRefusesWhatItCannotPromise() {
 	Group scope("the reducer declines a cycle, a non-tree and a column it does not have");
 
@@ -1173,6 +1245,8 @@ int main() {
 	TestReducedExtremeRefusesWhatItCannotPromise();
 	std::printf("\n");
 	TestReducedExtremeHandlesTheSentinelKey();
+	std::printf("\n");
+	TestReducedExtremeIsTheSameOnManyThreads();
 	std::printf("\n");
 	TestSlicingIsExact();
 	std::printf("\n");

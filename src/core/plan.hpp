@@ -432,8 +432,17 @@ struct ExtremeResult {
 //! spanning tree of the relations, and genuinely acyclic.
 bool ReducibleByExtremeReduction(const QueryGraph &graph);
 
+//! `threads` is how many cores the reduction may use. Each relation's rows
+//! are split across that many workers, which probe the children's tables --
+//! reading only -- and sort what survives into one bucket per shard of the
+//! key set; then each worker fills one shard, so no shard has two writers
+//! and nothing is locked. One worker is the same code and not a separate
+//! path, which costs it about 6% against a version that could only count to
+//! one. Relations under a row floor stay sequential whatever is asked for,
+//! because two rounds of thread creation cost more than they save on a
+//! small one (D118).
 ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &source, size_t relation, size_t column,
-                                    bool want_min);
+                                    bool want_min, size_t threads = 1);
 
 //! Sums one column over the join without materializing it.
 //!

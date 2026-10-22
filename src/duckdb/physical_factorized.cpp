@@ -251,6 +251,22 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / threads));
 }
 
+//! How many cores the reducer may use. The setting wins when it is set;
+//! 0 follows DuckDB's own thread count, which is what every other part of
+//! this operator sizes itself by.
+static size_t ReduceThreads(ClientContext &context) {
+	Value value;
+	int64_t requested = 0;
+	if (context.TryGetCurrentSetting("factorize_reduce_threads", value) && !value.IsNull()) {
+		requested = value.GetValue<int64_t>();
+	}
+	if (requested > 0) {
+		return static_cast<size_t>(requested);
+	}
+	const idx_t threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	return threads < 1 ? 1 : static_cast<size_t>(threads);
+}
+
 //! The fold's int64 total, in the type the aggregate was bound to.
 //!
 //! For a DECIMAL the total is already in units of the scale -- the stored
@@ -326,9 +342,14 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 				// and keeps only the surviving keys, so one relation at a time is
 				// exactly its access pattern and the copy is pure loss (D112).
 				StorageSource reduced_source(client, relations);
-				const auto extreme = factorize::ExecuteExtremeReduced(graph, reduced_source, aggregates[0].relation,
-				                                                      aggregates[0].column,
-				                                                      aggregates[0].kind == factorize::Aggregate::MIN);
+				// The reduction is not a parallel source -- `slices` is 1 for
+				// anything but a plain count -- so without this it runs on one
+				// core while the rest of the pool idles and the consumer
+				// thread spins in ReplenishBuffer (D117). It parallelises
+				// inside instead, over the rows of one relation at a time.
+				const auto extreme = factorize::ExecuteExtremeReduced(
+				    graph, reduced_source, aggregates[0].relation, aggregates[0].column,
+				    aggregates[0].kind == factorize::Aggregate::MIN, ReduceThreads(client));
 				if (!extreme.ok) {
 					throw InvalidInputException("factorize: %s", extreme.error);
 				}

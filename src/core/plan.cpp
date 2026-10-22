@@ -2,9 +2,12 @@
 
 #include <limits>
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 namespace factorize {
 
@@ -211,6 +214,20 @@ bool IsAcyclic(const QueryGraph &graph) {
 
 namespace {
 
+//! splitmix64's finaliser. The keys are join keys: dense integers, often
+//! consecutive, and the identity hash libstdc++ uses for `long` leaves linear
+//! probing to deal with that clustering.
+//!
+//! A free function rather than a member because `ShardedKeySet` has to hash
+//! before it knows which shard to ask, and hashing twice would undo the point
+//! of sharding.
+inline uint64_t Mix(int64_t key) {
+	uint64_t x = static_cast<uint64_t>(key) + 0x9E3779B97F4A7C15ull;
+	x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+	x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+	return x ^ (x >> 31);
+}
+
 //! A set of int64 keys that allocates in blocks rather than per key.
 //!
 //! `std::unordered_set<int64_t>` was the obvious first choice and callgrind
@@ -233,33 +250,61 @@ namespace {
 //! is held in a flag beside the table.
 class KeySet {
 public:
-	void Insert(int64_t key) {
-		if (key == EMPTY) {
-			has_empty_key_ = true;
-			return;
-		}
-		if ((count_ + 1) * 5 >= capacity_ * 3) {
-			Grow();
-		}
-		size_t slot = Mix(key) & (capacity_ - 1);
-		while (slots_[slot] != EMPTY) {
-			if (slots_[slot] == key) {
-				return;
+	//! Insert a run of keys, which is how every caller actually arrives.
+	//!
+	//! One key at a time was a call per key once `Insert` had several callers
+	//! and stopped being inlined, and the call is not the cost: outside the
+	//! function the compiler kept `capacity_`, `count_` and the slot array in
+	//! registers across the whole row loop, and across a call it cannot. A
+	//! batch puts the loop back inside the table, and the fields are read
+	//! once per run rather than once per key (D118).
+	void InsertAll(const int64_t *keys, size_t count) {
+		size_t at = 0;
+		while (at < count) {
+			// How many more keys can land before the next grow. Duplicates
+			// do not consume room, so this is a floor, not a count, and the
+			// outer loop simply comes round again.
+			const size_t limit = capacity_ / 5 * 3;
+			if (count_ + 1 >= limit) {
+				Grow();
+				continue;
 			}
-			slot = (slot + 1) & (capacity_ - 1);
+			const size_t stop = std::min(count, at + (limit - count_ - 1));
+			int64_t *slots = slots_.data();
+			const size_t mask = capacity_ - 1;
+			size_t live = count_;
+			bool empty_key = has_empty_key_;
+			for (; at < stop; at++) {
+				const int64_t key = keys[at];
+				if (key == EMPTY) {
+					empty_key = true;
+					continue;
+				}
+				size_t slot = Mix(key) & mask;
+				while (slots[slot] != EMPTY) {
+					if (slots[slot] == key) {
+						break;
+					}
+					slot = (slot + 1) & mask;
+				}
+				if (slots[slot] == EMPTY) {
+					slots[slot] = key;
+					live++;
+				}
+			}
+			count_ = live;
+			has_empty_key_ = empty_key;
 		}
-		slots_[slot] = key;
-		count_++;
 	}
 
-	bool Contains(int64_t key) const {
+	bool Contains(int64_t key, uint64_t hash) const {
 		if (key == EMPTY) {
 			return has_empty_key_;
 		}
 		if (count_ == 0) {
 			return false;
 		}
-		size_t slot = Mix(key) & (capacity_ - 1);
+		size_t slot = hash & (capacity_ - 1);
 		for (;;) {
 			const int64_t occupant = slots_[slot];
 			if (occupant == key) {
@@ -280,16 +325,6 @@ private:
 	//! The value an unoccupied slot holds. A join key equal to it is real and
 	//! must still be answered for, so it is kept out of the table entirely.
 	static constexpr int64_t EMPTY = std::numeric_limits<int64_t>::min();
-
-	//! splitmix64's finaliser. The keys are join keys: dense integers, often
-	//! consecutive, and the identity hash libstdc++ uses for `long` leaves
-	//! linear probing to deal with that clustering.
-	static uint64_t Mix(int64_t key) {
-		uint64_t x = static_cast<uint64_t>(key) + 0x9E3779B97F4A7C15ull;
-		x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-		x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-		return x ^ (x >> 31);
-	}
 
 	//! Three fifths, not seven tenths. Linear probing walks
 	//! `(1 + 1/(1-load)^2)/2` slots on average to find a free one, which is
@@ -322,7 +357,136 @@ private:
 	size_t capacity_ = 0;
 	size_t count_ = 0;
 	bool has_empty_key_ = false;
+	//! To exactly 64 bytes, which is a cache line.
+	//!
+	//! Not for the alignment -- nothing here promises the array starts on a
+	//! line -- but for the stride. `count_` moves on every insert, and at any
+	//! size under 64 two shards' counters share a line and the threads
+	//! filling them fight over it. At exactly 64 the same field in two
+	//! shards is 64 bytes apart wherever the array begins, so it never can.
+	char padding_[23] = {};
 };
+
+//! The padding above is load-bearing and silent, so it is checked.
+static_assert(sizeof(KeySet) == 64, "a shard has to be exactly one cache line wide");
+
+//! The surviving keys of one relation, split into independent tables.
+//!
+//! A shard is chosen by the top byte of the hash and a slot by its low bits,
+//! so the two are independent and a shard's occupancy does not depend on
+//! which shard it is. With one shard this is the plain table above and costs
+//! one extra indexed load; with N it is N tables that no two threads ever
+//! write at once, which is what lets the reduction run on more than one core
+//! without a lock (D118).
+class ShardedKeySet {
+public:
+	void Reset(size_t shards) {
+		split_.clear();
+		if (shards > 1) {
+			split_.resize(shards);
+		}
+		mask_ = shards - 1;
+	}
+
+	//! Which shard a hash belongs to. Shifting by a constant 56 rather than
+	//! by `64 - log2(shards)` keeps one shard from shifting by 64, which is
+	//! undefined, and 256 shards is more than any thread count here.
+	size_t ShardOf(uint64_t hash) const {
+		return static_cast<size_t>(hash >> 56) & mask_;
+	}
+
+	//! The shard array, as one pointer and one mask.
+	//!
+	//! The row loop resolves these once per relation rather than asking the
+	//! set per row. Reaching the table through the set costs a second load,
+	//! and asking whether it is split costs a third on a line the table
+	//! itself is not on; both measured, together, at 0.87x on the corpus.
+	//! This is D113's lesson a second time: what the reduction cannot afford
+	//! is indirection inside the row loop.
+	const KeySet *Tables() const {
+		return split_.empty() ? &whole_ : split_.data();
+	}
+
+	KeySet *Writable() {
+		return split_.empty() ? &whole_ : split_.data();
+	}
+
+	size_t Mask() const {
+		return mask_;
+	}
+
+	//! Fill one named shard from a run of keys. The caller has already
+	//! decided, by hash, that they all belong here; no other thread may be
+	//! inside this shard.
+	void FillShard(size_t shard, const std::vector<int64_t> &keys) {
+		Writable()[shard].InsertAll(keys.data(), keys.size());
+	}
+
+	bool Empty() const {
+		if (split_.empty()) {
+			return whole_.Empty();
+		}
+		for (const auto &shard : split_) {
+			if (!shard.Empty()) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+private:
+	//! The whole set when there is one shard, and unused when there are
+	//! several; `split_` being empty is what says which.
+	KeySet whole_;
+	std::vector<KeySet> split_;
+	size_t mask_ = 0;
+};
+
+//! Run `body(0..workers-1)` on `workers` threads and wait for all of them.
+//!
+//! The calling thread takes slot 0 rather than sitting idle, so a run of two
+//! workers spawns one thread. A worker that throws sets `failed` instead of
+//! unwinding out of a thread, which would terminate the process: the only
+//! throw reachable from the bodies here is a failed allocation, and the
+//! reduction reports that as an error like any other.
+bool RunInParallel(size_t workers, const std::function<void(size_t)> &body) {
+	std::atomic<bool> failed(false);
+	auto guarded = [&body, &failed](size_t worker) {
+		try {
+			body(worker);
+		} catch (...) {
+			failed.store(true);
+		}
+	};
+	std::vector<std::thread> pool;
+	pool.reserve(workers - 1);
+	for (size_t worker = 1; worker < workers; worker++) {
+		pool.emplace_back(guarded, worker);
+	}
+	guarded(0);
+	for (auto &thread : pool) {
+		thread.join();
+	}
+	return !failed.load();
+}
+
+//! Below this many rows a relation is reduced on one thread. Two rounds of
+//! thread creation cost tens of microseconds and the corpus is mostly small
+//! relations, so the floor is what keeps the parallel path from being a loss
+//! on the queries it cannot help.
+constexpr size_t PARALLEL_ROW_FLOOR = 1u << 16;
+
+//! How many shards a thread budget turns into: a power of two, because a
+//! shard is chosen by masking, and at most 64, because `ShardOf` reads the
+//! top byte of the hash and 64 is already more threads than this reduction
+//! has ever been given.
+size_t ParallelWorkers(size_t threads) {
+	size_t workers = 1;
+	while (workers * 2 <= threads && workers < 64) {
+		workers *= 2;
+	}
+	return workers;
+}
 
 //! One non-root node of the reduction tree: who it hangs from, and on which
 //! columns. `own_column` is the key its parent probes it by.
@@ -339,7 +503,7 @@ bool ReducibleByExtremeReduction(const QueryGraph &graph) {
 }
 
 ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &source, size_t relation, size_t column,
-                                    bool want_min) {
+                                    bool want_min, size_t threads) {
 	ExtremeResult result;
 	const size_t relations = graph.RelationCount();
 	if (relation >= relations || column >= graph.column_counts[relation]) {
@@ -399,14 +563,13 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 	// below it has been. One relation is read at a time, because
 	// RelationSource only guarantees its columns until the next one is asked
 	// for -- the surviving keys are copied out before moving on.
-	std::vector<KeySet> surviving(relations);
+	std::vector<ShardedKeySet> surviving(relations);
 	bool extreme_set = false;
 	for (size_t i = order.size(); i-- > 0;) {
 		const size_t current = order[i];
 		const auto &columns = source.Columns(current);
 		const size_t rows = columns.empty() ? 0 : columns[0].size();
 		result.rows_scanned += rows;
-		KeySet keys;
 		// Resolved once, not per row. `columns[probe][row]` walks a vector of
 		// vectors on every probe of every row, and the child loop between the
 		// two indexings stops the compiler hoisting it. The profile put 79
@@ -414,36 +577,96 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 		// a good part of the difference was (D113).
 		struct Probe {
 			const int64_t *column;
-			const KeySet *keys;
+			const KeySet *tables;
+			size_t mask;
 		};
 		std::vector<Probe> probes;
 		probes.reserve(children[current].size());
 		for (const size_t child : children[current]) {
-			probes.push_back(Probe {columns[node[child].parent_column].data(), &surviving[child]});
+			const ShardedKeySet &child_keys = surviving[child];
+			probes.push_back(Probe {columns[node[child].parent_column].data(), child_keys.Tables(), child_keys.Mask()});
 		}
 		const int64_t *extreme_column = current == relation ? columns[column].data() : nullptr;
 		const int64_t *key_column = current == relation ? nullptr : columns[node[current].own_column].data();
-		for (size_t row = 0; row < rows; row++) {
-			bool survives = true;
+
+		const size_t workers = rows >= PARALLEL_ROW_FLOOR ? ParallelWorkers(threads) : 1;
+		ShardedKeySet keys;
+		keys.Reset(workers);
+
+		auto survives = [&probes](size_t row) {
 			for (const auto &probe : probes) {
-				if (!probe.keys->Contains(probe.column[row])) {
-					survives = false;
-					break;
+				const int64_t key = probe.column[row];
+				const uint64_t hash = Mix(key);
+				if (!probe.tables[static_cast<size_t>(hash >> 56) & probe.mask].Contains(key, hash)) {
+					return false;
 				}
 			}
-			if (!survives) {
-				continue;
+			return true;
+		};
+
+		// Two rounds over the same rows, on one thread or on many; the one
+		// thread case is the same code with one worker, because two code
+		// paths over a reduction that has to be exactly right is one too
+		// many.
+		//
+		// The first round probes, which only reads the children's tables and
+		// so shares nothing, and sorts the keys it keeps into one bucket per
+		// shard. The second gives each shard to one worker, which drains
+		// every bucket holding keys for it: a shard has exactly one writer
+		// and there is no lock anywhere.
+		//
+		// Buckets hold the key rather than the row, so the second round
+		// reads what the first round wrote instead of walking the key column
+		// again at random.
+		std::vector<std::vector<std::vector<int64_t>>> buckets(workers);
+		std::vector<int64_t> best(workers, 0);
+		std::vector<char> best_set(workers, 0);
+		const size_t span = (rows + workers - 1) / workers;
+		const bool probed = RunInParallel(workers, [&](size_t worker) {
+			const size_t from = worker * span;
+			const size_t to = std::min(rows, from + span);
+			if (!extreme_column) {
+				buckets[worker].resize(workers);
 			}
-			if (extreme_column) {
-				const int64_t value = extreme_column[row];
-				if (!extreme_set || (want_min ? value < result.value : value > result.value)) {
-					result.value = value;
+			for (size_t row = from; row < to; row++) {
+				if (!survives(row)) {
+					continue;
+				}
+				if (extreme_column) {
+					const int64_t value = extreme_column[row];
+					if (!best_set[worker] || (want_min ? value < best[worker] : value > best[worker])) {
+						best[worker] = value;
+						best_set[worker] = 1;
+					}
+				} else {
+					const int64_t key = key_column[row];
+					buckets[worker][keys.ShardOf(Mix(key))].push_back(key);
+				}
+			}
+		});
+		if (!probed) {
+			result.error = "the reduction ran out of memory";
+			return result;
+		}
+		if (extreme_column) {
+			for (size_t worker = 0; worker < workers; worker++) {
+				if (!best_set[worker]) {
+					continue;
+				}
+				if (!extreme_set || (want_min ? best[worker] < result.value : best[worker] > result.value)) {
+					result.value = best[worker];
 					extreme_set = true;
 				}
-			} else {
-				keys.Insert(key_column[row]);
 			}
+		} else if (!RunInParallel(workers, [&](size_t shard) {
+			           for (size_t worker = 0; worker < workers; worker++) {
+				           keys.FillShard(shard, buckets[worker][shard]);
+			           }
+		           })) {
+			result.error = "the reduction ran out of memory";
+			return result;
 		}
+
 		if (current != relation) {
 			// An empty relation empties the whole join, and continuing would
 			// read every remaining input to discover it.
