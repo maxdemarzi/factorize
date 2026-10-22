@@ -8122,3 +8122,70 @@ first scan of a relation is I/O and threads do not make a disk faster. The
 corpus runs warm, which is the right measurement for an engine being compared
 against another engine on the same data, and the wrong one to quote at a
 reader whose data does not fit in page cache.
+
+## D119 — Making the reducer twice as fast made the gate wrong about it, and the refit is left on the table
+
+`thresholds.reduce.per_input_row_ms` was fitted when the reduction ran on one
+core. It does not any more, so the constant is stale by construction. Re-timing
+the same 76 queries `scripts/fit-reducer-cost.sh` fitted on:
+
+    slope      3.9887e-5  ->  1.39264e-5 ms/row    (2.86x cheaper)
+    intercept  15.6ms     ->  63.3ms               (not taken; it is process start)
+
+### What the refit is worth, measured on both arms
+
+Replaying the margin test with the scaled estimate changes ten decisions on
+the excluded corpus. All ten were timed directly, DuckDB against the reducer
+forced:
+
+    dblp_acyclic_218_09        3.93s -> 0.42s        job_acyclic_109_33    24.85s -> 0.45s
+    job_acyclic_109_08        26.62s -> 0.48s        job_acyclic_109_49    59.91s -> 0.29s
+    job_acyclic_109_12         9.32s -> 0.58s        job_acyclic_109_91    20.37s -> 0.36s
+    job_acyclic_109_30      no answer -> 0.56s       job_acyclic_111_11     6.62s -> 0.50s
+    yago_acyclic_Chain_12_41   0.33s -> 0.31s        yago_acyclic_Chain_9_71 2.63s -> 0.27s
+
+**155s against 4.2s, every one a gain, and one query that DuckDB does not
+answer inside 90 seconds at all.** The gate is declining a reducer that beats
+DuckDB by up to 209x, on the corpus the reducer was built for.
+
+Against that, on the runnable corpus rewritten as min, the same refit takes
+the fire count from 51 of 119 to 107 and **loses 0.93s**, spread thin: about
+fifty queries each 0.02s to 0.3s worse, against two wins of 0.78s and 0.28s.
+
+### Why a single slope is the wrong shape, and why the obvious fix is not enough
+
+A relation under the 65,536-row floor is still reduced sequentially (D118), so
+one rate cannot describe both regimes. Charging each regime its own measured
+rate -- the pre-threading fit for sequential rows, a fit over rows above the
+floor for parallel ones -- was replayed and changes 48 runnable decisions
+instead of 56. Barely better, because the assumption behind it is wrong: the
+runnable corpus is not made of small relations. Its watdiv and yago tables run
+to millions of rows and sit well above the floor.
+
+The two-rate fit also cannot be taken from the sample that exists. 98.5% of its
+rows are above the floor, and the sequential rate it produces -- 8.96e-4 ms/row,
+22x the pre-threading fit -- is the per-query fixed cost wearing a slope, since
+8.96e-4 x the average 48,000 sequential rows is 43ms, which is process start.
+Fitting it honestly needs the reducer timed on the runnable corpus.
+
+### What the runnable corpus is actually saying
+
+The reducer is genuinely 2.86x cheaper per row; that is measured twice. The
+queries it newly fires on lose anyway because on the runnable corpus DuckDB is
+*fast* and the gate over-predicts it -- D98's winner's curse, which D107
+measured at a median factor of 79 and found no key that corrects. Lowering our
+side of the comparison does not create that error, it exposes more of it. The
+excluded corpus benefits enormously for the same reason in reverse: there
+DuckDB really is slow, so an over-prediction of it is harmless and an
+over-prediction of us is not.
+
+### Left as measured, not taken
+
++155s against -0.93s is not a close call on absolute seconds, and the
+constant is stale on its face. It is still a change to the gate rather than to
+the engine, it regresses the corpus the README quotes, and the right version
+of it needs a sequential rate this project has not measured yet. The numbers
+are here so the decision can be made on them rather than made again.
+
+Nothing in D117 or D118 depends on this: both were measured with the shipped
+gate, firing on exactly the queries it fires on today.
