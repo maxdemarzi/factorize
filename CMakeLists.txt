@@ -11,7 +11,9 @@ project(${TARGET_NAME})
 # This is a no-op for the factorize targets specifically -- see the comment
 # below at the CXX_STANDARD override for why. Kept in step with it so the two
 # cannot contradict each other even though this line does not take effect.
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+set(CMAKE_CXX_STANDARD
+    "17"
+    CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
@@ -29,16 +31,12 @@ set(CORE_SOURCES
     src/core/plan.cpp)
 
 set(DUCKDB_GLUE_SOURCES
-    src/duckdb/logical_factorized.cpp
-    src/duckdb/physical_factorized.cpp
-    src/duckdb/optimizer_rule.cpp
-    src/duckdb/storage_source.cpp
+    src/duckdb/logical_factorized.cpp src/duckdb/physical_factorized.cpp
+    src/duckdb/optimizer_rule.cpp src/duckdb/storage_source.cpp
     src/duckdb/table_function.cpp)
 
-set(EXTENSION_SOURCES
-    src/factorize_extension.cpp
-    ${DUCKDB_GLUE_SOURCES}
-    ${CORE_SOURCES})
+set(EXTENSION_SOURCES src/factorize_extension.cpp ${DUCKDB_GLUE_SOURCES}
+                      ${CORE_SOURCES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
