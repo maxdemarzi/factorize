@@ -8285,9 +8285,12 @@ format and tidy clean.
 ### Recorded and not taken
 
 A third term of 1.19ms per relation above the parallel floor brings median
-relative error to 14% from 20%, and it is a real mechanism -- D118's thread
-creation, about 75us a thread on this machine, sixteen threads a relation. It
-changes no decision on either corpus, so it buys accuracy nobody spends.
+relative error to 14% from 20%. It changes no decision on either corpus, so
+it buys accuracy nobody spends.
+
+**It was recorded here as being D118's thread creation. D122 built the pool
+that claim implies, measured 1.01x over six rounds, and refuted it: the term
+predicts and does not explain.**
 `scripts/fit-reducer-regimes.py` can fit it if that ever stops being true.
 
 ## D121 — Profiling the gate's new workload: the buckets were reallocating, and the floor is where it should be
@@ -8343,6 +8346,11 @@ knob; the spawn is.** A pool created once per reduction rather than per
 relation per round would both remove that and make a lower floor pay, and is
 worth about 5% by the fit's own estimate on this corpus. Hand-written barrier
 code for 5% is recorded and not taken.
+
+**Withdrawn by D122**, which wrote the pool anyway: 1.01x over six rounds,
+and 0.99x for the lower floor on top of it. The spawn is not the knob
+either, and `clone`'s 2.0s was CPU on threads starting while other threads
+worked -- real, and not on the critical path.
 
 ### What is left, with sizes
 
