@@ -8493,3 +8493,57 @@ a corpus set `factorize_mode` explicitly on every statement; the one-off
 written to answer a single question did not, and nothing in the output would
 have shown it. A measurement of two engines that reports them equal to three
 decimal places is evidence that it measured one engine twice.
+
+## D124 — The count path's allocator, which the profiler named and which turned out not to be there
+
+With the reducer's threads closed off (D122) the profiler went to the other
+path for the first time this session: `count(*)` over the 36 runnable
+queries the gate fires on, twenty rounds, 71s of wall and 340s of CPU across
+about 5.5 threads.
+
+`_nss_database_lookup` held 19.5s of it. That is a libc symbol the
+symbolicator reaches for when it cannot name a string or memory routine, and
+following it up the stack put every occurrence under
+`FRepresentation::AllocateSegment` -- which is to say inside `Arena::Grow`,
+which did:
+
+    auto chunk = std::unique_ptr<Byte[]>(new Byte[bytes]);
+    std::memset(chunk.get(), 0, bytes);
+
+A chunk that size comes from `mmap`, and the kernel hands those over already
+zeroed. `calloc` knows that and skips the clearing; `new` plus `memset` does
+not and writes every page a second time. Chunks double to 32MB, so a large
+f-representation was being cleared by the hundreds of megabytes.
+
+**It halved in the profile and changed nothing anyone can measure.**
+
+    allocator frame under AppendRoot    7.6s -> 3.4s
+    wall, four interleaved rounds       1.002x 1.005x 0.999x 1.054x
+    total CPU, three rounds             328.2s -> 325.6s, 0.8%
+    system time                         8.3s -> 6.7s
+    720 answers                         identical
+
+The pages are written either way. Clearing them in the allocator costs a
+pass; not clearing them moves that pass to whoever first touches the page,
+as a kernel zero-on-fault. The profile attributed the cost to one place
+because that is where it was being paid, not because it was avoidable.
+Reverted: 0.8% of CPU and none of the wall does not buy a custom deleter.
+
+**The count path is not allocator-bound, and that is the finding.** It is
+the second allocator-shaped idea this session to produce nothing -- the
+first was the pool -- and between them they say the remaining cost in both
+paths is the work itself.
+
+### One real bug fell out of it
+
+Removing `<cstring>` from `arena.hpp`, once nothing there used it, broke the
+build: `frep.hpp` calls `std::memcpy` and had been getting the header
+transitively. `scripts/core-test.sh` did not catch it, because the test
+translation units pull `<cstring>` in by other routes; only the DuckDB build
+failed, and it failed seven times in one log. `frep.hpp` includes what it
+uses now, and that change is kept.
+
+It is also the second time this session a build failed and a measurement ran
+anyway on the stale binary, reporting a tidy 1.00x. The A/B harness compares
+two paths and cannot tell that one of them is yesterday's; checking
+`build exit` before believing a ratio is the only thing that catches it.
