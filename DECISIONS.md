@@ -8834,3 +8834,42 @@ It also takes the newest artifact under `build/release/repository`, not the
 first one found: that directory keeps a subdirectory per version string the
 tree has been built under, and the stale one from a build without
 `DUCKDB_VERSION` is precisely the artifact that will not load.
+
+## D129 — The README's headline went stale again, for the reason D114 named
+
+D114 corrected the `count(*)` headline from 1.71x to 2.17x and wrote that "a
+performance claim in a README is a measurement with no owner and no test
+holding it true". It was right, and the claim it left behind has now expired
+the same way: 2.17x was measured against DuckDB v1.5.5, and D116 moved the
+extension to v2.0.0.
+
+Re-measured on 2.0, three runs of `scripts/measure-headline.sh`:
+
+    off 22.2s  auto 12.9s  force 249.9s    1.73x   0.09x
+    off 23.2s  auto 14.7s  force 275.4s    1.58x   0.08x
+    off 20.2s  auto 11.4s  force 201.2s    1.77x   0.10x
+
+Median **1.73x**, firing on 37 and faster on 24 of them, against 2.17x on 36
+and 24. D116 already found the cause and said it would keep happening:
+"**The ratios are mostly stock getting faster, not this engine getting
+slower.** Absolute `auto` time moved between 0.88x and 1.06x for five of the
+six folds while stock fell as much as 17%, which compresses a ratio without
+anything regressing."
+
+The README now quotes the median and the spread, because a single run of this
+measurement varies by 12% and a lone figure implies a precision it does not
+have.
+
+### What else was out of date
+
+The front page described the extension as answering `SELECT count(*)`, and
+listed the rule's shapes as "`count(*)` and `sum()`". The matcher has
+accepted `count(c)`, `sum(x * y)`, `avg`, `min`, `max`, `bool_and` and
+`bool_or` for some time; the status table said so in one row and not in the
+other two, and `packaging/description.yml` -- the text the community listing
+shows -- said count only until D127.
+
+And the table under the MCV section still read "**auto, now** 12.95s
+1.71x". That was a snapshot of what D38 through D41 were worth at the time,
+not a current figure, and with the corpus back at 1.73x it would have read as
+agreeing with the headline by coincidence. It is labelled as history now.

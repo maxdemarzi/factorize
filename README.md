@@ -1,8 +1,8 @@
 # factorize
 
-A DuckDB extension that answers `SELECT count(*)` over many-to-many equi-join
-graphs without materialising the join, by keeping intermediates in factorised
-(f-)representations.
+A DuckDB extension that answers `count`, `sum`, `avg`, `min`, `max` and
+`GROUP BY` over many-to-many equi-join graphs without materialising the join,
+by keeping intermediates in factorised (f-)representations.
 
 Clean-room implementation of Lehner & Neumann, *The Data World Is Not Flat:
 Efficient Factorized Execution for Relational Systems* (PVLDB 19(11):3006–3019,
@@ -28,11 +28,11 @@ off:  no answer in 180 seconds
 ```
 
 And what it is not worth: across the 119 CE queries whose results DuckDB *can*
-materialise, the gate fires on 36 and the engine is faster on 25 of those, for
-**2.17×** on the corpus. Firing on every match instead would be **0.09×** —
-261s against 24s — because for a `count(*)` DuckDB carries no payload columns
-through a join and counts empty tuples faster than this engine can build a
-representation. The gate exists to tell those two regimes apart, and the
+materialise, the gate fires on 37 and the engine is faster on 24 of those, for
+**1.73×** on the corpus — the median of three runs, which spanned 1.58× to
+1.77×. Firing on every match instead would be **0.09×** — 250s against 22s —
+because for a `count(*)` DuckDB carries no payload columns through a join and
+counts empty tuples faster than this engine can build a representation. The gate exists to tell those two regimes apart, and the
 coefficients it uses were fitted on one machine — `scripts/calibrate-synthetic.py`
 re-fits them on yours, with the caveat in its docstring that it generates
 uniform data and the gate's real difficulty is skew.
@@ -43,7 +43,7 @@ uniform data and the gate's real difficulty is skew.
 | MCV statistics and cost model | working, measured |
 | gate (fire/decline decision) | working — re-fitted against in-DuckDB timings, no regression on any query it fires on (DECISIONS D19) |
 | `factorized_count()` table function | working — 238 CE queries, 0 mismatches against published sizes and stock DuckDB (DECISIONS D16) |
-| optimizer rule | working — matches inner equi-join `count(*)`, `sum()`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
+| optimizer rule | working — matches inner equi-join `count`, `sum`, `sum(x * y)`, `avg`, `min`, `max`, `bool_and`/`bool_or`, `GROUP BY` and `EXISTS`, carries the plan's filters across, and answers identically to `'off'` (DECISIONS D18) |
 | `factorize_mode='auto'` | working — fires on the gate's verdict; 600 random join graphs agree with `'off'` |
 | memory | no spilling. A representation that will not fit is re-counted over a partition of its join key, slower, never a failure. A bucket that is one skewed value can be split on a second key, off by default (DECISIONS D55) |
 | `min` / `max` | working — answered by a semijoin reducer rather than a fold, which needs the inputs and not the join: **3.57×** and **3.59×** on the runnable corpus against 1.48–1.51× for the folded aggregates, which fold in buckets since D126, and on the 481 excluded queries it takes a 120-query sample from 86 answers to **118**, including 32 that neither this engine nor stock DuckDB could answer at all (DECISIONS D106–D113, D116–D120) |
@@ -58,9 +58,10 @@ SET factorize_explain = true;        -- say what was taken over, or why not
 SELECT count(*) FROM a, b, c WHERE a.x = b.x AND b.y = c.y;
 ```
 
-Shapes the rule takes over: `count(*)` and `sum()` — several of them at once,
-grouped or not — over inner equi-joins of stored tables on integer columns, with
-filters DuckDB pushed into or left above the scans. Everything else — outer
+Shapes the rule takes over: `count(*)`, `count(c)`, `sum()`, `sum(x * y)`,
+`avg()`, `min()`, `max()`, `bool_and()` and `bool_or()` — several of them at
+once, grouped or not — over inner equi-joins of stored tables on integer
+columns, with filters DuckDB pushed into or left above the scans. Everything else — outer
 joins, non-integer keys, cyclic join graphs, computed join keys — is declined
 silently and answered by the stock plan. `SET factorize_explain = true` says
 which, and why.
@@ -243,11 +244,14 @@ textbook estimator", silently. The gate spent its whole life running on the
 estimator that list was added to replace. It now samples 16,384 rows per join
 column, and asks the catalog as a second opinion whenever the sample says no.
 
+What that one fix was worth, measured at the time against DuckDB v1.5.5 — a
+snapshot of D38–D41, not the current corpus figure above:
+
 | | corpus, 119 queries | vs stock |
 |---|---|---|
 | factorize off | 22.17 s | — |
 | auto, before | 24.70 s | 0.88× |
-| **auto, now** | **12.95 s** | **1.71×** |
+| auto, after | 12.95 s | 1.71× |
 | a gate with perfect knowledge | 10.98 s | 2.02× |
 | firing on every match | 524.73 s | 0.04× |
 
