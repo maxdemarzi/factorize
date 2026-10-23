@@ -361,6 +361,22 @@ The extension builds through the standard DuckDB template flow:
 make                          # ./build/release/duckdb and the extension
 ```
 
+That binary has the extension *statically linked*, which is not what gets
+published. To check the artifact a user actually loads, against a DuckDB
+that was not built with it:
+
+```sh
+gh release download v2.0.0 --repo duckdb/duckdb   --pattern 'duckdb-cli-linux-amd64.tar.gz' --dir /tmp/duckdb-stock
+tar xzf /tmp/duckdb-stock/duckdb-cli-linux-amd64.tar.gz -C /tmp/duckdb-stock
+scripts/smoke-loadable.sh     # loads factorize.duckdb_extension and compares
+                              # every aggregate against the engine switched off
+```
+
+Build with `DUCKDB_VERSION` set to the version in
+`.github/workflows/MainDistributionPipeline.yml` or the artifact records the
+engine's git hash and the released CLI refuses it; `scripts/wsl-build.sh`
+does this for you (D128).
+
 The benchmark harness needs the CE corpus (~5.3 GB, downloaded from TUM):
 
 ```sh

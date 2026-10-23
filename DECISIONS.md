@@ -8775,3 +8775,62 @@ is also the warning for anyone who improves one of them next.
 So D56's count goes to eleven, and the first external criterion joins the
 ten internal ones. `watdiv_acyclic_208_00` stays slow. The fix is both sides
 at once or neither, and nothing here is evidence about how to do that.
+
+## D128 — Nothing had ever loaded the thing we publish, and the first attempt failed
+
+Everything in this repository tests `build/release/duckdb`, which has
+factorize **statically linked in**. The 1050 SQL assertions, both corpora,
+every measurement in every entry above: all of them exercise a binary that
+contains the extension rather than one that loads it. What gets published is
+`factorize.duckdb_extension`, and before `scripts/smoke-loadable.sh` nothing
+had ever loaded one.
+
+That is the shape of the worst thing D116 found -- "the extension was built
+but never linked. The build exits 0, the artifacts exist, and the only
+evidence is one line of configure output" -- and the test suite could not
+have caught its sibling either.
+
+### The first attempt failed, which is the point of running it
+
+The official v2.0.0 CLI refuses the locally built artifact:
+
+    Failed to load factorize.duckdb_extension, The file was built
+    specifically for DuckDB version 'd54cbbe3df' and can only be loaded
+    with that version of DuckDB. (this version of DuckDB is 'v2.0.0')
+
+Not an ABI problem: the submodule is exactly the `v2.0.0` tag, zero commits
+ahead, and the released CLI reports the same build hash `d54cbbe3df`. It is
+the version *string*. DuckDB's CMake takes it from `$ENV{DUCKDB_VERSION}`
+and falls back to the git hash when that is unset, and a local
+`make release` never set it. The published build is fine --
+`.github/workflows/MainDistributionPipeline.yml` passes `duckdb_version:
+v2.0.0` to the reusable workflow -- so this was a hole in local
+verification, not in what ships. But the only way to know that was to try,
+and the only reason to doubt it was that nobody had.
+
+`scripts/wsl-build.sh` now defaults `DUCKDB_VERSION` to the same string the
+workflow passes, so a local build produces an artifact that loads. With that
+set, the stock CLI takes it:
+
+    stock  v2.0.0|d54cbbe3df|Cyanoptera
+    ok   the extension loads at all
+    ok   the setting it registers exists
+    ok   count(*) / sum / min / max / avg / count(c) agree with the engine off
+    ok   GROUP BY agrees with the engine off
+    ok   the plan actually says FACTORIZED
+
+### What the script checks, and why each line is there
+
+It builds its own three-relation many-to-many dataset rather than using a
+corpus, so it runs anywhere and in a second. It forces the engine rather
+than trusting `auto`, because the gate would decline a dataset that small
+and the check would then be comparing stock DuckDB against itself -- the
+mistake D123 made with memory and D126 made with grouping, twice being
+enough to design against. And it ends by reading the plan, because every
+other line would still pass if the operator quietly declined and DuckDB
+answered everything.
+
+It also takes the newest artifact under `build/release/repository`, not the
+first one found: that directory keeps a subdirectory per version string the
+tree has been built under, and the stale one from a build without
+`DUCKDB_VERSION` is precisely the artifact that will not load.
