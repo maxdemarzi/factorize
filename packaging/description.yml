@@ -97,15 +97,15 @@ docs:
     model failing on since well before these measurements.
 
     Where it does regress is the corpus it is not for. On the queries DuckDB
-    can already materialise, 45% of the queries the gate fires on come out
-    slower. And `auto` costs about 2 to 4 milliseconds to decline -- the
+    can already materialise, about a third of the queries the gate fires on
+    come out slower -- 13 of the 37 it fires on for count(\*). And `auto` costs about 2 to 4 milliseconds to decline -- the
     statistics sampling behind the decision -- which is invisible past 100ms
     and around 20% on a 10ms query.
 
     **What it is not for.** Queries DuckDB already handles. For a plain
     count(\*) DuckDB carries no payload columns through a join and counts empty
     tuples faster than this engine can build a representation: firing on every
-    eligible query is about 25x *slower* on the benchmark's live corpus. The
+    eligible query is about 11x *slower* on the benchmark's live corpus. The
     cost model exists to tell those regimes apart, and `auto` declines far more
     often than it fires.
 
@@ -120,14 +120,27 @@ docs:
     bit-exact against `off`; if the factorised path raises, the replaced plan
     answers instead.
 
-    The aggregates beyond count(\*) are timed as well as verified (D81), and the
-    gate does not yet know which fold it is costing: it fires on the same
-    queries whichever aggregate runs. On the benchmark's live corpus that is
-    1.38x for min and sum, 1.39x for max, 1.41x for avg, 1.36x for
-    sum(x * y) and 2.04x for count(c), each over the same 119 join graphs with
-    the same 36 queries fired on, against 1.7x for count(\*). count(c) leads
-    because it is only accepted where the column cannot be NULL, which makes
-    the fold a count again. bool_and and bool_or are not listed separately:
+    The aggregates beyond count(\*) are timed as well as verified (D81). The
+    gate prices min and max separately from the rest, because they are not
+    folded at all: an ungrouped min or max over an acyclic join is answered by
+    a semijoin reducer, which reads the inputs and never builds the join. So
+    the folds no longer fire on the same queries as each other, which they did
+    until the reducer got a cost model of its own.
+
+    On the benchmark's live corpus, over the same 119 join graphs, medians of
+    three runs each:
+
+        fold          fires   ratio
+        min              65    3.9x
+        max              65    3.7x
+        count(\*)        37    1.7x
+        count(c)         36    1.4x
+        avg              29    1.5x
+        sum(x * y)       29    1.5x
+        sum              29    1.5x
+
+    Single runs of this measurement vary by about 10%, so these are medians
+    and not precise quantities. bool_and and bool_or are not listed separately:
     the matcher compiles them to the min and max folds with the same binding,
     so they are those rows with a BOOLEAN result type. An earlier reading of 0.93x for
     sum(x * y) -- "slower than not firing" -- was an artifact: 65 of the 119
@@ -141,6 +154,14 @@ docs:
     **Known limitations**, measured rather than assumed, with the numbers in
     DECISIONS.md: the cost model's coefficients are fitted on one machine and do
     not transfer between machines or datasets; its estimates are wrong where it
-    is most confident; and on the benchmark corpus six queries run slower than
-    the plan they replace, one of them past a sixty-second cap. Those cost 87 s
-    in total against 1160 s gained.
+    is most confident; and on the benchmark corpus a handful of queries run
+    slower than the plan they replace, one of them past a sixty-second cap.
+    Scored against a per-query oracle with both plans timed, the gate lands
+    within about 1.1x to 1.4x of perfect depending on the aggregate, and most
+    of what is left is one query.
+
+    The counts of rescued queries above were measured before the semijoin
+    reducer and before the cost model was refitted for it, both of which only
+    widened what gets answered, so they understate the current state rather
+    than overstating it. DECISIONS.md carries each measurement with the date
+    and method it was taken by.
