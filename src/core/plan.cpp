@@ -370,6 +370,52 @@ private:
 //! The padding above is load-bearing and silent, so it is checked.
 static_assert(sizeof(KeySet) == 64, "a shard has to be exactly one cache line wide");
 
+//! Keys on their way to one shard, held in blocks so that growing never
+//! copies what is already there.
+//!
+//! This was a `std::vector<int64_t>` and `push_back` reallocating it was 2.2%
+//! of the whole run -- `_M_realloc_insert` under the probing round, visible
+//! in the profile as its own frame (D121). Reserving instead would mean
+//! reserving for the case where every row survives, which on a selective
+//! join is a hundred times the memory actually used. Blocks cost one
+//! allocation per 4096 keys and copy nothing.
+class KeyBlocks {
+public:
+	void Add(int64_t key) {
+		if (used_ == BLOCK) {
+			// Through a local, because emplace_back binds a reference to its
+			// argument and odr-using a static constexpr member wants an
+			// out-of-line definition at C++14, which the standalone core
+			// still builds at (scripts/core-test.sh).
+			const size_t block = BLOCK;
+			blocks_.emplace_back(block);
+			used_ = 0;
+		}
+		blocks_.back()[used_++] = key;
+	}
+
+	size_t Blocks() const {
+		return blocks_.size();
+	}
+
+	const int64_t *Block(size_t i) const {
+		return blocks_[i].data();
+	}
+
+	//! Every block is full but the last, which holds what the last Add left.
+	size_t BlockSize(size_t i) const {
+		return i + 1 == blocks_.size() ? used_ : BLOCK;
+	}
+
+private:
+	static constexpr size_t BLOCK = 4096;
+	std::vector<std::vector<int64_t>> blocks_;
+	//! Starts full, so the first Add is what allocates: a bucket that never
+	//! receives a key never allocates at all, and there are workers squared
+	//! of them per relation.
+	size_t used_ = BLOCK;
+};
+
 //! The surviving keys of one relation, split into independent tables.
 //!
 //! A shard is chosen by the top byte of the hash and a slot by its low bits,
@@ -418,8 +464,10 @@ public:
 	//! Fill one named shard from a run of keys. The caller has already
 	//! decided, by hash, that they all belong here; no other thread may be
 	//! inside this shard.
-	void FillShard(size_t shard, const std::vector<int64_t> &keys) {
-		Writable()[shard].InsertAll(keys.data(), keys.size());
+	void FillShard(size_t shard, const KeyBlocks &keys) {
+		for (size_t i = 0; i < keys.Blocks(); i++) {
+			Writable()[shard].InsertAll(keys.Block(i), keys.BlockSize(i));
+		}
 	}
 
 	bool Empty() const {
@@ -618,7 +666,7 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 		// Buckets hold the key rather than the row, so the second round
 		// reads what the first round wrote instead of walking the key column
 		// again at random.
-		std::vector<std::vector<std::vector<int64_t>>> buckets(workers);
+		std::vector<std::vector<KeyBlocks>> buckets(workers);
 		std::vector<int64_t> best(workers, 0);
 		std::vector<char> best_set(workers, 0);
 		const size_t span = (rows + workers - 1) / workers;
@@ -640,7 +688,7 @@ ExtremeResult ExecuteExtremeReduced(const QueryGraph &graph, RelationSource &sou
 					}
 				} else {
 					const int64_t key = key_column[row];
-					buckets[worker][keys.ShardOf(Mix(key))].push_back(key);
+					buckets[worker][keys.ShardOf(Mix(key))].Add(key);
 				}
 			}
 		});

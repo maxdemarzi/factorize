@@ -8289,3 +8289,77 @@ relative error to 14% from 20%, and it is a real mechanism -- D118's thread
 creation, about 75us a thread on this machine, sixteen threads a relation. It
 changes no decision on either corpus, so it buys accuracy nobody spends.
 `scripts/fit-reducer-regimes.py` can fit it if that ever stops being true.
+
+## D121 — Profiling the gate's new workload: the buckets were reallocating, and the floor is where it should be
+
+The gate refit (D120) moved the firing set, so the profiling workload moved
+with it: 475 of the 481 excluded min queries fire now against 427 before.
+Profiling the old set would have profiled queries the engine no longer takes
+and missed the ones it just took on.
+
+### What the new profile showed
+
+    total active 143.6s over 45.1s wall -- about 3.2 threads
+
+    probing round (phase A)          48.4s
+    shard-filling round (phase B)    39.4s
+    main thread in ReplenishBuffer   29.5s   consumer spin, D117
+    pthread mutex                    14.3s
+    AppendChunk + AppendTyped         9.9s   column materialisation
+    clone                             2.0s   thread creation, newly visible
+
+And under phase A, its own frame: `std::vector<long>::_M_realloc_insert` at
+3.17s, 2.2% of the run. D118's buckets were plain vectors and `push_back` was
+doubling them -- which on a bucket that ends up holding a million keys copies
+two million elements to get there.
+
+Reserving instead would mean reserving for the case where every row survives,
+which on a selective join is a hundred times the memory actually used. So the
+bucket is a list of 4096-key blocks: one allocation per block, nothing ever
+copied, and a bucket that never receives a key -- there are `workers` squared
+of them per relation -- allocates nothing at all.
+
+    interleaved A/B, three rounds    1.043x  1.037x  1.047x
+    all 475 answers                  identical
+
+`_nss_database_lookup`, a libc frame the symbolicator had been attributing
+3.77s to, fell to 0.88s in the same change. It was the `memcpy` inside the
+reallocation, which is how a mis-symbolised frame can still tell the truth
+about where time goes.
+
+### The parallel floor is where it should be, and the reason is the spawn
+
+Relations under 65,536 rows are reduced sequentially. Dropping that to 8,192
+was tried on the same workload:
+
+    0.968x  0.994x
+
+A wash, and that is the useful part of the result rather than a null one: the
+parallelism gained at 8,192 is almost exactly cancelled by the cost of
+spawning for it. The reduction creates `2 x workers` threads per relation, so
+a query over six relations creates ninety-six, and the cost model's own fit
+priced that at 1.19ms per parallel relation (D120). **The floor is not the
+knob; the spawn is.** A pool created once per reduction rather than per
+relation per round would both remove that and make a lower floor pay, and is
+worth about 5% by the fit's own estimate on this corpus. Hand-written barrier
+code for 5% is recorded and not taken.
+
+### What is left, with sizes
+
+    main thread spinning            20.6% of CPU, no wall-clock cost on an
+                                    idle machine, and not ours: DuckDB's
+                                    consumer participates in the task queue
+                                    and a single-task source gives it nothing
+                                    to do
+    column materialisation           6.9%, plus the memory -- the heaviest
+                                    queries peak at 1.8GB to 4.3GB because
+                                    every relation is read whole into
+                                    `std::vector<int64_t>` before it is
+                                    probed. Consuming DuckDB chunks directly
+                                    would remove both, and changes
+                                    `RelationSource` for the fold path too
+    thread creation                  ~5% as above
+
+None of these is the kind of factor the first two passes found. The reduction
+is now within about 2.4x of perfect scaling on eight cores, and most of the
+gap is the consumer thread, which this extension does not own.
