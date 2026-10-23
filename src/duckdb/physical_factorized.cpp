@@ -248,6 +248,15 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 	// budget inert. Both directions cost something and neither is measured well
 	// enough to choose on, so the share stays: it is what shipped and was
 	// validated, and the trade is open (D43a).
+	//
+	// Closed by D125, in favour of the share and by more than D43a could
+	// see. Dividing by the bucket count instead -- the same number for a
+	// plain count, the whole budget for a fold, which runs on one bucket --
+	// is 0.43x on sum and 0.46x on avg, two and a bit times slower, for two
+	// fewer fallbacks out of seven. D43a's own sentence says why: a bucket
+	// allowed more spends longer building before it discovers it does not
+	// fit. The eighth is an early abandon, not a starvation, and the
+	// fallbacks it causes are cheaper than the builds it prevents.
 	return make_uniq<FactorizedGlobalSourceState>(slices, static_cast<size_t>(budget / threads));
 }
 

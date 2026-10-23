@@ -8547,3 +8547,76 @@ It is also the second time this session a build failed and a measurement ran
 anyway on the stale binary, reporting a tidy 1.00x. The A/B harness compares
 two paths and cannot tell that one of them is yesterday's; checking
 `build exit` before believing a ratio is the only thing that catches it.
+
+## D125 — Three questions the profiler was pointed at next: the gate is free, the fold is alone, and D43a's open trade is closed
+
+### The gate costs nothing it declines on
+
+`factorize_gate_sample_rows` is 16,384 rows a join column, and the gate pays
+it on every candidate before deciding. On a query it declines, `auto` and
+`off` then run the identical plan, so the difference between them is exactly
+what deciding cost. The 54 declined min queries, twenty times over in one
+process, alternating:
+
+    -1.6%   +0.7%   +1.2%
+
+Nothing, and the first number is negative, which is the honest signature of
+a difference below the noise. The gate is not a tax on the queries it turns
+down. Worth knowing, because "the optimizer rule samples every table in
+every candidate join" sounds expensive and is not.
+
+### The fold is alone on the machine
+
+`PhysicalFactorized` sets `slices = 1` for everything but a plain
+`count(*)`: grouping because partial groups would have to be merged across
+buckets and that is not written, summing because a bucket's fold is not a
+share of the total. So `sum`, `avg`, `sum(x*y)`, `count(c)` and every
+`GROUP BY` run the reduction's pre-D118 shape -- one thread working, the
+rest of the pool idle, the consumer spinning.
+
+Profiled over the 29 firing `sum` queries, ten rounds, 69.2s of wall:
+
+    pthread_mutex_lock                11.8s
+    pthread_mutex_unlock              10.6s
+    FRepresentation::InsertChild       8.5s
+
+**The top two entries are the lock, not the work**, and seven worker threads
+hold 61.6s of CPU between them across 69.2s -- about nine tenths of one
+thread's worth, spread over seven that are mostly spinning.
+
+This is D117 again, in the path D117 did not look at. The fix is the same
+shape as D118 and is a larger piece of work than the reducer was: a fold
+over a bucket is not a share of the fold over the whole join, so it needs
+the count path's key partitioning plus a correct per-bucket combine, and for
+grouping a merge of partial groups. That is a feature, not a tuning change,
+and it is the single largest thing the profiler has found that is still
+undone.
+
+### D43a's open trade, closed the other way
+
+The fold gets `budget / threads` of memory while running on one bucket, so
+it is handed an eighth with nobody to share it with, and 7 of the 58 firing
+`sum` and `avg` queries fall back to the stock plan rather than fit. That
+looks like an accounting slip, and D43a left the question open after
+measuring "the fired set runs 1.11x slower with a share than with the budget
+inert".
+
+Dividing by the bucket count instead -- which is the same number for a plain
+count and the whole budget for a fold -- was built and measured per query,
+alternating:
+
+    sum    8.63s, 3 fall back  ->  20.20s, 1 falls back   0.428x
+    avg    9.21s, 4 fall back  ->  20.26s, 2 fall back    0.455x
+
+**Two and a bit times slower**, for two fewer fallbacks. D43a's own sentence
+explains it -- "a bucket allowed more spends longer building before it
+discovers it does not fit" -- and the measurement now has the sign and the
+size. The small budget is not starving the fold; it is an early abandon that
+costs a cheap fallback and saves an expensive one. The fallbacks are the
+system working, not a leak.
+
+So the share stays, and the trade is no longer open: it was 1.11x against on
+the corpus D43a had, and it is 2.3x in favour on the corpus that exists now,
+which no longer contains min and max (D106 moved them to the reducer). The
+change is reverted and this is the measurement that says not to try it
+again.
