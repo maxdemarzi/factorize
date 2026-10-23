@@ -8529,6 +8529,14 @@ as a kernel zero-on-fault. The profile attributed the cost to one place
 because that is where it was being paid, not because it was avoidable.
 Reverted: 0.8% of CPU and none of the wall does not buy a custom deleter.
 
+**Tried again after D126 made the fold parallel**, because eight threads
+zeroing at once is a different landscape and `_nss_database_lookup` had
+climbed to second in the listing. It is worse there: 0.911x, 0.979x, 0.974x,
+0.919x over the sum corpus, about 5% down. Deferring the clearing moves the
+page faults from the allocating thread into the folding loop, where eight
+threads contend for them. Neutral on one thread and negative on eight is a
+firmer answer than the first measurement gave, and the idea is closed.
+
 **The count path is not allocator-bound, and that is the finding.** It is
 the second allocator-shaped idea this session to produce nothing -- the
 first was the pool -- and between them they say the remaining cost in both
