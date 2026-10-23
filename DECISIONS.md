@@ -8363,3 +8363,66 @@ code for 5% is recorded and not taken.
 None of these is the kind of factor the first two passes found. The reduction
 is now within about 2.4x of perfect scaling on eight cores, and most of the
 gap is the consumer thread, which this extension does not own.
+
+## D122 — The thread pool bought nothing, which means D120's per-relation term was not thread creation
+
+D121 said "the floor is not the knob, the spawn is", and priced a pool at
+about 5% from two independent-looking signals: `clone` holding 2.0s of a 45s
+run in the profile, and the cost fit wanting 1.19ms per relation above the
+parallel floor. Both were real numbers. The inference joining them was wrong.
+
+A `WorkerPool` was written -- threads spawned once per reduction instead of
+twice per relation, a generation counter and two condition variables, clean
+under ThreadSanitizer, identical answers on all 475 queries. Against the
+committed build on the same workload:
+
+    first two rounds      1.130x  1.060x
+    four more rounds      1.013x  0.994x  0.975x  1.013x
+
+**The first two rounds were the machine warming up.** Taken together the
+pool is worth nothing measurable, and taking the first pair as the answer is
+exactly the mistake D113 caught in blocked prefetching and D54 caught in a
+reported 2x that was drift. Six rounds, median 1.01x.
+
+Then the second half of the claim, which was the real reason to want a pool:
+that spawning was what made a lower floor a wash. With the pool in place,
+8,192 rows against 65,536:
+
+    1.009x  0.991x  0.998x  0.964x
+
+Also nothing. So the floor is not held up by the spawn either, and D121's
+sentence is withdrawn.
+
+### What the two signals actually were
+
+`clone`'s 2.0s is CPU spent on threads that were starting while other threads
+were working. It is real CPU and it is not on the critical path, which is the
+distinction a flat profile cannot draw and a wall-clock A/B can.
+
+The 1.19ms per parallel relation improved the fit's median relative error
+from 20% to 14%, and `par_relations` correlates with input rows -- a
+regression coefficient on a correlated regressor is not a mechanism. D120
+recorded that term as "a real mechanism -- it is the thread creation D118
+added". That was an inference stated as a finding, and this is the
+measurement that refutes it. The term still predicts; it just does not
+explain, and nothing can be bought by attacking what it names.
+
+Both changes are reverted. A hundred lines of hand-written condition-variable
+code is a standing correctness liability, and it has to earn that with a
+number.
+
+### What this leaves
+
+Of the three things D121 sized, one is now closed as unavailable. The
+consumer thread spinning in `ReplenishBuffer` is 20.6% of CPU and belongs to
+DuckDB's streaming result, not to this extension, and costs no wall clock on
+an otherwise idle machine. That leaves reading relations a chunk at a time
+instead of materialising them -- 6.9% of CPU in `AppendChunk` and
+`AppendTyped`, and the reason the heaviest queries peak at 1.8GB to 4.3GB for
+a query returning one row.
+
+It is worth recording that memory is **not** what limits the gate: of the six
+excluded min queries that still decline, five are the 1.5x margin and one is
+a CTE the rule cannot see through. So streaming would buy resident memory and
+about 7% of CPU, and would not make the engine answer anything it cannot
+answer today.
