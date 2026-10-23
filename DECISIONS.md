@@ -8094,7 +8094,11 @@ loop cannot afford.**
 ### What it cost elsewhere
 
     runnable corpus         1.065x, 1.063x, 119 answers identical
-    peak RSS                within 0.3% on the three heaviest queries
+    peak RSS                measured wrong; see D123. The check ran in
+                            the default mode, which is `off`, so both
+                            arms were stock DuckDB and the number says
+                            nothing about the buckets. Measured properly
+                            it is within 12%, worst case +30MB on 259MB
     core suite              asan+ubsan and -O2 clean
     test_plan under tsan    0 races, 166 checks
     SQL suite               1050 assertions
@@ -8359,13 +8363,16 @@ worked -- real, and not on the critical path.
                                     consumer participates in the task queue
                                     and a single-task source gives it nothing
                                     to do
-    column materialisation           6.9%, plus the memory -- the heaviest
-                                    queries peak at 1.8GB to 4.3GB because
-                                    every relation is read whole into
+    column materialisation           6.9%, plus the memory -- every relation
+                                    is read whole into
                                     `std::vector<int64_t>` before it is
                                     probed. Consuming DuckDB chunks directly
                                     would remove both, and changes
-                                    `RelationSource` for the fold path too
+                                    `RelationSource` for the fold path too.
+                                    (**The 1.8GB-to-4.3GB figures first
+                                    written here were DuckDB's, not this
+                                    engine's -- D123. The reduction peaks at
+                                    about 0.5GB on the same queries.**)
     thread creation                  ~5% as above
 
 None of these is the kind of factor the first two passes found. The reduction
@@ -8433,4 +8440,56 @@ It is worth recording that memory is **not** what limits the gate: of the six
 excluded min queries that still decline, five are the 1.5x margin and one is
 a CTE the rule cannot see through. So streaming would buy resident memory and
 about 7% of CPU, and would not make the engine answer anything it cannot
-answer today.
+answer today. (**And less memory than stated -- D123 measures the reduction
+at about 0.5GB where this entry said 4.3GB.**)
+
+## D123 — The memory numbers in D118, D121 and D122 were DuckDB's, because the measurement never left `off`
+
+D118 reported peak RSS "within 0.3%" between the sequential and threaded
+reduction, which was the check that the threaded path's buckets -- 8 bytes a
+surviving row that the sequential path never held -- had not cost memory.
+D121 and D122 then reported the reduction peaking at 1.8GB to 4.3GB and used
+that as most of the case for reading relations a chunk at a time.
+
+All of it came from one script that set `factorize_reduce_threads` and never
+set `factorize_mode`. **The default is `off`.** Both arms were stock DuckDB,
+which is why they agreed to 0.3%: they were the same program twice. The
+4.3GB was DuckDB's hash join on a query whose join is enormous, which is the
+reason the query is in the excluded corpus in the first place.
+
+Measured again, in `auto`, with the threads knob doing what it was supposed
+to be doing:
+
+    query                    serial          threaded
+    dblp_acyclic_217_16      494MB  1.74s    496MB  0.71s
+    dblp_acyclic_216_07      520MB  1.89s    499MB  0.67s
+    job_acyclic_111_11       461MB  0.83s    456MB  0.54s
+    dblp_acyclic_211_14      259MB  0.67s    289MB  0.33s
+
+So the conclusion D118 drew is right and the evidence was not: the buckets
+cost within 12%, worst case +30MB against a 259MB baseline, not 0.3%. The
+blocks of D121 are part of why -- a doubling vector holds the old array
+while it copies into the new one.
+
+And for the same answer on `dblp_acyclic_216_07`, stock DuckDB needs
+**1796MB and 6.88s** against the reduction's 499MB and 0.67s. The engine
+already uses a third of the memory, not several times it.
+
+### What this does to the last open item
+
+Reading relations a chunk at a time was sized in D121 and D122 as 6.9% of
+CPU plus a 4.3GB-to-something memory win. The CPU number stands. The memory
+win is from about 0.5GB to perhaps 0.2GB on the heaviest queries -- real,
+and not the reason anyone would take on a change to `RelationSource`, which
+the fold path shares. With memory confirmed not to be what the gate declines
+on either, the honest size of the remaining work is "about 7% of CPU", and
+that is the whole of it.
+
+### The habit this broke
+
+Three entries carried a number from a script whose mode was never asserted,
+and the number looked plausible every time it was read. The scripts that run
+a corpus set `factorize_mode` explicitly on every statement; the one-off
+written to answer a single question did not, and nothing in the output would
+have shown it. A measurement of two engines that reports them equal to three
+decimal places is evidence that it measured one engine twice.
