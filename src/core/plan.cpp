@@ -2487,6 +2487,73 @@ GroupCountResult ExecuteGroupBy(const QueryGraph &graph, const Plan &plan, Relat
 	return GroupBy(graph, plan, source, mode, keys, aggregates, strategy);
 }
 
+bool SliceableByKey(const QueryGraph &graph, const Plan &plan) {
+	return !ChooseSliceColumns(graph, &plan).empty();
+}
+
+GroupCountResult ExecuteGroupBySlice(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                     const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
+                                     size_t slice, size_t slices, PathStrategy strategy) {
+	if (slices <= 1) {
+		return GroupBy(graph, plan, source, mode, keys, aggregates, strategy);
+	}
+	auto key_column = ChooseSliceColumns(graph, &plan);
+	if (key_column.empty()) {
+		GroupCountResult result;
+		result.error = "no join key reaches more than one relation, so slicing cannot shrink anything";
+		return result;
+	}
+	SlicedSource sliced(source, key_column, slice, slices);
+	return GroupBy(graph, plan, sliced, mode, keys, aggregates, strategy);
+}
+
+void MergeGroups(GroupCountResult &into, GroupCountResult &&from, const std::vector<GroupAggregate> &aggregates) {
+	if (!into.ok) {
+		into = std::move(from);
+		return;
+	}
+	// Where the same group appears in more than one bucket. A group's tuples
+	// are spread across buckets whenever the key sliced on is not the key
+	// grouped by, which is the usual case -- `ChooseSliceColumns` picks
+	// whichever class reaches the most relations, not whichever the query
+	// groups on.
+	std::map<std::vector<int64_t>, size_t> at;
+	for (size_t i = 0; i < into.groups.size(); i++) {
+		at.emplace(into.groups[i].first, i);
+	}
+	for (size_t i = 0; i < from.groups.size(); i++) {
+		auto &group = from.groups[i];
+		const int64_t count = i < from.counts.size() ? from.counts[i] : 0;
+		const auto found = at.find(group.first);
+		if (found == at.end()) {
+			at.emplace(group.first, into.groups.size());
+			into.groups.push_back(std::move(group));
+			into.counts.push_back(count);
+			continue;
+		}
+		auto &target = into.groups[found->second].second;
+		for (size_t a = 0; a < target.size() && a < group.second.size(); a++) {
+			switch (a < aggregates.size() ? aggregates[a].kind : Aggregate::COUNT) {
+			case Aggregate::MIN:
+				target[a] = std::min(target[a], group.second[a]);
+				break;
+			case Aggregate::MAX:
+				target[a] = std::max(target[a], group.second[a]);
+				break;
+			default:
+				// COUNT, SUM and AVG are all sums here: AVG carries its total
+				// in `values` and is divided by `counts` by the caller, so the
+				// two halves merge the same way (D78).
+				target[a] = CheckedCardinalityAdd(target[a], group.second[a]);
+				break;
+			}
+		}
+		into.counts[found->second] = CheckedCardinalityAdd(into.counts[found->second], count);
+	}
+	into.records += from.records;
+	into.bytes += from.bytes;
+}
+
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                    const std::vector<GroupKey> &keys, PathStrategy strategy) {
 	return GroupBy(graph, plan, source, mode, keys, {GroupAggregate {Aggregate::COUNT, 0, 0}}, strategy);

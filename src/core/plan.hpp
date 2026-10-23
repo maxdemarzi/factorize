@@ -535,6 +535,31 @@ GroupCountResult ExecuteGroupBy(const QueryGraph &graph, const Plan &plan, Relat
                                 const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
                                 PathStrategy strategy = PathStrategy::LEVELWISE);
 
+//! Whether the join has a key worth bucketing on, which is what slicing needs.
+//!
+//! False when no equivalence class reaches more than one relation: bucketing
+//! on such a class filters one relation and leaves every other one whole, so
+//! the buckets would each do nearly the whole join.
+bool SliceableByKey(const QueryGraph &graph, const Plan &plan);
+
+//! One bucket of a grouped fold: the tuples whose sliced key falls in `slice`.
+//!
+//! The same partition `ExecuteCountSlice` uses, and sound for the same reason
+//! -- the buckets' tuples are disjoint and their union is the join's. What
+//! differs is the combine: a count is one number to add, and a fold is a list
+//! of groups that have to be merged by key, because a group's tuples sit in
+//! whichever buckets their *sliced* key sends them to, not all in one.
+GroupCountResult ExecuteGroupBySlice(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
+                                     const std::vector<GroupKey> &keys, const std::vector<GroupAggregate> &aggregates,
+                                     size_t slice, size_t slices, PathStrategy strategy = PathStrategy::LEVELWISE);
+
+//! Folds one bucket's groups into the groups collected so far.
+//!
+//! COUNT, SUM and AVG add; MIN and MAX take the extreme. All five are
+//! associative and commutative, so buckets may arrive in any order, which is
+//! what lets threads merge as they finish rather than in sequence.
+void MergeGroups(GroupCountResult &into, GroupCountResult &&from, const std::vector<GroupAggregate> &aggregates);
+
 GroupCountResult ExecuteGroupCount(const QueryGraph &graph, const Plan &plan, RelationSource &source, JoinMode mode,
                                    const std::vector<GroupKey> &keys, PathStrategy strategy = PathStrategy::LEVELWISE);
 

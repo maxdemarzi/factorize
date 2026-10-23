@@ -8620,3 +8620,90 @@ the corpus D43a had, and it is 2.3x in favour on the corpus that exists now,
 which no longer contains min and max (D106 moved them to the reducer). The
 change is reverted and this is the measurement that says not to try it
 again.
+
+## D126 — The fold in buckets, which the comment said was not written
+
+D125 profiled the `sum` fold and found the top two entries were
+`pthread_mutex_lock` and `unlock`, with seven workers holding nine tenths of
+one thread's work between them while one thread did the folding.
+`PhysicalFactorized` set `slices = 1` for everything but a plain `count(*)`,
+and the comment gave the reason: "Merging partial groups across buckets is
+the correct general answer and is not written; one thread is."
+
+It is written now.
+
+### Why the partition argument carries over unchanged
+
+`SlicedSource` is not part of counting. It is a `RelationSource` that filters
+the relations holding an attribute of the sliced class to the rows whose key
+falls in one bucket, and passes the rest through. Anything reading through it
+computes over exactly that bucket's tuples, and the buckets are disjoint and
+cover the join -- which is the whole of why `ExecuteCountSlice` is sound, and
+none of it mentions counting.
+
+What a fold needs on top is the combine. A count is one number to add; a fold
+is a list of groups, and a group's tuples sit in whichever buckets their
+*sliced* key sends them to. `ChooseSliceColumns` picks whichever class reaches
+the most relations, which is rarely the one the query groups on, so the same
+group routinely appears in several buckets. `MergeGroups` merges by key:
+COUNT, SUM and AVG add, MIN and MAX take the extreme. AVG merges as a sum
+because it is one -- the total is in `values` and the denominator in `counts`,
+and the division is the operator's (D78). All five are associative and
+commutative, so buckets may be merged in whatever order they finish, which is
+what lets threads merge as they land rather than in sequence.
+
+The operator protocol is the count's: claim a bucket, fold it outside the
+lock, merge under it, and the thread that folds the last bucket turns the
+merge into the answer. Threads that finish early return no rows rather than
+FINISHED, because FINISHED would tell DuckDB the thread is done with the
+operator and with fewer threads than buckets the rest would never be claimed.
+
+### Measured
+
+    sum, 29 firing queries, per query, binaries alternating   6.45s -> 5.38s   1.20x
+    avg, 29 firing queries                                    6.28s -> 5.23s   1.20x
+    sum against stock, scripts/measure-aggregates.sh          1.31x -> 1.51x
+    avg against stock                                         1.32x -> 1.48x
+
+And the profile closes the loop it opened: `pthread_mutex_lock` has left the
+top of the listing entirely, and `FRepresentation::InsertChild` has gone from
+8.5s to 47.6s of CPU on the same workload -- not more work, the same work
+done by more threads at once.
+
+The big queries scale and the small ones do not, which is why the total is
+1.2x and not 4x: `watdiv_acyclic_217_01` goes 3.63s to 0.92s across one
+thread to eight, `epinions_acyclic_216_08` 0.77s to 0.03s, while most of the
+corpus is queries where eight buckets each filtering the whole input costs
+more than the fold they parallelise.
+
+### Correctness, which is the part that had to be right
+
+    randomised, sliced-and-merged against the whole fold    6970 checks, 0 failures
+      random trees, 2-4 relations, grouped and ungrouped, COUNT/SUM/MIN/MAX
+      at 2, 3 and 8 buckets
+    sum and avg, 29 queries each, at threads 1/2/4/8        0 answer differences,
+      and none against the build that could not slice
+    GROUP BY on the corpus, forced so it actually runs      24 queries, 6 aggregates
+      at once including MIN, MAX and AVG, at threads 1/4/8  0 disagreements with stock
+    SQL suite                                                1050 assertions
+
+The grouped check had to be run under `force`. Under `auto` the gate declines
+most of those queries, and the first version of the check compared DuckDB
+against DuckDB on 11 of 14 and reported them all passing -- the same way the
+memory measurement of D123 reported two identical programs equal.
+
+### One query is slower, and the fallback was the reason it was not
+
+`watdiv_acyclic_208_00` goes 0.78s to 3.10s. The old build printed "fell back
+to the stock plan: the engine exceeded its per-slice memory budget" and
+DuckDB answered it in 0.18s. Sliced, each bucket fits, nothing exceeds
+anything, and the engine runs a query it should never have taken: D116
+already recorded this one as a bad fire, with DuckDB predicted at 26,593ms
+for a query stock answers in 0.157s.
+
+**Slicing did not cause that regression, it stopped hiding it.** The
+out-of-memory fallback was an accidental rescue from a gate error, and D125's
+finding is the same coin the other way up -- there the small budget was a
+useful early abandon. The honest reading is that one of the fold's safety
+nets was load-bearing for the wrong reason, and the fix is the gate's
+estimate of DuckDB, which is D98's winner's curse and still open.

@@ -78,6 +78,9 @@ public:
 	unique_ptr<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>> groups;
 	//! Tuples per group, parallel to `groups`: an AVG's denominator.
 	std::vector<int64_t> counts;
+	//! The buckets' groups as they arrive, merged by key. Becomes `groups`
+	//! once the last bucket has been folded in (D126).
+	factorize::GroupCountResult merged;
 	idx_t handed_out = 0;
 	//! Set once the factorized path has failed and the plan it replaced is
 	//! answering instead (§7.5). Under `lock`, because several threads can be
@@ -215,22 +218,34 @@ unique_ptr<GlobalSourceState> PhysicalFactorized::GetGlobalSourceState(ClientCon
 		// be two schemes fighting over the same key -- and the point of the
 		// limit is the buckets it never builds.
 		slices = 1;
-	} else if (!IsPlainCount()) {
-		// Everything but a single ungrouped count(*) runs on one thread.
-		//
-		// Grouping, because partitioning by the join key puts each group wholly
-		// inside one bucket *only* when the partitioned key is the grouping key,
-		// and ChooseSliceColumns picks whichever key reaches the most relations.
-		// Merging partial groups across buckets is the correct general answer
-		// and is not written; one thread is.
-		//
-		// Summing, for a sharper reason: the fold takes the whole source, not a
-		// bucket of it. Left parallel, every thread would fold the entire join
-		// and the totals would be added -- an answer N times too large, on N
-		// threads, silently. Slicing it is the same partition argument as for
-		// counting and is simply not written yet.
+	} else if (!aggregates.empty() && aggregates[0].kind == factorize::Aggregate::SUM_PRODUCT) {
+		// Its own ungrouped path below, which does not go through the fold.
+		slices = 1;
+	} else if (!factorize::SliceableByKey(graph, plan)) {
+		// No class reaches more than one relation, so every bucket would do
+		// nearly the whole join and the slicing would be pure overhead.
+		slices = 1;
+	} else if (reduce_extremes && IsUngroupedExtreme() && factorize::ReducibleByExtremeReduction(graph)) {
+		// The reducer answers this one, and parallelises inside itself.
 		slices = 1;
 	}
+	// Everything else -- sum, avg, count(c), and every GROUP BY -- now slices
+	// like the count does.
+	//
+	// It did not, and the comment here said why: merging partial groups across
+	// buckets "is the correct general answer and is not written". A profile of
+	// the sum fold is what made writing it worth the trouble -- the top two
+	// entries were `pthread_mutex_lock` and `unlock`, with seven workers
+	// holding nine tenths of one thread's work between them while one thread
+	// did the fold (D125).
+	//
+	// The partition argument is the count's, unchanged: the buckets' tuples
+	// are disjoint and their union is the join's. What the fold needs on top
+	// is that a group may appear in several buckets -- `ChooseSliceColumns`
+	// picks whichever class reaches the most relations, which is rarely the
+	// one the query groups on -- so the buckets are merged by key rather than
+	// concatenated, with COUNT, SUM and AVG adding and MIN and MAX taking the
+	// extreme (D126).
 	// Divided by the thread count, not the bucket count, so a single bucket gets
 	// a share of the budget rather than all of it.
 	//
@@ -371,7 +386,7 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 					gstate.counts = {1};
 				}
 				gstate.groups = std::move(groups);
-			} else {
+			} else if (gstate.slices <= 1) {
 				SharedRelations source(client, relations);
 				auto result = factorize::ExecuteGroupBy(graph, plan, source, factorize::JoinMode::BOTTOM_INSERT,
 				                                        group_keys, aggregates);
@@ -382,6 +397,67 @@ SourceResultType PhysicalFactorized::EmitGroups(ExecutionContext &context, DataC
 				    std::move(result.groups));
 				gstate.counts = std::move(result.counts);
 			}
+		}
+	}
+
+	// Sliced: every thread takes a bucket, folds it on its own, and merges
+	// what it found. Mirrors the count's protocol exactly -- the thread that
+	// folds the last bucket is the one that turns the merge into the answer,
+	// and the rest come back round to claim another or to emit (D126).
+	bool have_groups;
+	{
+		// Under the lock: another thread writes this pointer when it folds the
+		// last bucket, and the acquire here is what orders that write against
+		// the reads of `groups` below.
+		lock_guard<mutex> guard(gstate.lock);
+		have_groups = gstate.groups != nullptr;
+	}
+	if (!have_groups && gstate.slices > 1) {
+		// Read once however many threads want them: every bucket looks at
+		// every row to find its own, so a scan per thread would read the
+		// whole input once per thread.
+		{
+			lock_guard<mutex> guard(gstate.lock);
+			if (!gstate.inputs) {
+				gstate.inputs = make_uniq<SharedRelations>(client, relations);
+			}
+		}
+		const idx_t slice = gstate.next_slice.fetch_add(1);
+		if (slice < gstate.slices) {
+			// Per thread, because the cap is thread-local: a worker that
+			// never sets it would fold uncapped.
+			factorize::SetGlobalLimits(gstate.memory_per_slice, estimate_budget_bytes, min_compression,
+			                           abandon_after_ms, min_rate, second_key);
+			factorize::SetGlobalStepDetail(explain_steps);
+			auto part = factorize::ExecuteGroupBySlice(graph, plan, *gstate.inputs, factorize::JoinMode::BOTTOM_INSERT,
+			                                           group_keys, aggregates, slice, gstate.slices);
+			lock_guard<mutex> guard(gstate.lock);
+			if (!part.ok) {
+				if (gstate.error.empty()) {
+					gstate.error = part.error;
+				}
+			} else if (gstate.error.empty()) {
+				factorize::MergeGroups(gstate.merged, std::move(part), aggregates);
+			}
+			if (++gstate.completed == gstate.slices) {
+				if (!gstate.error.empty()) {
+					// Answering with some of the buckets is the one thing this
+					// must never do: a query that fails is recoverable with
+					// factorize_mode='off', a query that answers wrongly is not.
+					throw InvalidInputException("factorize: %s", gstate.error);
+				}
+				gstate.groups = make_uniq<std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>>>(
+				    std::move(gstate.merged.groups));
+				gstate.counts = std::move(gstate.merged.counts);
+			}
+		}
+		lock_guard<mutex> guard(gstate.lock);
+		if (!gstate.groups) {
+			// Other buckets are still folding. Not FINISHED: that would tell
+			// DuckDB this thread is done with the operator, and with fewer
+			// threads scheduled than buckets the rest would never be claimed.
+			chunk.SetChildCardinality(0);
+			return SourceResultType::HAVE_MORE_OUTPUT;
 		}
 	}
 

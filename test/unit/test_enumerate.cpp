@@ -511,6 +511,124 @@ static void TestGroupSumOnSiblingBranches() {
 //! Two sums over columns in *different* branches is where that would break:
 //! each is weighted by how many tuples the other branches make, and those
 //! weights differ per aggregate.
+//! Slicing a fold must not change its answer.
+//!
+//! The count path has bucketed the join key since D20; a fold could not,
+//! because a group's tuples sit in whichever buckets their *sliced* key sends
+//! them to, so buckets have to be merged by group rather than added up. This
+//! checks the merge over random trees, grouped and ungrouped, for every
+//! aggregate the grouped walk carries.
+static void TestSlicedFoldAgreesWithTheWholeFold() {
+	Group scope("a fold in buckets answers what the same fold whole answers");
+
+	uint64_t seed = 0xA5A5C3C35A5A3C3Cull;
+	auto next = [&seed](int64_t bound) {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		return static_cast<int64_t>(seed % static_cast<uint64_t>(bound));
+	};
+
+	int checked = 0;
+	int unsliceable = 0;
+	for (int trial = 0; trial < 120; trial++) {
+		const size_t relations = 2 + static_cast<size_t>(next(3)); // 2..4
+		const int64_t domain = 2 + next(5);
+
+		QueryGraph graph;
+		graph.column_counts.assign(relations, 2);
+		graph.column_types.assign(relations, {ValueType::INT64, ValueType::INT64});
+		for (size_t child = 1; child < relations; child++) {
+			const size_t parent = static_cast<size_t>(next(static_cast<int64_t>(child)));
+			graph.predicates.push_back(Predicate {parent, 0, child, 0});
+		}
+
+		MemorySource source;
+		for (size_t r = 0; r < relations; r++) {
+			const size_t n = 1 + static_cast<size_t>(next(10));
+			std::vector<int64_t> key(n), value(n);
+			for (size_t i = 0; i < n; i++) {
+				key[i] = next(domain);
+				value[i] = next(21) - 10;
+			}
+			source.Add({key, value});
+		}
+
+		const auto plan = BuildPlan(graph);
+		if (!plan.complete) {
+			continue;
+		}
+		if (!SliceableByKey(graph, plan)) {
+			unsliceable++;
+			continue;
+		}
+
+		const std::vector<GroupAggregate> aggregates = {
+		    GroupAggregate {Aggregate::COUNT, 0, 0}, GroupAggregate {Aggregate::SUM, 0, 1},
+		    GroupAggregate {Aggregate::MIN, 0, 1}, GroupAggregate {Aggregate::MAX, 0, 1}};
+
+		for (int grouped = 0; grouped < 2; grouped++) {
+			std::vector<GroupKey> keys;
+			if (grouped != 0) {
+				keys.push_back(GroupKey {relations - 1, 1});
+			}
+			const auto whole = ExecuteGroupBy(graph, plan, source, JoinMode::BOTTOM_INSERT, keys, aggregates);
+			if (!whole.ok) {
+				continue;
+			}
+			for (const size_t slices : {size_t(2), size_t(3), size_t(8)}) {
+				GroupCountResult merged;
+				bool ran = true;
+				for (size_t slice = 0; slice < slices; slice++) {
+					auto part = ExecuteGroupBySlice(graph, plan, source, JoinMode::BOTTOM_INSERT, keys, aggregates,
+					                                slice, slices);
+					if (!part.ok) {
+						ran = false;
+						break;
+					}
+					MergeGroups(merged, std::move(part), aggregates);
+				}
+				if (!ran) {
+					continue;
+				}
+				checked++;
+				const std::string at = "trial " + std::to_string(trial) + " at " + std::to_string(slices) +
+				                       (grouped != 0 ? " grouped" : " ungrouped");
+				if (merged.groups.size() != whole.groups.size()) {
+					Expect(false, at + ": " + std::to_string(merged.groups.size()) + " groups against " +
+					                  std::to_string(whole.groups.size()));
+					continue;
+				}
+				// The buckets finish in whatever order, so the merged list is
+				// not in the whole fold's order; compare by key.
+				std::map<std::vector<int64_t>, size_t> at_merged;
+				for (size_t i = 0; i < merged.groups.size(); i++) {
+					at_merged.emplace(merged.groups[i].first, i);
+				}
+				for (size_t i = 0; i < whole.groups.size(); i++) {
+					const auto found = at_merged.find(whole.groups[i].first);
+					if (found == at_merged.end()) {
+						Expect(false, at + ": a group of the whole fold is missing from the buckets");
+						continue;
+					}
+					const auto &mine = merged.groups[found->second].second;
+					const auto &theirs = whole.groups[i].second;
+					for (size_t a = 0; a < theirs.size() && a < mine.size(); a++) {
+						Expect(mine[a] == theirs[a], at + ": aggregate " + std::to_string(a) + " gives " +
+						                                 std::to_string(mine[a]) + ", the whole fold says " +
+						                                 std::to_string(theirs[a]));
+					}
+					Expect(merged.counts[found->second] == whole.counts[i],
+					       at + ": tuple count " + std::to_string(merged.counts[found->second]) + " against " +
+					           std::to_string(whole.counts[i]));
+				}
+			}
+		}
+	}
+	Expect(checked > 100, "enough trials sliced: " + std::to_string(checked) + " (" + std::to_string(unsliceable) +
+	                          " graphs had no key to slice on)");
+}
+
 static void TestSeveralAggregatesInOneWalk() {
 	Group scope("several aggregates folded in one walk agree with each folded alone");
 
@@ -815,6 +933,8 @@ int main() {
 	std::printf("\n");
 	TestGroupSumOnSiblingBranches();
 	TestSeveralAggregatesInOneWalk();
+	std::printf("\n");
+	TestSlicedFoldAgreesWithTheWholeFold();
 	TestSeveralAggregatesUngrouped();
 	TestMinMaxAgainstEnumeration();
 	TestProductSumAgainstEnumeration();
