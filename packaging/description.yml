@@ -13,8 +13,8 @@
 # against.
 extension:
   name: factorize
-  description: Answers count(*) over many-to-many equi-join graphs without materialising the join
-  version: 0.1.2
+  description: Answers count, sum, avg, min, max and GROUP BY over many-to-many equi-join graphs without materialising the join
+  version: 0.2.0
   language: C++
   build: cmake
   license: MIT
@@ -24,11 +24,15 @@ extension:
 
 repo:
   github: maxdemarzi/factorize
-  # v0.1.2. Verified green on the six-platform matrix before the tag was
-  # cut. v0.1.1 is not used: its sum(x * y) accumulator is 64 bits wide and
-  # falls back rather than answering on most of the queries that aggregate
-  # exists for, which D88 widened.
-  ref: 59554125d4ab7ff81f42cc4bdba3231b372ff781
+  # v0.2.0. Verified green on the six-platform matrix on `main` before the
+  # tag was cut -- pull requests build a reduced matrix, so the push build is
+  # the one that counts here.
+  #
+  # v0.1.2 and earlier target DuckDB v1.5.5 and will not load against 2.0:
+  # the C++ extension API is version-locked, and 2.0 also needs
+  # `duckdb_extension_statically_link()` to reach the shipped binary at all,
+  # which D116 found by its absence.
+  ref: 1f38c96adc116ab0aa4cd59610a6a1ca2437a5fc
 
 docs:
   hello_world: |

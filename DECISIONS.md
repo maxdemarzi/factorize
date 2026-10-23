@@ -8715,3 +8715,63 @@ finding is the same coin the other way up -- there the small budget was a
 useful early abandon. The honest reading is that one of the fold's safety
 nets was load-bearing for the wrong reason, and the fix is the gate's
 estimate of DuckDB, which is D98's winner's curse and still open.
+
+## D127 — Where the fold's remaining regret is, and the eleventh signal that does not separate
+
+D126 left one query slower and said the fix was the gate. With both arms of
+the fold now measurable in-process, here is how much is actually left and
+what it is made of. The runnable corpus as `sum`, every query timed folded
+and unfolded:
+
+    always DuckDB 20.22s    always fold 85.46s    oracle 8.92s
+    the gate that ships     12.69s over 29 fires    1.42x of oracle
+
+Regret is 3.77s over 14 queries, and **`watdiv_acyclic_208_00` is 2.725s of
+it -- 72% of the fold's entire regret is one query.** Declining that one
+would take the gate from 1.42x of oracle to about 1.12x. D116 recorded it as
+a bad fire and D126 unmasked it; this prices it.
+
+### The one signal D56's list did not contain
+
+D56 concluded that every quantity the engine can see from inside its own
+execution -- predicted records, predicted bytes, measured compression,
+measured rate -- separates wins from losses on the sample it was fitted on
+and overlaps on the next, "because what actually separates them is how fast
+DuckDB would have been, and that is the one number not available without
+running it". Ten criteria in a row.
+
+All ten were internal. **DuckDB's own optimizer publishes a cardinality
+estimate for the plan the rule is replacing**, and on `watdiv_acyclic_208_00`
+it is strikingly better: DuckDB says 232,225,264 rows against a true
+132,834,048 -- 1.75x -- where the gate's flat estimate is 6.631e9, off by
+50x. That is the whole of why the gate fires on a query stock answers in
+0.17s.
+
+Over 118 queries with a known answer it is better on average and not by
+much:
+
+    estimate / truth      p10     p50     p90
+    DuckDB's             0.07    6.28 1436.35      within 100x: 77.1%
+    the gate's           0.31   10.17 1489.09      within 100x: 68.6%
+
+And substituting it into the gate -- exactly, by swapping only the per-tuple
+term that depends on the join size -- makes the decisions **worse**:
+
+    the gate that ships             12.65s   29 fires   1.42x of oracle
+    DuckDB's own estimate instead   15.29s    3 fires   1.72x of oracle
+
+Fires collapse from 29 to 3, and every one of the new losses is a decline:
+queries the fold wins that the gate now refuses. A better estimate of
+DuckDB's work makes DuckDB look cheaper, and the gate's over-estimate of it
+had been carrying the margin.
+
+**This is D120's finding for the third time.** There, a perfect estimate of
+our own cost alone was worse than two wrong estimates together. Here, a
+better estimate of DuckDB's alone is worse for the same reason. The two
+halves of this comparison have been wrong in compensating directions for
+long enough that either one, corrected by itself, is a regression -- which
+is also the warning for anyone who improves one of them next.
+
+So D56's count goes to eleven, and the first external criterion joins the
+ten internal ones. `watdiv_acyclic_208_00` stays slow. The fix is both sides
+at once or neither, and nothing here is evidence about how to do that.
